@@ -1,0 +1,55 @@
+- intro: >
+    角膜塑形镜（OK镜）是一种夜间配戴的硬性透气性隐形眼镜，通过特殊的反几何设计，暂时改变角膜形态，从而在白天获得更清晰的裸眼视力，并可帮助青少年减缓近视进展。
+  officer: 角膜塑形镜（OK镜）
+  role: Orthokeratology Vision Correction
+  dept: 近视控制与屈光矫正
+  detail: departments/角膜塑形镜.md
+
+- intro: >
+    周边离焦软性角膜接触镜是一种用于近视控制的软性隐形眼镜方案，通过模拟角膜塑形镜形成的周边离焦状态，在更宽的度数范围内帮助青少年有效延缓近视发展，同时兼顾配戴舒适性与安全性。
+  officer: 周边离焦软性角膜接触镜
+  role: Peripheral Defocus Soft Contact Lens
+  dept: 近视控制与视觉舒适管理
+  detail: departments/周边离焦软性角膜接触镜.md
+
+- intro: >
+    周边离焦性镜片通过光学设计干预周边成像位置，在保证中心视力清晰的同时，使周边成像落在视网膜前，从而抑制眼轴过度增长，帮助发育期青少年减缓近视加深。
+  officer: 周边离焦性镜片
+  role: Peripheral Defocus Spectacle Lens
+  dept: 青少年近视防控
+  detail: departments/周边离焦性镜片.md
+
+- intro: >
+    青少年渐变焦镜片通过从远到近连续变化的屈光设计，减少近距离用眼时的调节负担，缓解视疲劳，并在合适人群中辅助控制近视发展，但需严格视光评估与个性化验配。
+  officer: 青少年渐变焦镜片
+  role: Progressive Addition Lens for Youth
+  dept: 青少年视功能管理
+  detail: departments/青少年渐变焦镜片.md
+
+- intro: >
+    视觉训练通过系统化的训练手段提升双眼运动、调节与协同能力，强化视觉信息的接收与处理效率，用于改善视疲劳、双眼视功能异常及与学习和运动相关的视觉问题。
+  officer: 视觉训练
+  role: Vision Therapy & Visual Function Training
+  dept: 双眼视功能康复
+  detail: departments/视觉训练.md
+
+- intro: >
+    圆锥角膜是一种进行性角膜扩张性疾病，当框架眼镜无法获得满意视力时，需通过个性化接触镜设计重建规则屈光界面，以提升视力质量并兼顾角膜长期健康与安全。
+  officer: 圆锥角膜验配
+  role: Keratoconus Contact Lens Fitting
+  dept: 角膜疾病与复杂屈光矫正
+  detail: departments/圆锥角膜验配.md
+
+- intro: >
+    视疲劳是多种眼部、生理及心理因素共同作用的结果，表现为用眼后不适、视功能下降甚至全身症状，需要通过系统检查找出诱因并进行针对性的视觉与用眼管理。
+  officer: 减缓视疲劳
+  role: Visual Fatigue Assessment & Management
+  dept: 视功能评估与视觉健康管理
+  detail: departments/减缓视疲劳.md
+
+- intro: >
+    老花是一种随年龄增长而出现的正常生理现象，本质是眼睛调节能力下降导致近距离视物困难，通过专业验光与个性化镜片方案，可有效恢复近用视觉舒适度。
+  officer: 解决老花困扰
+  role: Presbyopia Correction & Management
+  dept: 中老年视觉健康管理
+  detail: departments/解决老花困扰.md
