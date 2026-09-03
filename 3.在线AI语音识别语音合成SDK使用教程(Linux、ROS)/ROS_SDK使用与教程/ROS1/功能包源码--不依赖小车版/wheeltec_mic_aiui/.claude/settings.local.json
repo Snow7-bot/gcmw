@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /tmp/wheeltec_orig)",
+      "Bash(unzip -o wheeltec_mic_aiui.zip -d /tmp/wheeltec_orig)",
+      "Bash(cp wheeltec_mic.cpp wheeltec_mic.cpp.bak)",
+      "Bash(awk 'NR==284{ *)",
+      "Bash(cd /tmp)",
+      "Bash(python3 -c ' *)",
+      "Read(//tmp/**)",
+      "Bash(python3 -c \"import docx; print\\('OK'\\)\")",
+      "Bash(pip3 install *)",
+      "Bash(python3 *)"
+    ]
+  }
+}

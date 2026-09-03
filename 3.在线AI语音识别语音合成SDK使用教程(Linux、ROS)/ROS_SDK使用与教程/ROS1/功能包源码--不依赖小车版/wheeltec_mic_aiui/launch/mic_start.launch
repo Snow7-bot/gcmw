@@ -1,0 +1,40 @@
+<launch>
+  <arg name="sound_device"  default="NEW_M2" doc="opt: M07, M2, NEW_M2"/>
+ 
+  <group if="$(eval sound_device == 'M07')">
+    <node pkg="wheeltec_mic_aiui" type="wheeltecM07" name="wheeltecM07" output="screen">
+      <param name="usart_port_name"  type="string" value="/dev/wheeltec_mic"/>
+    </node>
+
+    <node pkg="wheeltec_mic_aiui" type="wheeltec_mic_aiui" name="wheeltec_mic_aiui" output="screen">
+      <param name="source_path" type="string" value="$(find wheeltec_mic_aiui)"/>
+      <param name="RECORD_DEVICE_NAME" type="string" value="hw:CARD=Device,DEV=0"/>
+    </node>
+  </group>
+
+  <group if="$(eval sound_device == 'M2')">
+    <node pkg="wheeltec_mic_aiui" type="wheeltecMic" name="wheeltecMic" output="screen">
+      <param name="usart_port_name"  type="string" value="/dev/wheeltec_mic"/>
+    </node>
+
+    <node pkg="wheeltec_mic_aiui" type="wheeltec_mic_aiui" name="wheeltec_mic_aiui" output="screen">
+      <param name="source_path" type="string" value="$(find wheeltec_mic_aiui)"/>
+      <param name="RECORD_DEVICE_NAME" type="string" value="hw:CARD=XFMDPV0018,DEV=0"/>
+    </node>
+  </group>
+
+  <group if="$(eval sound_device == 'NEW_M2')">
+    <node pkg="wheeltec_mic_aiui" type="wheeltecMicM2N" name="wheeltecMicM2N" output="screen">
+      <param name="usart_port_name"  type="string" value="/dev/wheeltec_mic"/>
+      <param name="virtual_usart_port_name"  type="string" value="/dev/wheeltec_mic_virtual"/>
+    </node>
+
+    <node pkg="wheeltec_mic_aiui" type="wheeltec_mic_aiui" name="wheeltec_mic_aiui" output="screen">
+      <param name="source_path" type="string" value="$(find wheeltec_mic_aiui)"/>
+      <param name="RECORD_DEVICE_NAME" type="string" value="hw:CARD=L6Microphone,DEV=0"/>
+    </node>
+  </group>
+
+  <node pkg="wheeltec_mic_aiui" type="commandRecognition" name="commandRecognition" output="screen"/>
+
+</launch>

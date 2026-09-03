@@ -1,0 +1,5 @@
+离线命令词识别功能和SDK介绍：https://www.xfyun.cn/doc/asr/commandWord/Linux-SDK.html
+
+API接口：https://www.xfyun.cn/doc/mscapi/Windows&Linux/WLfilelist.html
+
+错误码查询：https://www.xfyun.cn/document/error-code
