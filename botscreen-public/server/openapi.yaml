@@ -1,0 +1,382 @@
+openapi: 3.0.3
+info:
+  title: 互动问答后端 API
+  description: |
+    botscreen 互动问答与语音唤醒后端接口清单。
+    本清单依据 `server/qa_server.py` 的实际 FastAPI 路由整理。
+  version: 3.0.0
+servers:
+  - url: http://127.0.0.1:8000
+    description: 本机问答服务
+security: []
+tags:
+  - name: 问答
+    description: 知识库检索与大模型兜底问答
+  - name: 麦克风
+    description: 前端、语音转发节点与硬件唤醒状态协作
+  - name: 实时推送
+    description: 基于 Server-Sent Events 的状态与答案推送
+  - name: 系统
+    description: 服务状态检查
+paths:
+  /chat:
+    post:
+      tags: [问答]
+      summary: 提交问题并获取回答
+      description: 优先检索本地知识库，未命中时调用 DeepSeek，并将回答推送到 SSE 客户端。
+      operationId: chatApi
+      x-source-location: server/qa_server.py:485
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            example:
+              question: 什么是近视？
+              session_id: screen-session-01
+      responses:
+        '200':
+          description: 问答结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+              example:
+                user_question: 什么是近视？
+                robot_answer: 近视会让远处的东西看起来模糊，需要好好保护眼睛哦！
+                source: kb
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /suggestions:
+    get:
+      tags: [问答]
+      summary: 获取推荐问题
+      description: 返回知识库中前 6 个问题。
+      operationId: getSuggestions
+      x-source-location: server/qa_server.py:522
+      responses:
+        '200':
+          description: 推荐问题列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuggestionsResponse'
+
+  /mic/wakeup:
+    post:
+      tags: [麦克风]
+      summary: 手动唤醒麦克风
+      description: 前端点击麦克风后设置唤醒标记，并推送 `manual_wakeup` 事件。
+      operationId: micWakeup
+      x-source-location: server/qa_server.py:541
+      responses:
+        '200':
+          description: 唤醒成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOkResponse'
+
+  /mic/hw_wakeup:
+    post:
+      tags: [麦克风]
+      summary: 通知硬件语音唤醒
+      description: 语音转发节点检测到唤醒词后调用；若已处于唤醒状态则不重复触发。
+      operationId: micHardwareWakeup
+      x-source-location: server/qa_server.py:553
+      responses:
+        '200':
+          description: 硬件唤醒处理结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HardwareWakeupResponse'
+              examples:
+                accepted:
+                  summary: 已接受新唤醒
+                  value: { status: ok }
+                duplicate:
+                  summary: 麦克风已经处于唤醒状态
+                  value: { status: already_triggered }
+
+  /mic/stop:
+    post:
+      tags: [麦克风]
+      summary: 停止麦克风会话
+      description: 清除唤醒状态与最近 ASR 文本，并推送 `mic_stop` 事件。
+      operationId: micStop
+      x-source-location: server/qa_server.py:567
+      responses:
+        '200':
+          description: 停止成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOkResponse'
+
+  /mic/status:
+    get:
+      tags: [麦克风]
+      summary: 查询麦克风状态
+      description: 供前端和 ROS/ROS2 语音转发节点轮询唤醒状态及最近 ASR 文本。
+      operationId: getMicStatus
+      x-source-location: server/qa_server.py:578
+      responses:
+        '200':
+          description: 当前麦克风状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MicStatusResponse'
+              example:
+                triggered: true
+                elapsed_seconds: 2.5
+                asr_text: ''
+
+  /mic/notify_asr:
+    post:
+      tags: [麦克风]
+      summary: 回传 ASR 识别文本
+      description: 语音转发节点收到 ASR 结果后回传文本，并推送 `asr_received` 事件。
+      operationId: notifyAsr
+      x-source-location: server/qa_server.py:593
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AsrNotifyBody'
+            example:
+              text: 看多久要休息眼睛？
+      responses:
+        '200':
+          description: 回传成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOkResponse'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /sse:
+    get:
+      tags: [实时推送]
+      summary: 订阅答案与麦克风状态事件
+      description: |
+        建立长连接并接收两类 SSE 消息：
+        - 默认 `message` 事件：问答结果，数据结构见 `SseAnswerEvent`。
+        - `mic_status` 事件：麦克风状态变化，数据结构见 `MicStatusEvent`。
+
+        服务端约每 0.5 秒检查一次新事件。
+      operationId: subscribeEvents
+      x-source-location: server/qa_server.py:603
+      responses:
+        '200':
+          description: SSE 事件流
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-cache }
+            Connection:
+              schema: { type: string, example: keep-alive }
+            X-Accel-Buffering:
+              schema: { type: string, example: 'no' }
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                answer:
+                  summary: 默认问答事件
+                  value: |-
+                    data: {"user_question":"什么是近视？","robot_answer":"近视会让远处变模糊哦！","source":"kb","id":1}
+
+                microphone:
+                  summary: 麦克风状态事件
+                  value: |-
+                    event: mic_status
+                    data: {"id":1,"event":"hw_wakeup","text":"","timestamp":1767225600.0}
+
+      x-event-schemas:
+        message:
+          $ref: '#/components/schemas/SseAnswerEvent'
+        mic_status:
+          $ref: '#/components/schemas/MicStatusEvent'
+
+  /health:
+    get:
+      tags: [系统]
+      summary: 服务健康检查
+      operationId: healthCheck
+      x-source-location: server/qa_server.py:639
+      responses:
+        '200':
+          description: 服务、知识库和匹配阈值状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+                version: 3.0.0
+                kb_entries: 9
+                docx_path: 'D:\机器人-科普问答.docx'
+                match_threshold: 0.22
+
+components:
+  responses:
+    ValidationError:
+      description: 请求参数校验失败
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HTTPValidationError'
+
+  schemas:
+    ChatRequest:
+      type: object
+      required: [question]
+      properties:
+        question:
+          type: string
+          description: 用户问题；仅包含空白字符时会返回 `source=error` 的 200 响应。
+        session_id:
+          type: string
+          default: default
+          description: 会话标识，用于保留最多 10 轮、30 分钟有效的对话历史。
+
+    ChatResponse:
+      type: object
+      required: [user_question, robot_answer, source]
+      properties:
+        user_question:
+          type: string
+        robot_answer:
+          type: string
+        source:
+          type: string
+          enum: [kb, deepseek, error]
+          description: 回答来源：本地知识库、DeepSeek 或错误兜底。
+
+    SuggestionsResponse:
+      type: object
+      required: [suggestions]
+      properties:
+        suggestions:
+          type: array
+          maxItems: 6
+          items:
+            type: string
+
+    AsrNotifyBody:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          description: ASR 识别出的原始文本。
+
+    StatusOkResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    HardwareWakeupResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, already_triggered]
+
+    MicStatusResponse:
+      type: object
+      required: [triggered, elapsed_seconds, asr_text]
+      properties:
+        triggered:
+          type: boolean
+        elapsed_seconds:
+          type: number
+          format: float
+          minimum: 0
+          description: 本次唤醒后的经过秒数，保留 1 位小数；未唤醒时为 0。
+        asr_text:
+          type: string
+          description: 最近一次 ASR 文本；尚未收到时为空字符串。
+
+    SseAnswerEvent:
+      allOf:
+        - $ref: '#/components/schemas/ChatResponse'
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: integer
+              minimum: 1
+
+    MicStatusEvent:
+      type: object
+      required: [id, event, text, timestamp]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        event:
+          type: string
+          enum: [manual_wakeup, hw_wakeup, mic_stop, asr_received]
+        text:
+          type: string
+          description: "`asr_received` 事件携带 ASR 文本，其他事件通常为空字符串。"
+        timestamp:
+          type: number
+          format: double
+          description: Unix 时间戳（秒）。
+
+    HealthResponse:
+      type: object
+      required: [status, version, kb_entries, docx_path, match_threshold]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+          example: 3.0.0
+        kb_entries:
+          type: integer
+          minimum: 0
+        docx_path:
+          type: string
+          description: 当前使用的知识库 DOCX 路径。
+        match_threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationError'
+
+    ValidationError:
+      type: object
+      required: [loc, msg, type]
+      properties:
+        loc:
+          type: array
+          items:
+            oneOf:
+              - type: string
+              - type: integer
+        msg:
+          type: string
+        type:
+          type: string

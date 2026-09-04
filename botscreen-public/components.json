@@ -1,0 +1,14 @@
+{
+  "style": "default",
+  "typescript": true,
+  "tailwind": {
+    "config": "",
+    "css": "./src/renderer/src/assets/base.css",
+    "baseColor": "slate",
+    "cssVariables": true
+  },
+  "aliases": {
+    "components": "@renderer/components",
+    "utils": "@renderer/lib/utils"
+  }
+}

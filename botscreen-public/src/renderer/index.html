@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Electron</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self' rc: data: blob:;
+        script-src 'self' rc: data: blob:;
+        style-src 'self' 'unsafe-inline' rc: data: blob:;
+        img-src 'self' rc: data: blob: *;
+        frame-src 'self' rc: data: blob: *;
+        media-src 'self' rc: data: blob:;
+        connect-src 'self' http://127.0.0.1:* http://localhost:*;
+      "
+    />
+  </head>
+
+  <body class="light">
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

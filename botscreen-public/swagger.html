@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>botscreen Swagger 独立接口文档</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css" />
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f5f7fa;
+    }
+    header {
+      background: #0f172a;
+      color: #fff;
+      padding: 18px 24px;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 20px;
+    }
+    header p {
+      margin: 6px 0 0;
+      color: #94a3b8;
+      font-size: 13px;
+    }
+    .note {
+      max-width: 1460px;
+      margin: 16px auto 0;
+      padding: 0 20px;
+    }
+    .note-box {
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      color: #065f46;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+    #swagger-ui {
+      max-width: 1460px;
+      margin: 16px auto;
+      padding: 0 20px 40px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🤖 botscreen Swagger 独立接口文档</h1>
+    <p>无需启动后端 · 打开即看 · 可分享</p>
+  </header>
+
+  <div class="note">
+    <div class="note-box">
+      📌 这是一个独立 HTML 文档，已经把 OpenAPI 接口数据内嵌进来。
+      别人拿到这个文件后，直接用浏览器打开即可查看 Swagger 接口，不需要启动后端。
+    </div>
+  </div>
+
+  <div id="swagger-ui"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+  <script>
+    const spec = {
+      openapi: "3.0.3",
+      info: {
+        title: "botscreen 互动问答后端 API",
+        description: "天津市眼科医院视光中心智能导诊互动问答服务。\n\n独立离线文档，内嵌 OpenAPI 数据，无需启动后端即可查看。",
+        version: "3.0.0",
+        contact: {
+          name: "botscreen",
+          url: "https://github.com/xinqi123321/botscreen"
+        }
+      },
+      servers: [
+        {
+          url: "http://127.0.0.1:8000",
+          description: "本地后端服务"
+        }
+      ],
+      tags: [
+        { name: "问答", description: "核心问答接口：本地知识库匹配 + DeepSeek 大模型兜底" },
+        { name: "麦克风", description: "麦克风唤醒、停止、状态查询与 ASR 文本回调" },
+        { name: "实时推送", description: "SSE 服务端推送：问答答案与麦克风状态事件" },
+        { name: "系统", description: "健康检查与运行状态" }
+      ],
+      paths: {
+        "/chat": {
+          post: {
+            tags: ["问答"],
+            summary: "提交问题获取回答",
+            description: "先检索本地知识库，未命中时调用 DeepSeek 大模型兜底。",
+            operationId: "chat",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/ChatRequest" }
+                }
+              }
+            },
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/ChatResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/suggestions": {
+          get: {
+            tags: ["问答"],
+            summary: "获取示例问题列表",
+            operationId: "getSuggestions",
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/SuggestionsResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/mic/wakeup": {
+          post: {
+            tags: ["麦克风"],
+            summary: "手动唤醒麦克风",
+            operationId: "micWakeup",
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/OkResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/mic/hw_wakeup": {
+          post: {
+            tags: ["麦克风"],
+            summary: "硬件语音唤醒",
+            operationId: "micHwWakeup",
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/OkResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/mic/stop": {
+          post: {
+            tags: ["麦克风"],
+            summary: "停止麦克风聆听",
+            operationId: "micStop",
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/OkResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/mic/status": {
+          get: {
+            tags: ["麦克风"],
+            summary: "查询麦克风状态",
+            operationId: "micStatus",
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/MicStatusResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/mic/notify_asr": {
+          post: {
+            tags: ["麦克风"],
+            summary: "上报 ASR 识别结果",
+            operationId: "micNotifyAsr",
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/AsrNotifyBody" }
+                }
+              }
+            },
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/OkResponse" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/sse": {
+          get: {
+            tags: ["实时推送"],
+            summary: "SSE 实时事件流",
+            description: "SSE 长连接，推送问答答案与麦克风状态事件。",
+            operationId: "sse",
+            responses: {
+              "200": {
+                description: "SSE 流",
+                content: {
+                  "text/event-stream": {
+                    schema: {
+                      type: "string",
+                      description: "SSE 文本流"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/health": {
+          get: {
+            tags: ["系统"],
+            summary: "健康检查",
+            operationId: "health",
+            responses: {
+              "200": {
+                description: "成功",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/HealthResponse" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      components: {
+        schemas: {
+          ChatRequest: {
+            type: "object",
+            required: ["question"],
+            properties: {
+              question: {
+                type: "string",
+                description: "用户提问内容",
+                example: "眼轴长度是多少"
+              },
+              session_id: {
+                type: "string",
+                description: "会话 ID，用于多轮上下文",
+                default: "default",
+                example: "session-001"
+              }
+            }
+          },
+          ChatResponse: {
+            type: "object",
+            properties: {
+              user_question: {
+                type: "string",
+                description: "用户原始问题",
+                example: "眼轴长度是多少"
+              },
+              robot_answer: {
+                type: "string",
+                description: "机器人回答",
+                example: "6 岁小朋友平均眼轴长度是 22.46mm～"
+              },
+              source: {
+                type: "string",
+                description: "回答来源",
+                enum: ["kb", "deepseek", "error"],
+                example: "kb"
+              }
+            }
+          },
+          SuggestionsResponse: {
+            type: "object",
+            properties: {
+              suggestions: {
+                type: "array",
+                description: "示例问题列表",
+                items: {
+                  type: "string"
+                },
+                example: ["眼轴长度是多少", "近视是怎么分级的"]
+              }
+            }
+          },
+          OkResponse: {
+            type: "object",
+            properties: {
+              status: {
+                type: "string",
+                description: "操作结果状态",
+                example: "ok"
+              }
+            }
+          },
+          MicStatusResponse: {
+            type: "object",
+            properties: {
+              triggered: {
+                type: "boolean",
+                description: "是否处于唤醒/聆听状态",
+                example: true
+              },
+              elapsed_seconds: {
+                type: "number",
+                format: "float",
+                description: "已唤醒持续秒数",
+                example: 3.2
+              },
+              asr_text: {
+                type: "string",
+                description: "最近一次 ASR 识别文本",
+                example: "什么是近视"
+              }
+            }
+          },
+          AsrNotifyBody: {
+            type: "object",
+            required: ["text"],
+            properties: {
+              text: {
+                type: "string",
+                description: "ASR 识别到的文本",
+                example: "什么是近视"
+              }
+            }
+          },
+          HealthResponse: {
+            type: "object",
+            properties: {
+              status: {
+                type: "string",
+                description: "服务状态",
+                example: "ok"
+              },
+              version: {
+                type: "string",
+                description: "服务版本",
+                example: "3.0.0"
+              },
+              kb_entries: {
+                type: "integer",
+                description: "知识库条目数",
+                example: 9
+              },
+              docx_path: {
+                type: "string",
+                description: "当前加载的 docx 路径",
+                example: "D:\\机器人-科普问答.docx"
+              },
+              match_threshold: {
+                type: "number",
+                format: "float",
+                description: "知识库匹配阈值",
+                example: 0.22
+              }
+            }
+          }
+        }
+      }
+    };
+
+    window.onload = function () {
+      window.ui = SwaggerUIBundle({
+        spec: spec,
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        displayRequestDuration: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIBundle.SwaggerUIStandalonePreset
+        ],
+        layout: "BaseLayout"
+      });
+    };
+  </script>
+</body>
+</html>

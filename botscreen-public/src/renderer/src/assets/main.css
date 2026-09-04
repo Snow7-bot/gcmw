@@ -1,0 +1,14 @@
+@import './base.css';
+
+/* fix mathjax */
+mjx-container svg {
+  display: inline-block;
+}
+
+::-webkit-scrollbar {
+  width: 0;
+}
+
+body {
+  background: url(rc://bg-blank.png) center / cover no-repeat fixed;
+}
