@@ -17,12 +17,38 @@ def test_happy_path():
     sm.transition(RunState.COMPLETED)
     assert sm.current == RunState.COMPLETED
     assert sm.is_terminal
-    assert sm.event_seq == 7
+    assert sm.event_seq == 8  # run.accepted + 7 transitions
 
 
-def test_terminal_state_is_irreversible():
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        RunState.COMPLETED,
+        RunState.DEGRADED,
+        RunState.HANDOFF,
+        RunState.FAILED,
+        RunState.CANCELLED,
+    ],
+)
+def test_terminal_state_is_irreversible(terminal):
+    # Go through a legal path to each terminal state from ACCEPTED.
     sm = RunStateMachine("run-2")
-    sm.transition(RunState.CANCELLED)
+    if terminal == RunState.COMPLETED:
+        for s in [
+            RunState.GUARDING,
+            RunState.ROUTING,
+            RunState.RETRIEVING,
+            RunState.DRAFTING,
+            RunState.VERIFYING,
+            RunState.STREAMING,
+        ]:
+            sm.transition(s)
+    elif terminal == RunState.DEGRADED:
+        for s in [RunState.GUARDING, RunState.ROUTING, RunState.RETRIEVING]:
+            sm.transition(s)
+    elif terminal in (RunState.HANDOFF, RunState.FAILED):
+        sm.transition(RunState.GUARDING)
+    sm.transition(terminal)
     with pytest.raises(ValueError):
         sm.transition(RunState.ACCEPTED)
 
@@ -43,8 +69,8 @@ def test_event_has_utc_timestamp_and_increasing_seq():
     sm = RunStateMachine("run-5")
     e1 = sm.transition(RunState.GUARDING)
     e2 = sm.transition(RunState.ROUTING)
-    assert e1.event_seq == 1
-    assert e2.event_seq == 2
+    assert e1.event_seq == 2
+    assert e2.event_seq == 3
     assert e1.timestamp.tzinfo is not None
     assert e1.timestamp.tzinfo == timezone.utc
     assert e2.timestamp > e1.timestamp
@@ -102,3 +128,34 @@ def test_coordinator_empty_run_id_does_not_pollute_registry():
     # A later valid request should still work
     machine = coordinator.start_or_get("request-40", "run-40")
     assert machine is not None
+
+
+def test_initial_accepted_event_is_recorded():
+    sm = RunStateMachine("run-50")
+    assert sm.event_seq == 1
+    assert sm.history[0].state == RunState.ACCEPTED
+    assert sm.history[0].event_seq == 1
+
+
+def test_registry_rejects_empty_run_id():
+    reg = RunIdempotencyRegistry()
+    with pytest.raises(ValueError):
+        reg.register("request-60", "")
+
+
+def test_coordinator_concurrent_start_same_request_returns_same_run():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.orchestration.state_machine import RunCoordinator
+
+    coordinator = RunCoordinator()
+    results = []
+
+    def start():
+        return coordinator.start_or_get("request-concurrent", "run-concurrent")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: start(), range(16)))
+
+    assert all(machine is results[0] for machine in results)
+    assert coordinator.get_machine("run-concurrent") is results[0]

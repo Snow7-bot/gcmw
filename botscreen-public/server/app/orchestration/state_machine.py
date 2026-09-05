@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 
 from ..contracts.events import RunEvent
@@ -65,8 +66,18 @@ class RunStateMachine:
             raise ValueError("run_id is required")
         self.run_id = run_id
         self.current = initial
-        self.event_seq = 0
         self.events: list[RunEvent] = []
+        if initial == RunState.ACCEPTED:
+            self.events.append(
+                RunEvent(
+                    run_id=run_id,
+                    state=RunState.ACCEPTED,
+                    event_seq=1,
+                    payload={},
+                    timestamp=datetime.now(timezone.utc),
+                )
+            )
+        self.event_seq = len(self.events)
 
     def _next_seq(self) -> int:
         self.event_seq += 1
@@ -117,6 +128,8 @@ class RunIdempotencyRegistry:
         """Returns True if this request_id is new, False if already known."""
         if not request_id:
             raise ValueError("request_id is required")
+        if not run_id:
+            raise ValueError("run_id is required")
         if request_id in self._seen:
             return False
         self._seen[request_id] = run_id
@@ -136,22 +149,24 @@ class RunCoordinator:
     def __init__(self) -> None:
         self._registry = RunIdempotencyRegistry()
         self._machines: dict[str, RunStateMachine] = {}
+        self._lock = threading.Lock()
 
     def start_or_get(self, request_id: str, run_id: str) -> RunStateMachine:
         if not request_id:
             raise ValueError("request_id is required")
         if not run_id:
             raise ValueError("run_id is required")
-        existing_run_id = self._registry.get_run_id(request_id)
-        if existing_run_id is not None:
-            return self._machines[existing_run_id]
-        if run_id in self._machines:
-            raise ValueError(f"run_id already exists: {run_id}")
-        if not self._registry.register(request_id, run_id):
-            raise RuntimeError("request_id registration failed unexpectedly")
-        machine = RunStateMachine(run_id)
-        self._machines[run_id] = machine
-        return machine
+        with self._lock:
+            existing_run_id = self._registry.get_run_id(request_id)
+            if existing_run_id is not None:
+                return self._machines[existing_run_id]
+            if run_id in self._machines:
+                raise ValueError(f"run_id already exists: {run_id}")
+            if not self._registry.register(request_id, run_id):
+                raise RuntimeError("request_id registration failed unexpectedly")
+            machine = RunStateMachine(run_id)
+            self._machines[run_id] = machine
+            return machine
 
     def get_machine(self, run_id: str) -> RunStateMachine | None:
         return self._machines.get(run_id)
