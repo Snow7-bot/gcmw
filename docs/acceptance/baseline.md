@@ -83,7 +83,7 @@
 - `/sse` 无鉴权，任何能访问 8000 端口的人可订阅事件。
 - `qa_server.py` 读取外部 DOCX，若文件不存在则使用内置知识，但内置知识与 YAML 存在双源。
 - Electron 主进程存在硬编码退出口令。
-- 仓库中可能存在疑似 AIUI 凭据，需 Secret 扫描确认。
+- 历史扫描已确认 AIUI 凭据候选；当前工作区已清理，轮换未完成。
 - 日志中可能打印问题和回答明文，未脱敏。
 - 未实现取消、超时、幂等、审计和引用。
 
@@ -166,7 +166,7 @@ uvicorn==0.52.4
 ```text
 npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
 npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
-botscreen@1.0.0 /Users/w1nstep/Documents/Codex/2026-09-04/https-github-com-snow7-bot-gcmw/work/gcmw-sparse/botscreen-public
+botscreen@1.0.0 <workspace>/botscreen-public
 ├── @electron-toolkit/eslint-config-prettier@3.0.0
 ├── @electron-toolkit/eslint-config-ts@3.1.0
 ├── @electron-toolkit/preload@3.0.2
