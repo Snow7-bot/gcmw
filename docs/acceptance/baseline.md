@@ -87,6 +87,26 @@
 - 日志中可能打印问题和回答明文，未脱敏。
 - 未实现取消、超时、幂等、审计和引用。
 
+## 4.1 关键依赖版本
+
+| 依赖 | 版本来源 | 版本 |
+|---|---|---|
+| Electron | package.json | ^40.0.0 |
+| Vue | package.json | ^3.5.27 |
+| TypeScript | package.json | ^5.9.3 |
+| FastAPI | server/requirements.txt | >=0.100.0 |
+| Uvicorn | server/requirements.txt | >=0.23.0 |
+| Pydantic | 随 FastAPI 安装 | 待锁定 |
+| jieba | server/requirements.txt | >=0.42.1 |
+| Python | 开发环境 | 待确认（建议 3.11/3.12） |
+
+## 4.2 复核记录
+
+- 复核日期：2026-09-05
+- 复核人：Snow7
+- 复核方式：仓库静态盘点 + 接口 grep
+- 待补：实际 `pip freeze` / `npm ls` 输出、失败日志和精确锁定版本
+
 ## 5. 复核命令
 
 ```bash
