@@ -818,7 +818,13 @@ export class InfiniteGridClass implements EventHandlerHost, DisposableHost, Grid
    * Gets statistics about the current grid
    * @returns Object containing grid statistics
    */
-  public getGridStats() {
+  public getGridStats(): {
+    totalGroups: number
+    tilesPerGroup: number
+    totalTiles: number
+    totalTextures: number
+    memoryEstimate: string
+  } {
     return this.gridManager.getGridStats();
   }
 

@@ -42,12 +42,12 @@ function generateStar(): Sparkle {
 }
 
 // Initialize sparkles array with random stars
-function initializeStars() {
+function initializeStars(): void {
   sparkles.value = Array.from({ length: props.sparklesCount }, generateStar);
 }
 
 // Update sparkles - regenerate dead ones and update lifespans
-function updateStars() {
+function updateStars(): void {
   sparkles.value = sparkles.value.map((star) => {
     if (star.lifespan <= 0) {
       return generateStar();

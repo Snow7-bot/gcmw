@@ -19,7 +19,7 @@ if (!modal) {
 
 const isButton = computed(() => props.as === "button");
 
-const onClick = (event: MouseEvent) => {
+const onClick = (event: MouseEvent): void => {
   if (props.disabled) return;
   event.preventDefault();
   modal.openModal();

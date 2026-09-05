@@ -26,26 +26,26 @@ const autorotate = ref(props.autoRotate);
 const testimonialsRef = ref<HTMLElement | null>(null);
 let intervalId: number | null = null;
 
-function heightFix() {
+function heightFix(): void {
   if (testimonialsRef.value && testimonialsRef.value.parentElement) {
     testimonialsRef.value.parentElement.style.height = `${testimonialsRef.value.clientHeight}px`;
   }
 }
 
-function setActiveIndex(index: number) {
+function setActiveIndex(index: number): void {
   active.value = index;
   autorotate.value = false;
   resetAutorotate();
 }
 
-function startAutorotate() {
+function startAutorotate(): void {
   intervalId = window.setInterval(() => {
     active.value = active.value + 1 === props.testimonials.length ? 0 : active.value + 1;
     heightFix();
   }, props.duration * 1000);
 }
 
-function resetAutorotate() {
+function resetAutorotate(): void {
   if (intervalId) {
     clearInterval(intervalId);
   }
@@ -54,11 +54,11 @@ function resetAutorotate() {
   }
 }
 
-function handleNext() {
+function handleNext(): void {
   setActiveIndex((active.value + 1) % props.testimonials.length);
 }
 
-function handlePrev() {
+function handlePrev(): void {
   setActiveIndex((active.value - 1 + props.testimonials.length) % props.testimonials.length);
 }
 

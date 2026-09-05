@@ -12,8 +12,8 @@ if (process.contextIsolated) {
   contextBridge.exposeInMainWorld('electron', electronAPI)
   contextBridge.exposeInMainWorld('api', api)
 } else {
-  // @ts-ignore
+  // @ts-ignore - electronAPI types are not available in non-isolated context
   window.electron = electronAPI
-  // @ts-ignore
+  // @ts-ignore - api type is declared globally for renderer
   window.api = api
 }
