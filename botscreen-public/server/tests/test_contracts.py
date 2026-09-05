@@ -196,3 +196,34 @@ def test_naive_datetime_rejected():
             event="accepted",
             timestamp=naive,
         )
+
+
+def test_invalid_inputs_for_remaining_contracts():
+    from app.contracts.agent import AgentContext, ToolRequest
+    from app.contracts.common import DeviceContext, RunContext
+    from app.contracts.model import ToolSpec
+
+    invalid_cases = [
+        lambda: ToolSpec(name="", description="x"),
+        lambda: AgentContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="",
+            channel="text",
+        ),
+        lambda: DeviceContext(tenant_id="t1", device_id=""),
+        lambda: ToolRequest(tool_name="", arguments={}),
+        lambda: RunContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="",
+            request_id="r",
+            idempotency_key="i",
+            channel="text",
+        ),
+    ]
+    for factory in invalid_cases:
+        with pytest.raises(ValidationError):
+            factory()

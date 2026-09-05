@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class RiskLevel(str, Enum):
@@ -49,7 +48,7 @@ class AgentContext(BaseModel):
     short_memory_summary: str = ""
     permitted_long_memory: bool = False
     risk_level: RiskLevel = RiskLevel.LOW
-    deadline: datetime | None = None
+    deadline: AwareDatetime | None = None
 
 
 class ToolRequest(BaseModel):
@@ -57,7 +56,7 @@ class ToolRequest(BaseModel):
 
     tool_name: str = Field(..., min_length=1, max_length=128)
     arguments: dict[str, Any] = Field(default_factory=dict)
-    deadline: datetime | None = None
+    deadline: AwareDatetime | None = None
 
 
 class ToolResult(BaseModel):
