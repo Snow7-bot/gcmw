@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class Channel(str, Enum):
@@ -45,5 +45,7 @@ class RunContext(BaseModel):
     request_id: str = Field(..., min_length=1, max_length=128)
     idempotency_key: str = Field(..., min_length=1, max_length=128)
     channel: Channel
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: AwareDatetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     locale: str = "zh-CN"

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class AuditRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    occurred_at: AwareDatetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     tenant_id: str = Field(..., min_length=1, max_length=64)
     actor_type: str = Field(..., min_length=1, max_length=32)
     actor_id_hash: str = Field(..., min_length=1, max_length=128)

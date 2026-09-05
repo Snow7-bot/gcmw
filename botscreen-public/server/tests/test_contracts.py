@@ -157,3 +157,42 @@ def test_roundtrip_event_contracts():
 def test_text_content_requires_text():
     with pytest.raises(ValidationError):
         ContentPart(type=ContentType.TEXT, text="   ")
+
+
+def test_roundtrip_evidence_toolspec_contentpart_audit():
+    from app.contracts.agent import Evidence
+    from app.contracts.audit import AuditRecord
+    from app.contracts.model import ToolSpec
+
+    objects = [
+        Evidence(source_id="src-1", source_type="md", title="t", content_hash="h"),
+        ToolSpec(name="knowledge.search", description="search"),
+        ContentPart(type=ContentType.TEXT, text="hello"),
+        ContentPart(
+            type=ContentType.IMAGE, media_ref="rc://a.png", mime_type="image/png"
+        ),
+        AuditRecord(
+            tenant_id="t1",
+            actor_type="user",
+            actor_id_hash="h1",
+            request_id="r1",
+            action="test",
+        ),
+    ]
+    for obj in objects:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_naive_datetime_rejected():
+    from datetime import datetime
+
+    naive = datetime.fromisoformat("2026-01-01T00:00:00")
+    with pytest.raises(ValidationError):
+        SSEEvent(
+            seq=1,
+            run_id="run-1",
+            layer="process",
+            event="accepted",
+            timestamp=naive,
+        )
