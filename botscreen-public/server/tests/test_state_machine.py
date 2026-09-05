@@ -67,3 +67,17 @@ def test_duplicate_request_id_returns_original_run_id_and_does_not_advance_event
     assert reg.register("request-10", "run-10") is False
     assert reg.get_run_id("request-10") == "run-10"
     assert sm.event_seq == before_seq
+
+
+def test_coordinator_duplicate_start_returns_original_run_without_advancing():
+    from app.orchestration.state_machine import RunCoordinator
+
+    coordinator = RunCoordinator()
+    machine = coordinator.start_or_get("request-20", "run-20")
+    machine.transition(RunState.GUARDING)
+    before_seq = machine.event_seq
+
+    duplicate = coordinator.start_or_get("request-20", "run-21")
+    assert duplicate is machine
+    assert duplicate.event_seq == before_seq
+    assert coordinator.get_machine("run-21") is None

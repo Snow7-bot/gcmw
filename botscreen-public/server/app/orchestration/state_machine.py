@@ -124,3 +124,28 @@ class RunIdempotencyRegistry:
 
     def get_run_id(self, request_id: str) -> str | None:
         return self._seen.get(request_id)
+
+
+class RunCoordinator:
+    """Connects request_id idempotency with Run creation/execution entry.
+
+    Duplicate start requests return the original RunStateMachine and do not
+    create or advance another run.
+    """
+
+    def __init__(self) -> None:
+        self._registry = RunIdempotencyRegistry()
+        self._machines: dict[str, RunStateMachine] = {}
+
+    def start_or_get(self, request_id: str, run_id: str) -> RunStateMachine:
+        existing_run_id = self._registry.get_run_id(request_id)
+        if existing_run_id is not None:
+            return self._machines[existing_run_id]
+        if not self._registry.register(request_id, run_id):
+            raise RuntimeError("request_id registration failed unexpectedly")
+        machine = RunStateMachine(run_id)
+        self._machines[run_id] = machine
+        return machine
+
+    def get_machine(self, run_id: str) -> RunStateMachine | None:
+        return self._machines.get(run_id)
