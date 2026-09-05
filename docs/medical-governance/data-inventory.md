@@ -3,21 +3,21 @@
 - 盘点日期：2026-09-05
 - 对应 Issue：#3
 - 外部 DOCX：未提供/待确认，本次仅盘点仓库内置数据
-- 授权结论：数据源均已由 `Snow7` 授权
+- 授权声明：`Snow7` 声明数据源已授权；授权证据待核验，暂不得进入生产索引
 - Owner：`Snow7`
 
 ## 1. 数据源总览
 
 | 数据源 | 位置 | 数量 | 类型 | 授权状态 | Owner |
 |---|---|---|---:|---|---|
-| 儿童 FAQ | `botscreen-public/server/knowledge_base.yml` | 9 | YAML | 已授权 | Snow7 |
-| qa_server 内置 FAQ | `botscreen-public/server/qa_server.py` | 9 | Python 内置 | 已授权 | Snow7 |
-| 特色技术 | `departments/departments.yml` | 8 | YAML | 已授权 | Snow7 |
-| 技术详情/科普 | `departments/*.md` | 8 | Markdown | 已授权 | Snow7 |
-| 人员介绍 | `members/members.yml` | 17 | YAML | 已授权 | Snow7 |
-| 科普视频元数据 | `science-video/index.yml` | 36 | YAML | 已授权 | Snow7 |
-| 科普视频文件 | `science-video/media/*.mp4` | 36 | 视频 | 已授权 | Snow7 |
-| 科普视频封面 | `science-video/poster/*.jpg` | 36 | 图片 | 已授权 | Snow7 |
+| 儿童 FAQ | `botscreen-public/server/knowledge_base.yml` | 9 | YAML | 声明已授权/证据待核验 | Snow7 |
+| qa_server 内置 FAQ | `botscreen-public/server/qa_server.py` | 9 | Python 内置 | 声明已授权/证据待核验 | Snow7 |
+| 特色技术 | `departments/departments.yml` | 8 | YAML | 声明已授权/证据待核验 | Snow7 |
+| 技术详情/科普 | `departments/*.md` | 8 | Markdown | 声明已授权/证据待核验 | Snow7 |
+| 人员介绍 | `members/members.yml` | 17 | YAML | 声明已授权/证据待核验 | Snow7 |
+| 科普视频元数据 | `science-video/index.yml` | 36 | YAML | 声明已授权/证据待核验 | Snow7 |
+| 科普视频文件 | `science-video/media/*.mp4` | 36 | 视频 | 声明已授权/证据待核验 | Snow7 |
+| 科普视频封面 | `science-video/poster/*.jpg` | 36 | 图片 | 声明已授权/证据待核验 | Snow7 |
 | 外部 DOCX | 仓库外 `KB_DOCX_PATH` | 未提供/待确认 | DOCX | 待确认 | 待确认 |
 
 ## 2. 逐类说明
@@ -79,7 +79,7 @@
 | members/members.yml | 是 | Snow7 | 待补充审核日期/有效期 |
 | science-video/index.yml | 是 | Snow7 | 待补充审核日期/有效期 |
 
-> 本盘点只确认“数据来源与授权状态”，不等同于已完成临床内容审核。
+> 当前仅确认负责人声明授权；授权证据、版本、临床审核状态和有效期待核验，补齐前不得进入生产索引。
 > 授权证据编号、内容版本、临床审核状态和有效期必须补齐后才能进入生产索引。
 > 后续进入生产索引前仍需按 V2.3 知识治理流程补齐审核记录。
 
