@@ -126,7 +126,93 @@ $ python3 -c "import fastapi,pydantic,pytest; print(fastapi.__version__, pydanti
 0.141.1 2.13.5 9.1.1
 ```
 
-失败日志：本次核验未触发运行失败；CI 运行失败日志待 GitHub Actions 输出后补充。
+失败日志：本次核验未触发本地运行失败；CI 历史失败及修复结果见 PR #24 的检查记录。
+
+## 4.4 实际依赖输出
+
+### `pip freeze`
+
+```text
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+fastapi==0.141.1
+h11==0.16.0
+idna==3.19
+iniconfig==2.3.0
+jieba==0.42.1
+packaging==26.3
+pluggy==1.6.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+requests==2.34.2
+ruff==0.16.6
+starlette==1.6.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.7.0
+uv==0.12.8
+uvicorn==0.52.4
+```
+
+### `npm ls --depth=0`
+
+```text
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+botscreen@1.0.0 /Users/w1nstep/Documents/Codex/2026-09-04/https-github-com-snow7-bot-gcmw/work/gcmw-sparse/botscreen-public
+├── @electron-toolkit/eslint-config-prettier@3.0.0
+├── @electron-toolkit/eslint-config-ts@3.1.0
+├── @electron-toolkit/preload@3.0.2
+├── @electron-toolkit/tsconfig@2.0.0
+├── @electron-toolkit/utils@4.0.0
+├── @iconify/vue@5.0.0
+├── @tailwindcss/postcss@4.1.18
+├── @tailwindcss/vite@4.1.18
+├── @types/markdown-it@14.1.2
+├── @types/node@25.9.4
+├── @vitejs/plugin-vue@6.0.3
+├── @vueuse/core@14.1.0
+├── autoprefixer@10.4.23
+├── class-variance-authority@0.7.1
+├── clsx@2.1.1
+├── docx@9.7.1
+├── electron-builder@26.8.1
+├── electron-updater@6.7.3
+├── electron-vite@5.0.0
+├── electron@40.10.2
+├── eslint-plugin-vue@10.7.0
+├── eslint@9.39.2
+├── gsap@3.14.2
+├── lucide-vue-next@0.563.0
+├── markdown-it-footnote@4.0.0
+├── markdown-it-mermaid@0.2.5
+├── markdown-it-table-of-contents@1.1.0
+├── markdown-it@14.2.0
+├── mathjax-full@3.2.2
+├── mathjax@4.1.0
+├── mime-types@3.0.2
+├── motion-v@1.10.0
+├── ogl@1.0.11
+├── prettier@3.8.1
+├── tailwind-merge@3.4.0
+├── tailwindcss@4.1.18
+├── tw-animate-css@1.4.0
+├── typescript@5.9.3
+├── unplugin-vue-router@0.19.2
+├── vite@7.3.5
+├── vue-eslint-parser@10.2.0
+├── vue-router@4.6.4
+├── vue-tsc@3.2.3
+├── vue@3.5.27
+└── yaml@2.9.0
+```
 
 ## 5. 复核命令
 
