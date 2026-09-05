@@ -1,0 +1,31 @@
+# Gitleaks configuration for gcmw.
+# Binary/media/vendor files are excluded only after review because they are
+# not source text and are expected to contain non-secret binary data.
+# If a binary is later found to contain a real secret, this allowlist entry
+# must be revisited through Issue #4.
+
+title = "gcmw secret scan config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Approved exclusions for non-text binary and vendor assets"
+paths = [
+  # Packed vendor SDK / release archives
+  '''(?i)\.zip$''',
+  # Firmware and documentation binaries
+  '''(?i)\.pdf$''',
+  '''(?i)\.img$''',
+  '''(?i)\.exe$''',
+  '''(?i)\.dll$''',
+  '''(?i)\.so$''',
+  '''(?i)\.a$''',
+  # Media assets
+  '''(?i)\.(png|jpe?g|gif|webp|ico|icns)$''',
+  '''(?i)\.(mp4|mov|avi|mkv|wav|pcm)$''',
+  # Local caches/binaries from AIUI SDK
+  '''AIUI/msc/.*\.cache$''',
+  '''AIUI/audio/.*\.pcm$''',
+  '''AIUI/assets/vtn/res\.bin$''',
+]
