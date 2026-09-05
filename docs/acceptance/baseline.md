@@ -107,6 +107,27 @@
 - 复核方式：仓库静态盘点 + 接口 grep
 - 待补：实际 `pip freeze` / `npm ls` 输出、失败日志和精确锁定版本
 
+## 4.3 实际环境证据（2026-09-05 本机核验）
+
+```text
+$ python3 --version
+Python 3.14.6
+
+$ node --version
+v24.18.0
+
+$ npm --version
+11.17.0
+
+$ git --version
+git version 2.50.1 (Apple Git-155)
+
+$ python3 -c "import fastapi,pydantic,pytest; print(fastapi.__version__, pydantic.__version__, pytest.__version__)"
+0.141.1 2.13.5 9.1.1
+```
+
+失败日志：本次核验未触发运行失败；CI 运行失败日志待 GitHub Actions 输出后补充。
+
 ## 5. 复核命令
 
 ```bash
