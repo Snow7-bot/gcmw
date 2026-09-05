@@ -15,6 +15,13 @@ class ContentType(str, Enum):
     VIDEO = "video"
 
 
+class ModelEventType(str, Enum):
+    DELTA = "delta"
+    DONE = "done"
+    ERROR = "error"
+    TOOL_CALL = "tool_call"
+
+
 class ContentPart(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +61,7 @@ class ModelRequest(BaseModel):
     content_parts: list[ContentPart] = Field(default_factory=list)
     tools: list[ToolSpec] = Field(default_factory=list)
     response_schema: dict[str, Any] | None = None
+    safety_context: dict[str, Any] = Field(default_factory=dict)
     stream: bool = False
     deadline_ms: int = Field(10000, gt=0)
     token_budget: int = Field(400, ge=1)
@@ -69,6 +77,8 @@ class ModelResponse(BaseModel):
     model_version: str = Field(..., min_length=1, max_length=64)
     content: str = ""
     content_parts: list[ContentPart] = Field(default_factory=list)
+    input_modalities: list[ContentType] = Field(default_factory=list)
+    recognition_text: str = ""
     finish_reason: str = ""
     usage: dict[str, Any] = Field(default_factory=dict)
     latency_ms: int = 0
@@ -78,7 +88,7 @@ class ModelResponse(BaseModel):
 class ModelEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: str = Field(..., min_length=1, max_length=32)
+    type: ModelEventType
     provider_id: str = Field(..., min_length=1, max_length=64)
     model_id: str = Field(..., min_length=1, max_length=128)
     model_version: str = Field(..., min_length=1, max_length=64)

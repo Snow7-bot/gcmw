@@ -3,7 +3,7 @@ from pydantic import ValidationError
 
 from app.contracts.agent import AgentManifest
 from app.contracts.audit import AuditRecord
-from app.contracts.events import RunEvent, SSEEvent
+from app.contracts.events import RunEvent, SSEEvent, SSEEventType
 from app.contracts.model import ContentPart, ContentType, ModelRequest, ModelResponse
 from app.contracts.run import RunState
 
@@ -42,7 +42,15 @@ def test_model_response_requires_model_version():
 
 def test_sse_event_layer_validation():
     with pytest.raises(ValidationError):
-        SSEEvent(seq=1, run_id="run-1", layer="invalid", event="test")
+        SSEEvent(
+            seq=1,
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="run-1",
+            layer="invalid",
+            event=SSEEventType.RUN_ACCEPTED,
+        )
 
 
 def test_run_event_requires_seq():
@@ -74,7 +82,15 @@ def test_timestamps_are_timezone_aware_utc():
 
     from app.contracts.events import SSEEvent
 
-    event = SSEEvent(seq=1, run_id="run-1", layer="process", event="accepted")
+    event = SSEEvent(
+        seq=1,
+        tenant_id="t1",
+        device_id="d1",
+        session_id="s1",
+        run_id="run-1",
+        layer="process",
+        event=SSEEventType.RUN_ACCEPTED,
+    )
     assert event.timestamp.tzinfo is not None
     assert event.timestamp.utcoffset() == timezone.utc.utcoffset(None)
 
@@ -146,7 +162,15 @@ def test_roundtrip_model_contracts():
 def test_roundtrip_event_contracts():
     from datetime import timezone
 
-    sse = SSEEvent(seq=1, run_id="run-1", layer="process", event="accepted")
+    sse = SSEEvent(
+        seq=1,
+        tenant_id="t1",
+        device_id="d1",
+        session_id="s1",
+        run_id="run-1",
+        layer="process",
+        event=SSEEventType.RUN_ACCEPTED,
+    )
     run_evt = RunEvent(run_id="run-1", state=RunState.ACCEPTED, event_seq=1)
     assert sse.timestamp.tzinfo == timezone.utc
     assert run_evt.timestamp.tzinfo == timezone.utc
@@ -191,9 +215,12 @@ def test_naive_datetime_rejected():
     with pytest.raises(ValidationError):
         SSEEvent(
             seq=1,
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
             run_id="run-1",
             layer="process",
-            event="accepted",
+            event=SSEEventType.RUN_ACCEPTED,
             timestamp=naive,
         )
 
@@ -227,3 +254,50 @@ def test_invalid_inputs_for_remaining_contracts():
     for factory in invalid_cases:
         with pytest.raises(ValidationError):
             factory()
+
+
+def test_invalid_inputs_for_all_missing_contracts():
+    from app.contracts.agent import (
+        AgentResult,
+        Evidence,
+        ToolResult,
+    )
+    from app.contracts.common import SessionContext, TenantContext
+    from app.contracts.model import ModelEvent, ModelEventType, ModelRequest
+
+    invalid_cases = [
+        lambda: TenantContext(tenant_id=""),
+        lambda: SessionContext(tenant_id="t1", device_id="d1", session_id=""),
+        lambda: ToolResult(tool_name="", ok=True),
+        lambda: Evidence(source_id="", source_type="md"),
+        lambda: AgentResult(agent_id="", status="completed"),
+        lambda: ModelRequest(messages=[], trace_id=""),
+        lambda: ModelEvent(
+            type=ModelEventType.DELTA,
+            provider_id="",
+            model_id="m",
+            model_version="1",
+        ),
+    ]
+    for factory in invalid_cases:
+        with pytest.raises(ValidationError):
+            factory()
+
+
+def test_agent_deadline_rejects_naive_datetime():
+    from datetime import datetime
+
+    from app.contracts.agent import AgentContext, ToolRequest
+
+    naive = datetime.fromisoformat("2026-01-01T00:00:00")
+    with pytest.raises(ValidationError):
+        AgentContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="r1",
+            channel="text",
+            deadline=naive,
+        )
+    with pytest.raises(ValidationError):
+        ToolRequest(tool_name="knowledge.search", deadline=naive)

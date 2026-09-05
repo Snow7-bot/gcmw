@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
+from .common import Channel
+
 
 class RiskLevel(str, Enum):
     LOW = "low"
@@ -43,7 +45,7 @@ class AgentContext(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=128)
     session_id: str = Field(..., min_length=1, max_length=128)
     run_id: str = Field(..., min_length=1, max_length=128)
-    channel: str = Field(..., min_length=1, max_length=32)
+    channel: Channel
     normalized_input: str = ""
     short_memory_summary: str = ""
     permitted_long_memory: bool = False
