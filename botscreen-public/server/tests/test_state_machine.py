@@ -1,0 +1,57 @@
+from datetime import timezone
+
+import pytest
+
+from app.contracts.run import RunState
+from app.orchestration.state_machine import RunIdempotencyRegistry, RunStateMachine
+
+
+def test_happy_path():
+    sm = RunStateMachine("run-1")
+    sm.transition(RunState.GUARDING)
+    sm.transition(RunState.ROUTING)
+    sm.transition(RunState.RETRIEVING)
+    sm.transition(RunState.DRAFTING)
+    sm.transition(RunState.VERIFYING)
+    sm.transition(RunState.STREAMING)
+    sm.transition(RunState.COMPLETED)
+    assert sm.current == RunState.COMPLETED
+    assert sm.is_terminal
+    assert sm.event_seq == 7
+
+
+def test_terminal_state_is_irreversible():
+    sm = RunStateMachine("run-2")
+    sm.transition(RunState.COMPLETED)
+    with pytest.raises(ValueError):
+        sm.transition(RunState.ACCEPTED)
+
+
+def test_illegal_transition_rejected():
+    sm = RunStateMachine("run-3")
+    with pytest.raises(ValueError):
+        sm.transition(RunState.COMPLETED)
+
+
+def test_cancel_from_accepted():
+    sm = RunStateMachine("run-4")
+    sm.transition(RunState.CANCELLED)
+    assert sm.current == RunState.CANCELLED
+
+
+def test_event_has_utc_timestamp_and_increasing_seq():
+    sm = RunStateMachine("run-5")
+    e1 = sm.transition(RunState.GUARDING)
+    e2 = sm.transition(RunState.ROUTING)
+    assert e1.event_seq == 1
+    assert e2.event_seq == 2
+    assert e1.timestamp.tzinfo is not None
+    assert e1.timestamp.tzinfo == timezone.utc
+    assert e2.timestamp > e1.timestamp
+
+
+def test_idempotency_registry_rejects_duplicate_request():
+    reg = RunIdempotencyRegistry()
+    assert reg.register("request-1", "run-1") is True
+    assert reg.register("request-1", "run-2") is False
+    assert reg.get_run_id("request-1") == "run-1"
