@@ -138,9 +138,15 @@ class RunCoordinator:
         self._machines: dict[str, RunStateMachine] = {}
 
     def start_or_get(self, request_id: str, run_id: str) -> RunStateMachine:
+        if not request_id:
+            raise ValueError("request_id is required")
+        if not run_id:
+            raise ValueError("run_id is required")
         existing_run_id = self._registry.get_run_id(request_id)
         if existing_run_id is not None:
             return self._machines[existing_run_id]
+        if run_id in self._machines:
+            raise ValueError(f"run_id already exists: {run_id}")
         if not self._registry.register(request_id, run_id):
             raise RuntimeError("request_id registration failed unexpectedly")
         machine = RunStateMachine(run_id)

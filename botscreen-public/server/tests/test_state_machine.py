@@ -81,3 +81,24 @@ def test_coordinator_duplicate_start_returns_original_run_without_advancing():
     assert duplicate is machine
     assert duplicate.event_seq == before_seq
     assert coordinator.get_machine("run-21") is None
+
+
+def test_coordinator_rejects_different_request_id_same_run_id():
+    from app.orchestration.state_machine import RunCoordinator
+
+    coordinator = RunCoordinator()
+    coordinator.start_or_get("request-30", "run-30")
+    with pytest.raises(ValueError):
+        coordinator.start_or_get("request-31", "run-30")
+
+
+def test_coordinator_empty_run_id_does_not_pollute_registry():
+    from app.orchestration.state_machine import RunCoordinator
+
+    coordinator = RunCoordinator()
+    with pytest.raises(ValueError):
+        coordinator.start_or_get("request-40", "")
+    assert coordinator.get_machine("") is None
+    # A later valid request should still work
+    machine = coordinator.start_or_get("request-40", "run-40")
+    assert machine is not None
