@@ -202,6 +202,7 @@ export class EventHandler {
    * Ends drag interaction and applies inertia scrolling
    */
   private onPointerUp(_e?: MouseEvent | TouchEvent): void {
+    void _e
     this.host.isDown = false
 
     // Clear hover state when pointer is lifted
@@ -233,6 +234,7 @@ export class EventHandler {
    * Clears hover states when mouse exits
    */
   private onPointerOut(_e: MouseEvent): void {
+    void _e
     this.host.isHoveringCanvas = false
 
     // Clear hover state when pointer leaves canvas

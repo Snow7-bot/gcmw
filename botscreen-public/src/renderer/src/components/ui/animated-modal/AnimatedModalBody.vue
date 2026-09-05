@@ -31,14 +31,16 @@ if (!modal) {
   throw new Error('AnimatedModalBody must be used within <AnimatedModal>')
 }
 
-const panelRef = ref<any>(null)
+type PanelLike = HTMLElement | { $el?: HTMLElement }
+
+const panelRef = ref<PanelLike | null>(null)
 const previousActive = ref<HTMLElement | null>(null)
 
 const getPanelEl = (): HTMLElement | null => {
-  const raw = panelRef.value as any
+  const raw = panelRef.value
   if (!raw) return null
   if (raw instanceof HTMLElement) return raw
-  if (raw.$el instanceof HTMLElement) return raw.$el
+  if ('$el' in raw && raw.$el instanceof HTMLElement) return raw.$el
   return null
 }
 
