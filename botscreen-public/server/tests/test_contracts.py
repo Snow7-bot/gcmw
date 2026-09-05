@@ -77,3 +77,83 @@ def test_timestamps_are_timezone_aware_utc():
     event = SSEEvent(seq=1, run_id="run-1", layer="process", event="accepted")
     assert event.timestamp.tzinfo is not None
     assert event.timestamp.utcoffset() == timezone.utc.utcoffset(None)
+
+
+def test_roundtrip_common_contracts():
+    from app.contracts.common import (
+        DeviceContext,
+        RunContext,
+        SessionContext,
+        TenantContext,
+    )
+
+    for obj in [
+        TenantContext(tenant_id="t1"),
+        DeviceContext(tenant_id="t1", device_id="d1"),
+        SessionContext(tenant_id="t1", device_id="d1", session_id="s1"),
+        RunContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="r1",
+            request_id="req1",
+            idempotency_key="idem1",
+            channel="text",
+        ),
+    ]:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_roundtrip_agent_contracts():
+    from app.contracts.agent import AgentContext, AgentResult, ToolRequest, ToolResult
+
+    for obj in [
+        AgentManifest(agent_id="agent-1", version="1.0.0"),
+        AgentContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="r1",
+            channel="text",
+        ),
+        ToolRequest(tool_name="knowledge.search", arguments={"q": "x"}),
+        ToolResult(tool_name="knowledge.search", ok=True, data={"items": []}),
+        AgentResult(agent_id="agent-1", status="completed"),
+    ]:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_roundtrip_model_contracts():
+    from app.contracts.model import ModelEvent
+
+    req = ModelRequest(messages=[], trace_id="trace-1")
+    resp = ModelResponse(
+        provider_id="mock",
+        model_id="mock-model",
+        model_version="1.0.0",
+        content="hello",
+    )
+    event = ModelEvent(
+        type="delta", provider_id="mock", model_id="mock-model", model_version="1.0.0"
+    )
+    for obj in [req, resp, event]:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_roundtrip_event_contracts():
+    from datetime import timezone
+
+    sse = SSEEvent(seq=1, run_id="run-1", layer="process", event="accepted")
+    run_evt = RunEvent(run_id="run-1", state=RunState.ACCEPTED, event_seq=1)
+    assert sse.timestamp.tzinfo == timezone.utc
+    assert run_evt.timestamp.tzinfo == timezone.utc
+    assert SSEEvent.model_validate(sse.model_dump()) == sse
+    assert RunEvent.model_validate(run_evt.model_dump()) == run_evt
+
+
+def test_text_content_requires_text():
+    with pytest.raises(ValidationError):
+        ContentPart(type=ContentType.TEXT, text="   ")

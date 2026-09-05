@@ -34,6 +34,8 @@ class ContentPart(BaseModel):
     def validate_non_text_media_ref(self):
         if self.type != ContentType.TEXT and not self.media_ref:
             raise ValueError("media_ref is required for non-text content parts")
+        if self.type == ContentType.TEXT and not (self.text or "").strip():
+            raise ValueError("text is required for text content parts")
         return self
 
 
