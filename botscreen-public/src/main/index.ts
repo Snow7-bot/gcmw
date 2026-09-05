@@ -11,7 +11,7 @@ import mime from 'mime-types'
 let exitArmed = false
 let exitInputBuffer = ''
 let exitArmedAt = 0
-const EXIT_PASSWORD = '114514'
+const EXIT_PASSWORD = process.env.GCMW_EXIT_PASSWORD || ''
 
 function createWindow(): void {
   // Create the browser window.
