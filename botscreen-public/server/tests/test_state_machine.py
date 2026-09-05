@@ -22,7 +22,7 @@ def test_happy_path():
 
 def test_terminal_state_is_irreversible():
     sm = RunStateMachine("run-2")
-    sm.transition(RunState.COMPLETED)
+    sm.transition(RunState.CANCELLED)
     with pytest.raises(ValueError):
         sm.transition(RunState.ACCEPTED)
 

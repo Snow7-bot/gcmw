@@ -1,20 +1,54 @@
 """Deterministic Run state machine with idempotency and event sequencing."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
 
 from ..contracts.events import RunEvent
 from ..contracts.run import TERMINAL_STATES, RunState
 
 _ALLOWED: dict[RunState, set[RunState]] = {
     RunState.ACCEPTED: {RunState.GUARDING, RunState.FAILED, RunState.CANCELLED},
-    RunState.GUARDING: {RunState.ROUTING, RunState.FAILED, RunState.CANCELLED, RunState.HANDOFF},
-    RunState.ROUTING: {RunState.RETRIEVING, RunState.DRAFTING, RunState.FAILED, RunState.CANCELLED, RunState.HANDOFF},
-    RunState.RETRIEVING: {RunState.DRAFTING, RunState.FAILED, RunState.CANCELLED, RunState.HANDOFF, RunState.DEGRADED},
-    RunState.DRAFTING: {RunState.VERIFYING, RunState.FAILED, RunState.CANCELLED, RunState.HANDOFF},
-    RunState.VERIFYING: {RunState.STREAMING, RunState.DRAFTING, RunState.FAILED, RunState.CANCELLED, RunState.HANDOFF},
-    RunState.STREAMING: {RunState.COMPLETED, RunState.DEGRADED, RunState.FAILED, RunState.CANCELLED, RunState.HANDOFF},
+    RunState.GUARDING: {
+        RunState.ROUTING,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.HANDOFF,
+    },
+    RunState.ROUTING: {
+        RunState.RETRIEVING,
+        RunState.DRAFTING,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.HANDOFF,
+    },
+    RunState.RETRIEVING: {
+        RunState.DRAFTING,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.HANDOFF,
+        RunState.DEGRADED,
+    },
+    RunState.DRAFTING: {
+        RunState.VERIFYING,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.HANDOFF,
+    },
+    RunState.VERIFYING: {
+        RunState.STREAMING,
+        RunState.DRAFTING,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.HANDOFF,
+    },
+    RunState.STREAMING: {
+        RunState.COMPLETED,
+        RunState.DEGRADED,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.HANDOFF,
+    },
     RunState.COMPLETED: set(),
     RunState.DEGRADED: set(),
     RunState.HANDOFF: set(),
@@ -43,7 +77,7 @@ class RunStateMachine:
             return False
         return target in _ALLOWED.get(self.current, set())
 
-    def transition(self, target: RunState, payload: Optional[dict] = None) -> RunEvent:
+    def transition(self, target: RunState, payload: dict | None = None) -> RunEvent:
         """Transitions to target and returns a structured RunEvent.
 
         Terminal states are irreversible; attempting to transition out of a
@@ -88,5 +122,5 @@ class RunIdempotencyRegistry:
         self._seen[request_id] = run_id
         return True
 
-    def get_run_id(self, request_id: str) -> Optional[str]:
+    def get_run_id(self, request_id: str) -> str | None:
         return self._seen.get(request_id)
