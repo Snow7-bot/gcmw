@@ -3,12 +3,12 @@
 Secrets are never stored here. In production, missing required secret
 references cause startup to fail.
 """
+
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
 
@@ -30,7 +30,7 @@ class LocalProviderConfig(BaseModel):
     adapter: str = "local_omni"
     model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     api_base: str = "http://127.0.0.1:8001/v1"
-    api_key_env: Optional[str] = None
+    api_key_env: str | None = None
     modalities: tuple[str, ...] = ("text", "audio", "image", "video")
     timeout_ms: int = 30_000
     connect_timeout_ms: int = 5_000
@@ -44,7 +44,7 @@ class Settings(BaseModel):
 
     redis_url: str = "redis://127.0.0.1:6379/0"
     database_url: str = "postgresql://gcmw:gcmw@127.0.0.1:5432/gcmw"
-    vector_database_url: Optional[str] = None
+    vector_database_url: str | None = None
 
     run_timeout_ms: int = 15_000
     answer_token_budget: int = 400
@@ -62,9 +62,15 @@ class Settings(BaseModel):
     def validate_for_environment(self) -> None:
         if self.environment in {"production", "staging"}:
             missing = []
-            if self.active_provider == "cloud" and not os.getenv(self.cloud.api_key_env):
+            if self.active_provider == "cloud" and not os.getenv(
+                self.cloud.api_key_env
+            ):
                 missing.append(self.cloud.api_key_env)
-            if self.active_provider == "local" and self.local.api_key_env and not os.getenv(self.local.api_key_env):
+            if (
+                self.active_provider == "local"
+                and self.local.api_key_env
+                and not os.getenv(self.local.api_key_env)
+            ):
                 missing.append(self.local.api_key_env)
             if missing:
                 raise RuntimeError(
@@ -72,7 +78,7 @@ class Settings(BaseModel):
                 )
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         def _int(name: str, default: int) -> int:
             try:
                 return int(os.getenv(name, str(default)))
@@ -86,7 +92,9 @@ class Settings(BaseModel):
             provider=os.getenv("GCMW_CLOUD_PROVIDER", "dashscope_realtime"),
             adapter=os.getenv("GCMW_CLOUD_ADAPTER", "cloud_realtime"),
             model=os.getenv("GCMW_CLOUD_MODEL", "qwen3.5-omni-plus-realtime"),
-            api_base=os.getenv("GCMW_CLOUD_API_BASE", "https://dashscope.aliyuncs.com/api/v1"),
+            api_base=os.getenv(
+                "GCMW_CLOUD_API_BASE", "https://dashscope.aliyuncs.com/api/v1"
+            ),
             api_key_env=os.getenv("GCMW_CLOUD_API_KEY_ENV", "GCMW_CLOUD_API_KEY"),
             transport="websocket",
             modalities=tuple(
@@ -112,7 +120,9 @@ class Settings(BaseModel):
             debug=_bool("GCMW_DEBUG"),
             active_provider=os.getenv("GCMW_ACTIVE_PROVIDER", "mock"),
             redis_url=os.getenv("GCMW_REDIS_URL", "redis://127.0.0.1:6379/0"),
-            database_url=os.getenv("GCMW_DATABASE_URL", "postgresql://gcmw:gcmw@127.0.0.1:5432/gcmw"),
+            database_url=os.getenv(
+                "GCMW_DATABASE_URL", "postgresql://gcmw:gcmw@127.0.0.1:5432/gcmw"
+            ),
             vector_database_url=os.getenv("GCMW_VECTOR_DATABASE_URL") or None,
             run_timeout_ms=_int("GCMW_RUN_TIMEOUT_MS", 15_000),
             answer_token_budget=_int("GCMW_ANSWER_TOKEN_BUDGET", 400),
