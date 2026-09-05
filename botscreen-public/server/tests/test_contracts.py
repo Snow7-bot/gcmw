@@ -1,0 +1,303 @@
+import pytest
+from pydantic import ValidationError
+
+from app.contracts.agent import AgentManifest
+from app.contracts.audit import AuditRecord
+from app.contracts.events import RunEvent, SSEEvent, SSEEventType
+from app.contracts.model import ContentPart, ContentType, ModelRequest, ModelResponse
+from app.contracts.run import RunState
+
+
+def test_agent_manifest_requires_id():
+    with pytest.raises(ValidationError):
+        AgentManifest(agent_id="", version="1.0.0")
+
+
+def test_unknown_fields_forbidden():
+    with pytest.raises(ValidationError):
+        AgentManifest(agent_id="agent", version="1.0.0", unexpected=True)
+
+
+def test_content_parts_support_modalities():
+    parts = [
+        ContentPart(type=ContentType.TEXT, text="hello"),
+        ContentPart(
+            type=ContentType.IMAGE, media_ref="rc://test.png", mime_type="image/png"
+        ),
+        ContentPart(
+            type=ContentType.AUDIO, media_ref="rc://test.pcm", mime_type="audio/pcm"
+        ),
+        ContentPart(
+            type=ContentType.VIDEO, media_ref="rc://test.mp4", mime_type="video/mp4"
+        ),
+    ]
+    req = ModelRequest(messages=[], content_parts=parts, trace_id="trace-1")
+    assert len(req.content_parts) == 4
+
+
+def test_model_response_requires_model_version():
+    with pytest.raises(ValidationError):
+        ModelResponse(provider_id="mock", model_id="mock-model", model_version="")
+
+
+def test_sse_event_layer_validation():
+    with pytest.raises(ValidationError):
+        SSEEvent(
+            seq=1,
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="run-1",
+            layer="invalid",
+            event=SSEEventType.RUN_ACCEPTED,
+        )
+
+
+def test_run_event_requires_seq():
+    with pytest.raises(ValidationError):
+        RunEvent(run_id="run-1", state=RunState.ACCEPTED, event_seq=0)
+
+
+def test_audit_record_requires_ids():
+    with pytest.raises(ValidationError):
+        AuditRecord(tenant_id="", actor_type="user", actor_id_hash="h", request_id="r")
+
+
+def test_roundtrip_serialization():
+    manifest = AgentManifest(agent_id="agent-1", version="1.0.0")
+    data = manifest.model_dump()
+    restored = AgentManifest.model_validate(data)
+    assert restored == manifest
+
+
+def test_multimodal_content_requires_media_ref_for_media_types():
+    from app.contracts.model import ContentType
+
+    with pytest.raises(ValidationError):
+        ContentPart(type=ContentType.IMAGE, text="no media")
+
+
+def test_timestamps_are_timezone_aware_utc():
+    from datetime import timezone
+
+    from app.contracts.events import SSEEvent
+
+    event = SSEEvent(
+        seq=1,
+        tenant_id="t1",
+        device_id="d1",
+        session_id="s1",
+        run_id="run-1",
+        layer="process",
+        event=SSEEventType.RUN_ACCEPTED,
+    )
+    assert event.timestamp.tzinfo is not None
+    assert event.timestamp.utcoffset() == timezone.utc.utcoffset(None)
+
+
+def test_roundtrip_common_contracts():
+    from app.contracts.common import (
+        DeviceContext,
+        RunContext,
+        SessionContext,
+        TenantContext,
+    )
+
+    for obj in [
+        TenantContext(tenant_id="t1"),
+        DeviceContext(tenant_id="t1", device_id="d1"),
+        SessionContext(tenant_id="t1", device_id="d1", session_id="s1"),
+        RunContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="r1",
+            request_id="req1",
+            idempotency_key="idem1",
+            channel="text",
+        ),
+    ]:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_roundtrip_agent_contracts():
+    from app.contracts.agent import AgentContext, AgentResult, ToolRequest, ToolResult
+
+    for obj in [
+        AgentManifest(agent_id="agent-1", version="1.0.0"),
+        AgentContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="r1",
+            channel="text",
+        ),
+        ToolRequest(tool_name="knowledge.search", arguments={"q": "x"}),
+        ToolResult(tool_name="knowledge.search", ok=True, data={"items": []}),
+        AgentResult(agent_id="agent-1", status="completed"),
+    ]:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_roundtrip_model_contracts():
+    from app.contracts.model import ModelEvent
+
+    req = ModelRequest(messages=[], trace_id="trace-1")
+    resp = ModelResponse(
+        provider_id="mock",
+        model_id="mock-model",
+        model_version="1.0.0",
+        content="hello",
+    )
+    event = ModelEvent(
+        type="delta", provider_id="mock", model_id="mock-model", model_version="1.0.0"
+    )
+    for obj in [req, resp, event]:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_roundtrip_event_contracts():
+    from datetime import timezone
+
+    sse = SSEEvent(
+        seq=1,
+        tenant_id="t1",
+        device_id="d1",
+        session_id="s1",
+        run_id="run-1",
+        layer="process",
+        event=SSEEventType.RUN_ACCEPTED,
+    )
+    run_evt = RunEvent(run_id="run-1", state=RunState.ACCEPTED, event_seq=1)
+    assert sse.timestamp.tzinfo == timezone.utc
+    assert run_evt.timestamp.tzinfo == timezone.utc
+    assert SSEEvent.model_validate(sse.model_dump()) == sse
+    assert RunEvent.model_validate(run_evt.model_dump()) == run_evt
+
+
+def test_text_content_requires_text():
+    with pytest.raises(ValidationError):
+        ContentPart(type=ContentType.TEXT, text="   ")
+
+
+def test_roundtrip_evidence_toolspec_contentpart_audit():
+    from app.contracts.agent import Evidence
+    from app.contracts.audit import AuditRecord
+    from app.contracts.model import ToolSpec
+
+    objects = [
+        Evidence(source_id="src-1", source_type="md", title="t", content_hash="h"),
+        ToolSpec(name="knowledge.search", description="search"),
+        ContentPart(type=ContentType.TEXT, text="hello"),
+        ContentPart(
+            type=ContentType.IMAGE, media_ref="rc://a.png", mime_type="image/png"
+        ),
+        AuditRecord(
+            tenant_id="t1",
+            actor_type="user",
+            actor_id_hash="h1",
+            request_id="r1",
+            action="test",
+        ),
+    ]
+    for obj in objects:
+        restored = type(obj).model_validate(obj.model_dump())
+        assert restored == obj
+
+
+def test_naive_datetime_rejected():
+    from datetime import datetime
+
+    naive = datetime.fromisoformat("2026-01-01T00:00:00")
+    with pytest.raises(ValidationError):
+        SSEEvent(
+            seq=1,
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="run-1",
+            layer="process",
+            event=SSEEventType.RUN_ACCEPTED,
+            timestamp=naive,
+        )
+
+
+def test_invalid_inputs_for_remaining_contracts():
+    from app.contracts.agent import AgentContext, ToolRequest
+    from app.contracts.common import DeviceContext, RunContext
+    from app.contracts.model import ToolSpec
+
+    invalid_cases = [
+        lambda: ToolSpec(name="", description="x"),
+        lambda: AgentContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="",
+            channel="text",
+        ),
+        lambda: DeviceContext(tenant_id="t1", device_id=""),
+        lambda: ToolRequest(tool_name="", arguments={}),
+        lambda: RunContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="",
+            request_id="r",
+            idempotency_key="i",
+            channel="text",
+        ),
+    ]
+    for factory in invalid_cases:
+        with pytest.raises(ValidationError):
+            factory()
+
+
+def test_invalid_inputs_for_all_missing_contracts():
+    from app.contracts.agent import (
+        AgentResult,
+        Evidence,
+        ToolResult,
+    )
+    from app.contracts.common import SessionContext, TenantContext
+    from app.contracts.model import ModelEvent, ModelEventType, ModelRequest
+
+    invalid_cases = [
+        lambda: TenantContext(tenant_id=""),
+        lambda: SessionContext(tenant_id="t1", device_id="d1", session_id=""),
+        lambda: ToolResult(tool_name="", ok=True),
+        lambda: Evidence(source_id="", source_type="md"),
+        lambda: AgentResult(agent_id="", status="completed"),
+        lambda: ModelRequest(messages=[], trace_id=""),
+        lambda: ModelEvent(
+            type=ModelEventType.DELTA,
+            provider_id="",
+            model_id="m",
+            model_version="1",
+        ),
+    ]
+    for factory in invalid_cases:
+        with pytest.raises(ValidationError):
+            factory()
+
+
+def test_agent_deadline_rejects_naive_datetime():
+    from datetime import datetime
+
+    from app.contracts.agent import AgentContext, ToolRequest
+
+    naive = datetime.fromisoformat("2026-01-01T00:00:00")
+    with pytest.raises(ValidationError):
+        AgentContext(
+            tenant_id="t1",
+            device_id="d1",
+            session_id="s1",
+            run_id="r1",
+            channel="text",
+            deadline=naive,
+        )
+    with pytest.raises(ValidationError):
+        ToolRequest(tool_name="knowledge.search", deadline=naive)
