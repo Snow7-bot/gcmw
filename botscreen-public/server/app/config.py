@@ -23,6 +23,14 @@ def _is_loopback_url(value: str) -> bool:
     return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
 
 
+def _is_invalid_storage_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return True
+    return not parsed.scheme or not parsed.hostname
+
+
 class CloudProviderConfig(BaseModel):
     provider: str = "dashscope_realtime"
     adapter: str = "cloud_realtime"
@@ -90,17 +98,21 @@ class Settings(BaseModel):
     def validate_for_environment(self) -> None:
         if self.environment in {"production", "staging"}:
             missing = []
-            if not self.redis_url or any(
-                h in self.redis_url for h in ("127.0.0.1", "localhost", "::1")
+            if (
+                not self.redis_url
+                or _is_invalid_storage_url(self.redis_url)
+                or _is_loopback_url(self.redis_url)
             ):
                 missing.append(
-                    "GCMW_REDIS_URL (production must not use localhost default)"
+                    "GCMW_REDIS_URL (production must be valid remote URL, not localhost)"
                 )
-            if not self.database_url or any(
-                h in self.database_url for h in ("127.0.0.1", "localhost", "::1")
+            if (
+                not self.database_url
+                or _is_invalid_storage_url(self.database_url)
+                or _is_loopback_url(self.database_url)
             ):
                 missing.append(
-                    "GCMW_DATABASE_URL (production must not use localhost default)"
+                    "GCMW_DATABASE_URL (production must be valid remote URL, not localhost)"
                 )
             if self.active_provider == "cloud" and not os.getenv(
                 self.cloud.api_key_env

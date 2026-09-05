@@ -69,3 +69,34 @@ def test_environment_typo_rejected(monkeypatch):
     monkeypatch.setenv("GCMW_ENV", "prod")
     with pytest.raises(ValueError):
         Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "redis,db",
+    [
+        ("redis://LOCALHOST:6379/0", "postgresql://u:p@db.internal:5432/db"),
+        ("redis://127.0.0.1:6379/0", "postgresql://u:p@db.internal:5432/db"),
+        ("redis://127.1.2.3:6379/0", "postgresql://u:p@db.internal:5432/db"),
+        ("redis://[::1]:6379/0", "postgresql://u:p@db.internal:5432/db"),
+        ("not-a-url", "postgresql://u:p@db.internal:5432/db"),
+        ("redis:///tmp/redis.sock", "postgresql://u:p@db.internal:5432/db"),
+    ],
+)
+def test_production_storage_url_rejected_via_settings(monkeypatch, redis, db):
+    monkeypatch.setenv("GCMW_ENV", "production")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "mock")
+    monkeypatch.setenv("GCMW_REDIS_URL", redis)
+    monkeypatch.setenv("GCMW_DATABASE_URL", db)
+    with pytest.raises(RuntimeError):
+        Settings.from_env()
+
+
+def test_production_valid_remote_storage_passes(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "production")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "mock")
+    monkeypatch.setenv("GCMW_REDIS_URL", "rediss://redis.internal:6379/0")
+    monkeypatch.setenv(
+        "GCMW_DATABASE_URL", "postgresql://gcmw:secret@db.internal:5432/gcmw"
+    )
+    settings = Settings.from_env()
+    assert settings.environment == "production"
