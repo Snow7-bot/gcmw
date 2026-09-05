@@ -55,3 +55,15 @@ def test_idempotency_registry_rejects_duplicate_request():
     assert reg.register("request-1", "run-1") is True
     assert reg.register("request-1", "run-2") is False
     assert reg.get_run_id("request-1") == "run-1"
+
+
+def test_duplicate_request_id_returns_original_run_id_and_does_not_advance_event_seq():
+    sm = RunStateMachine("run-10")
+    reg = RunIdempotencyRegistry()
+    assert reg.register("request-10", "run-10") is True
+    sm.transition(RunState.GUARDING)
+    before_seq = sm.event_seq
+    # A duplicate create/advance request must not create a new run or change event seq.
+    assert reg.register("request-10", "run-10") is False
+    assert reg.get_run_id("request-10") == "run-10"
+    assert sm.event_seq == before_seq
