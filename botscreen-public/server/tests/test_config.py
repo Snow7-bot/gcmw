@@ -13,9 +13,14 @@ def test_from_env_defaults():
 def test_production_missing_cloud_secret_fails(monkeypatch):
     monkeypatch.setenv("GCMW_ENV", "production")
     monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "cloud")
+    monkeypatch.setenv("GCMW_REDIS_URL", "redis://redis.internal:6379/0")
+    monkeypatch.setenv(
+        "GCMW_DATABASE_URL", "postgresql://gcmw:secret@db.internal:5432/gcmw"
+    )
     monkeypatch.delenv("GCMW_CLOUD_API_KEY", raising=False)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as exc:
         Settings.from_env()
+    assert "GCMW_CLOUD_API_KEY" in str(exc.value)
 
 
 def test_production_with_cloud_secret_passes(monkeypatch):

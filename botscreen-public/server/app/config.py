@@ -57,7 +57,7 @@ class LocalProviderConfig(BaseModel):
 
 class Settings(BaseModel):
     app_name: str = "gcmw-agent"
-    environment: str = "development"
+    environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
     active_provider: Literal["mock", "cloud", "local"] = "mock"
 
@@ -81,11 +81,15 @@ class Settings(BaseModel):
     def validate_for_environment(self) -> None:
         if self.environment in {"production", "staging"}:
             missing = []
-            if not self.redis_url or self.redis_url.startswith("redis://127.0.0.1"):
+            if not self.redis_url or any(
+                h in self.redis_url for h in ("127.0.0.1", "localhost", "::1")
+            ):
                 missing.append(
                     "GCMW_REDIS_URL (production must not use localhost default)"
                 )
-            if not self.database_url or "127.0.0.1" in self.database_url:
+            if not self.database_url or any(
+                h in self.database_url for h in ("127.0.0.1", "localhost", "::1")
+            ):
                 missing.append(
                     "GCMW_DATABASE_URL (production must not use localhost default)"
                 )
