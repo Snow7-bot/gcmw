@@ -96,16 +96,16 @@
 | TypeScript | package.json | ^5.9.3 |
 | FastAPI | server/requirements.txt | >=0.100.0 |
 | Uvicorn | server/requirements.txt | >=0.23.0 |
-| Pydantic | 随 FastAPI 安装 | 待锁定 |
+| Pydantic | 本机核验 | 2.13.5（正式基线需在 3.11/3.12 锁定） |
 | jieba | server/requirements.txt | >=0.42.1 |
-| Python | 开发环境 | 待确认（建议 3.11/3.12） |
+| Python | 开发机 3.14.6；正式基线 3.11/3.12 | 3.14.6 / 3.11 / 3.12 |
 
 ## 4.2 复核记录
 
 - 复核日期：2026-09-05
 - 复核人：Snow7
 - 复核方式：仓库静态盘点 + 接口 grep
-- 待补：实际 `pip freeze` / `npm ls` 输出、失败日志和精确锁定版本
+- 本机已提供关键版本实际输出；精确锁定版本以 CI/正式环境为准。
 
 ## 4.3 实际环境证据（2026-09-05 本机核验）
 
