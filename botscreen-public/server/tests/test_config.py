@@ -40,3 +40,32 @@ def test_production_invalid_integer_raises(monkeypatch):
     monkeypatch.setenv("GCMW_RUN_TIMEOUT_MS", "abc")
     with pytest.raises(ValueError):
         Settings.from_env()
+
+
+def test_production_localhost_variants_rejected(monkeypatch):
+    from app.config import _is_loopback_url
+
+    assert _is_loopback_url("redis://LOCALHOST:6379/0")
+    assert _is_loopback_url("postgresql://user@127.0.0.1:5432/db")
+    assert _is_loopback_url("postgresql://user@[::1]:5432/db")
+    assert not _is_loopback_url("redis://redis.internal:6379/0")
+
+
+def test_invalid_modalities_rejected(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "development")
+    monkeypatch.setenv("GCMW_CLOUD_MODALITIES", "text,image,not-a-modal")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_nonpositive_timeout_rejected(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "development")
+    monkeypatch.setenv("GCMW_MODEL_TIMEOUT_MS", "0")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_environment_typo_rejected(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "prod")
+    with pytest.raises(ValueError):
+        Settings.from_env()

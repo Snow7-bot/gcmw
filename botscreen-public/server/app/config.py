@@ -8,10 +8,19 @@ from __future__ import annotations
 
 import os
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
+
+
+def _is_loopback_url(value: str) -> bool:
+    try:
+        host = (urlparse(value).hostname or "").lower()
+    except ValueError:
+        return True
+    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
 
 
 class CloudProviderConfig(BaseModel):
