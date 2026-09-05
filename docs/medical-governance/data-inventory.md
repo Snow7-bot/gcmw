@@ -68,16 +68,20 @@
 | departments/*.md | 待补 | 待补 | 待临床审核 | 待补 |
 | members/members.yml | 待补 | 待补 | 待临床审核 | 待补 |
 | science-video/index.yml | 待补 | 待补 | 待临床审核 | 待补 |
+| science-video/media/*.mp4 | 待补 | 待补 | 待临床审核 | 待补 |
+| science-video/poster/*.jpg | 待补 | 待补 | 待临床审核 | 待补 |
 
 ## 3. 授权与审核状态
 
 | 数据源 | 授权 | Owner | 医学审核状态 |
 |---|---|---:|---|
-| knowledge_base.yml | 是 | Snow7 | 待补充审核日期/有效期 |
-| qa_server 内置 FAQ | 是 | Snow7 | 待补充审核日期/有效期 |
-| departments/*.md | 是 | Snow7 | 待补充审核日期/有效期 |
-| members/members.yml | 是 | Snow7 | 待补充审核日期/有效期 |
-| science-video/index.yml | 是 | Snow7 | 待补充审核日期/有效期 |
+| knowledge_base.yml | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
+| qa_server 内置 FAQ | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
+| departments/*.md | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
+| members/members.yml | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
+| science-video/index.yml | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
+| science-video/media/*.mp4 | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
+| science-video/poster/*.jpg | 负责人声明已授权/证据待核验 | Snow7 | 待补充审核日期/有效期 |
 
 > 当前仅确认负责人声明授权；授权证据、版本、临床审核状态和有效期待核验，补齐前不得进入生产索引。
 > 授权证据编号、内容版本、临床审核状态和有效期必须补齐后才能进入生产索引。
