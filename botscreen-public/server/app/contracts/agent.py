@@ -1,9 +1,10 @@
 """Agent manifest, context and result contracts."""
+
 from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,7 +49,7 @@ class AgentContext(BaseModel):
     short_memory_summary: str = ""
     permitted_long_memory: bool = False
     risk_level: RiskLevel = RiskLevel.LOW
-    deadline: Optional[datetime] = None
+    deadline: datetime | None = None
 
 
 class ToolRequest(BaseModel):
@@ -56,7 +57,7 @@ class ToolRequest(BaseModel):
 
     tool_name: str = Field(..., min_length=1, max_length=128)
     arguments: dict[str, Any] = Field(default_factory=dict)
-    deadline: Optional[datetime] = None
+    deadline: datetime | None = None
 
 
 class ToolResult(BaseModel):
@@ -65,8 +66,8 @@ class ToolResult(BaseModel):
     tool_name: str = Field(..., min_length=1, max_length=128)
     ok: bool = True
     data: Any = None
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class Evidence(BaseModel):
@@ -89,7 +90,7 @@ class AgentResult(BaseModel):
     answer_candidate: str = ""
     evidence: list[Evidence] = Field(default_factory=list)
     actions: list[dict[str, Any]] = Field(default_factory=list)
-    confidence_band: Optional[str] = None
+    confidence_band: str | None = None
     safety_status: str = "unknown"
     memory_candidates: list[dict[str, Any]] = Field(default_factory=list)
     public_trace: list[dict[str, Any]] = Field(default_factory=list)

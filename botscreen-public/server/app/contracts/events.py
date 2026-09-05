@@ -1,7 +1,8 @@
 """SSE and run event contracts."""
+
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,7 +18,7 @@ class SSEEvent(BaseModel):
     layer: str = Field(..., pattern="^(process|answer)$")
     event: str = Field(..., min_length=1, max_length=64)
     data: dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RunEvent(BaseModel):
@@ -27,4 +28,4 @@ class RunEvent(BaseModel):
     state: RunState
     event_seq: int = Field(..., ge=1)
     payload: dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

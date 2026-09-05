@@ -1,10 +1,11 @@
 """ModelGateway request/response and content part contracts."""
+
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ContentType(str, Enum):
@@ -18,9 +19,22 @@ class ContentPart(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: ContentType
-    text: Optional[str] = None
-    media_ref: Optional[str] = None
-    mime_type: Optional[str] = None
+    text: str | None = None
+    media_ref: str | None = None
+    mime_type: str | None = None
+
+    @field_validator("media_ref")
+    @classmethod
+    def media_ref_required_for_non_text(cls, v, info):
+        if info.data.get("type") != ContentType.TEXT and not v:
+            raise ValueError("media_ref is required for non-text content parts")
+        return v
+
+    @model_validator(mode="after")
+    def validate_non_text_media_ref(self):
+        if self.type != ContentType.TEXT and not self.media_ref:
+            raise ValueError("media_ref is required for non-text content parts")
+        return self
 
 
 class ToolSpec(BaseModel):
@@ -37,12 +51,12 @@ class ModelRequest(BaseModel):
     messages: list[dict[str, Any]] = Field(default_factory=list)
     content_parts: list[ContentPart] = Field(default_factory=list)
     tools: list[ToolSpec] = Field(default_factory=list)
-    response_schema: Optional[dict[str, Any]] = None
+    response_schema: dict[str, Any] | None = None
     stream: bool = False
     deadline_ms: int = Field(10000, gt=0)
     token_budget: int = Field(400, ge=1)
     trace_id: str = Field(..., min_length=1, max_length=128)
-    provider_hint: Optional[str] = None
+    provider_hint: str | None = None
 
 
 class ModelResponse(BaseModel):
@@ -56,7 +70,7 @@ class ModelResponse(BaseModel):
     finish_reason: str = ""
     usage: dict[str, Any] = Field(default_factory=dict)
     latency_ms: int = 0
-    error_code: Optional[str] = None
+    error_code: str | None = None
 
 
 class ModelEvent(BaseModel):
