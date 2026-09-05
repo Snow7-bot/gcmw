@@ -2,18 +2,18 @@
 
 
 def test_app_package_imports():
-    import app  # noqa: F401
-    import app.agents  # noqa: F401
-    import app.api  # noqa: F401
-    import app.api.v1  # noqa: F401
-    import app.contracts  # noqa: F401
-    import app.memory  # noqa: F401
-    import app.observability  # noqa: F401
-    import app.orchestration  # noqa: F401
-    import app.providers  # noqa: F401
-    import app.rag  # noqa: F401
-    import app.safety  # noqa: F401
-    import app.storage  # noqa: F401
+    import app
+    import app.agents
+    import app.api
+    import app.api.v1
+    import app.contracts
+    import app.memory
+    import app.observability
+    import app.orchestration
+    import app.providers
+    import app.rag
+    import app.safety
+    import app.storage
     import app.tools  # noqa: F401
 
 
