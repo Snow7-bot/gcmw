@@ -7,8 +7,9 @@ references cause startup to fail.
 from __future__ import annotations
 
 import os
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
 
@@ -21,8 +22,17 @@ class CloudProviderConfig(BaseModel):
     api_key_env: str = "GCMW_CLOUD_API_KEY"
     transport: str = "websocket"
     modalities: tuple[str, ...] = ("text", "audio", "image", "video")
-    timeout_ms: int = 15_000
-    connect_timeout_ms: int = 5_000
+    timeout_ms: int = Field(15_000, gt=0)
+    connect_timeout_ms: int = Field(5_000, gt=0)
+
+    @field_validator("modalities")
+    @classmethod
+    def validate_modalities(cls, v):
+        if not v or any(item not in SUPPORTED_MODALITIES for item in v):
+            raise ValueError(
+                f"modalities must be non-empty subset of {SUPPORTED_MODALITIES}"
+            )
+        return v
 
 
 class LocalProviderConfig(BaseModel):
@@ -32,29 +42,38 @@ class LocalProviderConfig(BaseModel):
     api_base: str = "http://127.0.0.1:8001/v1"
     api_key_env: str | None = None
     modalities: tuple[str, ...] = ("text", "audio", "image", "video")
-    timeout_ms: int = 30_000
-    connect_timeout_ms: int = 5_000
+    timeout_ms: int = Field(30_000, gt=0)
+    connect_timeout_ms: int = Field(5_000, gt=0)
+
+    @field_validator("modalities")
+    @classmethod
+    def validate_modalities(cls, v):
+        if not v or any(item not in SUPPORTED_MODALITIES for item in v):
+            raise ValueError(
+                f"modalities must be non-empty subset of {SUPPORTED_MODALITIES}"
+            )
+        return v
 
 
 class Settings(BaseModel):
     app_name: str = "gcmw-agent"
     environment: str = "development"
     debug: bool = False
-    active_provider: str = "mock"
+    active_provider: Literal["mock", "cloud", "local"] = "mock"
 
     redis_url: str = "redis://127.0.0.1:6379/0"
     database_url: str = "postgresql://gcmw:gcmw@127.0.0.1:5432/gcmw"
     vector_database_url: str | None = None
 
-    run_timeout_ms: int = 15_000
-    answer_token_budget: int = 400
-    max_tool_calls: int = 4
-    max_agent_handoffs: int = 2
-    max_revisions: int = 1
+    run_timeout_ms: int = Field(15_000, gt=0)
+    answer_token_budget: int = Field(400, gt=0)
+    max_tool_calls: int = Field(4, gt=0)
+    max_agent_handoffs: int = Field(2, ge=0)
+    max_revisions: int = Field(1, ge=0)
 
-    model_timeout_ms: int = 15_000
-    tool_timeout_ms: int = 5_000
-    sse_timeout_ms: int = 30_000
+    model_timeout_ms: int = Field(15_000, gt=0)
+    tool_timeout_ms: int = Field(5_000, gt=0)
+    sse_timeout_ms: int = Field(30_000, gt=0)
 
     cloud: CloudProviderConfig = Field(default_factory=CloudProviderConfig)
     local: LocalProviderConfig = Field(default_factory=LocalProviderConfig)
@@ -62,6 +81,14 @@ class Settings(BaseModel):
     def validate_for_environment(self) -> None:
         if self.environment in {"production", "staging"}:
             missing = []
+            if not self.redis_url or self.redis_url.startswith("redis://127.0.0.1"):
+                missing.append(
+                    "GCMW_REDIS_URL (production must not use localhost default)"
+                )
+            if not self.database_url or "127.0.0.1" in self.database_url:
+                missing.append(
+                    "GCMW_DATABASE_URL (production must not use localhost default)"
+                )
             if self.active_provider == "cloud" and not os.getenv(
                 self.cloud.api_key_env
             ):
@@ -74,16 +101,19 @@ class Settings(BaseModel):
                 missing.append(self.local.api_key_env)
             if missing:
                 raise RuntimeError(
-                    f"Missing required secret environment variables in {self.environment}: {missing}"
+                    f"Missing/invalid required configuration in {self.environment}: {missing}"
                 )
 
     @classmethod
     def from_env(cls) -> Settings:
         def _int(name: str, default: int) -> int:
-            try:
-                return int(os.getenv(name, str(default)))
-            except ValueError:
+            raw = os.getenv(name)
+            if raw is None:
                 return default
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer, got: {raw!r}") from exc
 
         def _bool(name: str, default: bool = False) -> bool:
             return os.getenv(name, "1" if default else "0") == "1"
