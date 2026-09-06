@@ -5,6 +5,9 @@
   "main": "./out/main/index.js",
   "author": "example.com",
   "homepage": "https://electron-vite.org",
+  "engines": {
+    "node": ">=22 <25"
+  },
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
