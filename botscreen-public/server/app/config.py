@@ -10,25 +10,31 @@ import os
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
 
 
-def _is_loopback_url(value: str) -> bool:
+def _normalized_host(value: str) -> str:
     try:
-        host = (urlparse(value).hostname or "").lower()
+        return (urlparse(value).hostname or "").lower().rstrip(".")
     except ValueError:
-        return True
+        return ""
+
+
+def _is_loopback_url(value: str) -> bool:
+    host = _normalized_host(value)
     return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
 
 
-def _is_invalid_storage_url(value: str) -> bool:
+def _is_invalid_storage_url(value: str, allowed_schemes: set[str]) -> bool:
     try:
         parsed = urlparse(value)
     except ValueError:
         return True
-    return not parsed.scheme or not parsed.hostname
+    if parsed.scheme.lower() not in allowed_schemes:
+        return True
+    return not parsed.hostname
 
 
 class CloudProviderConfig(BaseModel):
@@ -95,24 +101,35 @@ class Settings(BaseModel):
     cloud: CloudProviderConfig = Field(default_factory=CloudProviderConfig)
     local: LocalProviderConfig = Field(default_factory=LocalProviderConfig)
 
+    @model_validator(mode="after")
+    def _validate_model(self):
+        self.validate_for_environment()
+        return self
+
     def validate_for_environment(self) -> None:
         if self.environment in {"production", "staging"}:
             missing = []
             if (
                 not self.redis_url
-                or _is_invalid_storage_url(self.redis_url)
+                or _is_invalid_storage_url(self.redis_url, {"redis", "rediss"})
                 or _is_loopback_url(self.redis_url)
             ):
                 missing.append(
-                    "GCMW_REDIS_URL (production must be valid remote URL, not localhost)"
+                    "GCMW_REDIS_URL (production must be valid redis/rediss remote URL, not localhost)"
                 )
             if (
                 not self.database_url
-                or _is_invalid_storage_url(self.database_url)
+                or _is_invalid_storage_url(
+                    self.database_url, {"postgres", "postgresql"}
+                )
                 or _is_loopback_url(self.database_url)
             ):
                 missing.append(
-                    "GCMW_DATABASE_URL (production must be valid remote URL, not localhost)"
+                    "GCMW_DATABASE_URL (production must be valid postgres/postgresql remote URL, not localhost)"
+                )
+            if self.active_provider != "local":
+                missing.append(
+                    "GCMW_ACTIVE_PROVIDER (production/staging must be local)"
                 )
             if self.active_provider == "cloud" and not os.getenv(
                 self.cloud.api_key_env
@@ -141,7 +158,15 @@ class Settings(BaseModel):
                 raise ValueError(f"{name} must be an integer, got: {raw!r}") from exc
 
         def _bool(name: str, default: bool = False) -> bool:
-            return os.getenv(name, "1" if default else "0") == "1"
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+            raise ValueError(f"{name} must be a boolean, got: {raw!r}")
 
         cloud = CloudProviderConfig(
             provider=os.getenv("GCMW_CLOUD_PROVIDER", "dashscope_realtime"),
