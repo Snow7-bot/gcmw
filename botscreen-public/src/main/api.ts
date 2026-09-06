@@ -15,6 +15,11 @@ function getResourceDir(): string {
 
 const resourceDir = getResourceDir()
 
+function isPathInside(base: string, target: string): boolean {
+  const rel = path.relative(base, target)
+  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
+}
+
 export const hasYaml = (_e: IpcMainInvokeEvent, ymlPath: string): boolean => {
   const fullPath = path.isAbsolute(ymlPath) ? ymlPath : path.join(resourceDir, ymlPath)
 
@@ -27,7 +32,7 @@ export const hasYaml = (_e: IpcMainInvokeEvent, ymlPath: string): boolean => {
   }
 
   const resolved = path.resolve(resourceDir, ymlPath)
-  if (!resolved.startsWith(path.resolve(resourceDir))) {
+  if (!isPathInside(resourceDir, resolved)) {
     return false
   }
 
@@ -47,7 +52,7 @@ export const getYaml = async (_e: IpcMainInvokeEvent, ymlPath: string): Promise<
   }
 
   const resolved = path.resolve(resourceDir, ymlPath)
-  if (!resolved.startsWith(path.resolve(resourceDir))) {
+  if (!isPathInside(resourceDir, resolved)) {
     throw new Error('Invalid path')
   }
 
@@ -65,10 +70,16 @@ import mermaid from 'markdown-it-mermaid'
 import { IpcMainInvokeEvent } from 'electron'
 
 const md = new MarkdownIt({
-  html: true,
+  html: false,
   linkify: true,
   typographer: true
 })
+
+md.validateLink = (url: string): boolean => {
+  const normalized = url.trim().toLowerCase()
+  if (normalized.startsWith('rc:')) return true
+  return /^(https?|mailto):/i.test(normalized)
+}
 
 // md.use(mathjax)
 
@@ -95,7 +106,7 @@ export const hasMarkdown = (_e: IpcMainInvokeEvent, mdPath: string): boolean => 
   }
 
   const resolved = path.resolve(resourceDir, mdPath)
-  if (!resolved.startsWith(path.resolve(resourceDir))) {
+  if (!isPathInside(resourceDir, resolved)) {
     return false
   }
 
@@ -137,8 +148,7 @@ export const getMarkdown = async (_e: IpcMainInvokeEvent, mdPath: string): Promi
   }
 
   const resolved = path.resolve(fullPath)
-  const base = path.resolve(resourceDir)
-  if (!resolved.startsWith(base)) {
+  if (!isPathInside(resourceDir, resolved)) {
     throw new Error('Invalid path')
   }
 

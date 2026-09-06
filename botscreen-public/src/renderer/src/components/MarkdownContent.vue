@@ -125,8 +125,17 @@ import IntraLinkModal from '@renderer/components/IntraLinkModal.vue'
 const linkModalOpen = ref(false)
 const linkModalUrl = ref<string | null>(null)
 
+function isSafeExternalUrl(url: string): boolean {
+  const trimmed = url.trim().toLowerCase()
+  return trimmed.startsWith('rc:') || /^(https?|mailto):/i.test(trimmed)
+}
+
 function handleMarkdownLink(href: string): void {
   if (!href.startsWith('#')) {
+    if (!isSafeExternalUrl(href)) {
+      console.warn('Blocked unsafe link:', href)
+      return
+    }
     linkModalUrl.value = href
     linkModalOpen.value = true
     return
@@ -218,6 +227,8 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <!-- v-html is allowed only after markdown-it html:false + validateLink allowlist in api.ts -->
+  <!-- eslint-disable-next-line vue/no-v-html -->
   <div v-if="content" ref="markdownRef" class="markdown-body w-full" v-html="content"></div>
   <IntraLinkModal v-model:open="linkModalOpen" :url="linkModalUrl" />
 </template>

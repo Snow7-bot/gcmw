@@ -22,6 +22,14 @@ const openProxy = computed({
   get: () => props.open,
   set: (v) => emit('update:open', v)
 })
+
+function isSafeIframeUrl(url: string | null): url is string {
+  if (!url) return false
+  const trimmed = url.trim().toLowerCase()
+  return trimmed.startsWith('rc:') || /^https?:/i.test(trimmed)
+}
+
+const safeUrl = computed(() => (isSafeIframeUrl(props.url) ? props.url : null))
 </script>
 
 <template>
@@ -32,7 +40,12 @@ const openProxy = computed({
         class="flex w-full h-full max-w-7xl max-h-100vh m-[2em] flex-col"
       >
         <AnimatedModalContent class="flex-1 p-0">
-          <iframe v-if="url" :src="url" class="h-full w-full border-none" />
+          <iframe
+              v-if="safeUrl"
+              :src="safeUrl"
+              class="h-full w-full border-none"
+              sandbox="allow-scripts allow-same-origin allow-presentation"
+            />
         </AnimatedModalContent>
 
         <AnimatedModalFooter class="gap-2">
