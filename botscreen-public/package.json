@@ -40,7 +40,6 @@
     "markdown-it-table-of-contents": "^1.1.0",
     "mathjax": "^4.1.0",
     "mathjax-full": "^3.2.2",
-    "mime-types": "^3.0.2",
     "motion-v": "^1.10.0",
     "ogl": "^1.0.11",
     "tailwind-merge": "^3.4.0",

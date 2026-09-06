@@ -87,3 +87,20 @@ describe('sanitizeMarkdownHtml expanded policy', () => {
     expect(second).not.toContain('javascript:')
   })
 })
+
+describe('srcset and rc image XSS regression', () => {
+  it('removes srcset even when mixed with rc and remote URLs', () => {
+    const html = '<img src="rc://a.png" srcset="rc://a.png 1x, https://evil.example/x.png 2x">'
+    const out = sanitizeMarkdownHtml(html)
+    expect(out).not.toContain('srcset=')
+    expect(out).not.toContain('evil.example')
+    expect(out).toContain('rc://a.png')
+  })
+
+  it('removes onerror from rc images', () => {
+    const html = '<img src="rc://a.png" onerror="alert(1)">'
+    const out = sanitizeMarkdownHtml(html)
+    expect(out).not.toContain('onerror=')
+    expect(out).toContain('rc://a.png')
+  })
+})

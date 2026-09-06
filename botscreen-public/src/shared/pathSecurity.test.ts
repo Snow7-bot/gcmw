@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { RC_ALLOWED_EXTENSIONS, mimeTypeForRcFile, resolveAllowedPath } from './pathSecurity'
 
 let root: string
+let outsideDir: string | undefined
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'gcmw-path-'))
@@ -12,6 +13,10 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true })
+  if (outsideDir) {
+    fs.rmSync(outsideDir, { recursive: true, force: true })
+    outsideDir = undefined
+  }
 })
 
 describe('resolveAllowedPath', () => {
@@ -28,10 +33,10 @@ describe('resolveAllowedPath', () => {
   })
 
   it('rejects symlink escaping root', () => {
-    const outside = path.join(path.dirname(root), `outside-${Date.now()}`)
-    fs.mkdirSync(outside)
-    fs.writeFileSync(path.join(outside, 'secret.md'), 'x')
-    fs.symlinkSync(path.join(outside, 'secret.md'), path.join(root, 'link.md'))
+    outsideDir = path.join(path.dirname(root), `outside-${Date.now()}`)
+    fs.mkdirSync(outsideDir)
+    fs.writeFileSync(path.join(outsideDir, 'secret.md'), 'x')
+    fs.symlinkSync(path.join(outsideDir, 'secret.md'), path.join(root, 'link.md'))
     expect(resolveAllowedPath(root, 'link.md', ['.md'])).toBeNull()
   })
 

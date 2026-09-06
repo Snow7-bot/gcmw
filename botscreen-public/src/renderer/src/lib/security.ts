@@ -33,7 +33,7 @@ export function sanitizeMarkdownHtml(html: string): string {
       'button',
       'textarea'
     ],
-    FORBID_ATTR: ['style']
+    FORBID_ATTR: ['style', 'srcset']
   })
 }
 
