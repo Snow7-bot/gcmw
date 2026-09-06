@@ -1,5 +1,3 @@
-import os
-
 import pytest
 from pydantic import ValidationError
 
@@ -230,11 +228,44 @@ def test_legacy_ipv4_loopback_helper_recognized():
         assert _is_loopback_url(value), value
 
 
-def test_load_dotenv_from_file(tmp_path, monkeypatch):
-    from app.config import load_dotenv
+@pytest.mark.parametrize(
+    "url",
+    [
+        "redis://0:6379/0",
+        "redis://00:6379/0",
+        "redis://0x0:6379/0",
+        "redis://127.0.0.1:0/0",
+        "redis://127.0.0.1:abc/0",
+        "redis://127.0.0.1:99999/0",
+    ],
+)
+def test_production_rejects_zero_legacy_and_invalid_ports(monkeypatch, url):
+    monkeypatch.setenv("GCMW_ENV", "production")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "local")
+    monkeypatch.setenv("GCMW_REDIS_URL", url)
+    monkeypatch.setenv(
+        "GCMW_DATABASE_URL", "postgresql://gcmw:secret@db.internal:5432/gcmw"
+    )
+    with pytest.raises(RuntimeError):
+        Settings.from_env()
 
-    env_file = tmp_path / ".env"
-    env_file.write_text('GCMW_TEST_KEY="abc"\nGCMW_EMPTY=\n')
-    monkeypatch.delenv("GCMW_TEST_KEY", raising=False)
-    load_dotenv(env_file)
-    assert os.getenv("GCMW_TEST_KEY") == "abc"
+
+def test_nested_config_is_frozen_and_forbids_unknown_fields():
+    from pydantic import ValidationError
+
+    from app.config import CloudProviderConfig
+
+    cfg = CloudProviderConfig()
+    with pytest.raises(ValidationError):
+        cfg.model = "other-model"
+    with pytest.raises(ValidationError):
+        CloudProviderConfig(unknown_field=True)
+
+
+def test_misspelled_config_field_fails():
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(environment="production", active_providerr="local")

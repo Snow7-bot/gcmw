@@ -9,37 +9,12 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
-from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
-
-
-def load_dotenv(path: str | Path | None = None) -> None:
-    """Load a simple .env file without adding a dependency.
-
-    Existing environment variables take precedence.
-    """
-    if path is None:
-        path = Path(__file__).resolve().parent.parent / ".env"
-    path = Path(path)
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("\"'")
-        if key:
-            os.environ.setdefault(key, value)
-
-
-load_dotenv()
 
 
 def _normalized_host(value: str) -> str:
@@ -59,10 +34,11 @@ def _is_loopback_url(value: str) -> bool:
             ip = ip.ipv4_mapped
         return ip.is_loopback or ip.is_unspecified
     except ValueError:
-        # Reject legacy IPv4 forms that resolve to loopback without DNS.
+        # Reject legacy IPv4 forms that resolve to loopback/unspecified without DNS.
         try:
             packed = socket.inet_aton(host)
-            return packed[0] == 127
+            ip = ipaddress.IPv4Address(packed)
+            return ip.is_loopback or ip.is_unspecified
         except OSError:
             return False
 
@@ -70,14 +46,19 @@ def _is_loopback_url(value: str) -> bool:
 def _is_invalid_storage_url(value: str, allowed_schemes: set[str]) -> bool:
     try:
         parsed = urlparse(value)
+        port = parsed.port
     except ValueError:
         return True
     if parsed.scheme.lower() not in allowed_schemes:
         return True
-    return not parsed.hostname
+    if not parsed.hostname:
+        return True
+    return bool(port is not None and port == 0)
 
 
 class CloudProviderConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     provider: str = "dashscope_realtime"
     adapter: str = "cloud_realtime"
     model: str = "qwen3.5-omni-plus-realtime"
@@ -99,6 +80,8 @@ class CloudProviderConfig(BaseModel):
 
 
 class LocalProviderConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     provider: str = "vllm"
     adapter: str = "local_omni"
     model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -119,7 +102,7 @@ class LocalProviderConfig(BaseModel):
 
 
 class Settings(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     app_name: str = "gcmw-agent"
     environment: Literal["development", "staging", "production"] = "development"
