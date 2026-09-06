@@ -74,3 +74,38 @@ jobs:
         run: npm run typecheck
       - name: Lint
         run: npm run lint
+      - name: Build
+        run: npm run build
+
+  frontend-electron-smoke:
+    name: Frontend electron smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: botscreen-public
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: botscreen-public/package-lock.json
+      - name: Install Xvfb and Electron runtime libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb \
+            libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2t64 libpango-1.0-0 libcairo2
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Preload purity check (sandbox-compatible output)
+        run: node scripts/check-preload-purity.mjs
+      - name: Electron smoke (real window, xvfb)
+        run: xvfb-run -a npx electron . --no-sandbox --disable-gpu
+        env:
+          DEBUG: "1"
+          ELECTRON_SMOKE: "1"
+        timeout-minutes: 5
