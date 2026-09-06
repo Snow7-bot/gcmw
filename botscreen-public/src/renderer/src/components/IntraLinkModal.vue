@@ -6,6 +6,7 @@ import {
   AnimatedModalFooter
 } from '@renderer/components/ui/animated-modal'
 import { computed } from 'vue'
+import { isSafeLocalVideoUrl } from '@renderer/lib/security'
 
 interface Props {
   open: boolean
@@ -22,6 +23,8 @@ const openProxy = computed({
   get: () => props.open,
   set: (v) => emit('update:open', v)
 })
+
+const safeVideoUrl = computed(() => (isSafeLocalVideoUrl(props.url) ? props.url : null))
 </script>
 
 <template>
@@ -32,14 +35,14 @@ const openProxy = computed({
         class="flex w-full h-full max-w-7xl max-h-100vh m-[2em] flex-col"
       >
         <AnimatedModalContent class="flex-1 p-0">
-          <iframe v-if="url" :src="url" class="h-full w-full border-none" />
+          <video v-if="safeVideoUrl" :src="safeVideoUrl" class="h-full w-full" controls />
         </AnimatedModalContent>
 
         <AnimatedModalFooter class="gap-2">
           <p
             class="w-full align-left ml-[1em] select-none text-xs text-gray-600 dark:text-gray-400 opacity-70"
           >
-            {{ url }}&emsp;外部链接 · 谨慎浏览
+            {{ url }}&emsp;本地视频
           </p>
         </AnimatedModalFooter>
       </AnimatedModalBody>

@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { isSafeMarkdownExternalUrl, sanitizeMarkdownHtml } from '@renderer/lib/security'
 
 interface Props {
   path: string
@@ -31,7 +32,7 @@ watch(
 
     try {
       const data = await window.api.getMarkdown(path)
-      content.value = data
+      content.value = sanitizeMarkdownHtml(data)
 
       await nextTick()
       await typesetMath()
@@ -127,6 +128,10 @@ const linkModalUrl = ref<string | null>(null)
 
 function handleMarkdownLink(href: string): void {
   if (!href.startsWith('#')) {
+    if (!isSafeMarkdownExternalUrl(href)) {
+      console.warn('Blocked unsafe link:', href)
+      return
+    }
     linkModalUrl.value = href
     linkModalOpen.value = true
     return
@@ -218,6 +223,8 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <!-- v-html is safe because content is sanitized by DOMPurify with #anchor/rc:// allowlist in security.ts -->
+  <!-- eslint-disable-next-line vue/no-v-html -->
   <div v-if="content" ref="markdownRef" class="markdown-body w-full" v-html="content"></div>
   <IntraLinkModal v-model:open="linkModalOpen" :url="linkModalUrl" />
 </template>
