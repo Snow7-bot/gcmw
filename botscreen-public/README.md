@@ -31,7 +31,7 @@
 
 ### Electron 前端
 
-- Node.js 与 npm，建议使用当前 LTS 版本。
+- Node.js 22 或 24 LTS，并确保 npm 版本兼容。
 - 能够安装 Electron 依赖的桌面环境。
 - 如果要显示外部资源，需要准备一个资源目录并通过 RCPATH 指向它。
 
