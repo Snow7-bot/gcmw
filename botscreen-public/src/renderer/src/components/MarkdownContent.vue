@@ -223,7 +223,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <!-- v-html is allowed only after markdown-it html:false + validateLink allowlist in api.ts -->
+  <!-- v-html is safe because content is sanitized by DOMPurify with #anchor/rc:// allowlist in security.ts -->
   <!-- eslint-disable-next-line vue/no-v-html -->
   <div v-if="content" ref="markdownRef" class="markdown-body w-full" v-html="content"></div>
   <IntraLinkModal v-model:open="linkModalOpen" :url="linkModalUrl" />

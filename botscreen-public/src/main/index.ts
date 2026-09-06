@@ -1,13 +1,8 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { join } from 'node:path'
-import {
-  getMarkdown,
-  getYaml,
-  hasMarkdown,
-  hasYaml,
-  resolveAllowedPath
-} from './api'
+import { getMarkdown, getYaml, hasMarkdown, hasYaml } from './api'
+import { RC_ALLOWED_EXTENSIONS, RC_MIME, resolveAllowedPath } from '../shared/pathSecurity'
 import { protocol } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
@@ -162,31 +157,6 @@ app.whenReady().then(() => {
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
-
-  const RC_ALLOWED_EXTENSIONS = [
-    '.png',
-    '.jpg',
-    '.jpeg',
-    '.webp',
-    '.gif',
-    '.mp4',
-    '.webm',
-    '.ogg',
-    '.mov',
-    '.m4v'
-  ]
-  const RC_MIME: Record<string, string> = {
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.webp': 'image/webp',
-    '.gif': 'image/gif',
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.ogg': 'video/ogg',
-    '.mov': 'video/quicktime',
-    '.m4v': 'video/x-m4v'
-  }
 
   protocol.handle('rc', async (request) => {
     try {

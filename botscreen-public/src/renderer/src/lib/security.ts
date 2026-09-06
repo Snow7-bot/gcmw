@@ -10,9 +10,7 @@ const sanitizeUri: UponSanitizeAttributeHook = (_node, data) => {
 
   const value = data.attrValue.trim().toLowerCase()
   const allowed =
-    attr === 'href'
-      ? value.startsWith('#') || value.startsWith('rc://')
-      : value.startsWith('rc://')
+    attr === 'href' ? value.startsWith('#') || value.startsWith('rc://') : value.startsWith('rc://')
 
   if (!allowed) {
     data.keepAttr = false

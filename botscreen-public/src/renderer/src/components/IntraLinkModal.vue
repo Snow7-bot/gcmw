@@ -42,7 +42,7 @@ const safeVideoUrl = computed(() => (isSafeLocalVideoUrl(props.url) ? props.url 
           <p
             class="w-full align-left ml-[1em] select-none text-xs text-gray-600 dark:text-gray-400 opacity-70"
           >
-            {{ url }}&emsp;外部链接 · 谨慎浏览
+            {{ url }}&emsp;本地视频
           </p>
         </AnimatedModalFooter>
       </AnimatedModalBody>
