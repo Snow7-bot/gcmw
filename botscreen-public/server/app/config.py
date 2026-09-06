@@ -6,32 +6,59 @@ references cause startup to fail.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
 
 
-def _is_loopback_url(value: str) -> bool:
+def _normalized_host(value: str) -> str:
     try:
-        host = (urlparse(value).hostname or "").lower()
+        return (urlparse(value).hostname or "").lower().rstrip(".")
     except ValueError:
+        return ""
+
+
+def _is_loopback_url(value: str) -> bool:
+    host = _normalized_host(value)
+    if host == "localhost" or host.endswith(".localhost"):
         return True
-    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
+    try:
+        ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        return ip.is_loopback or ip.is_unspecified
+    except ValueError:
+        # Reject legacy IPv4 forms that resolve to loopback/unspecified without DNS.
+        try:
+            packed = socket.inet_aton(host)
+            ip = ipaddress.IPv4Address(packed)
+            return ip.is_loopback or ip.is_unspecified
+        except OSError:
+            return False
 
 
-def _is_invalid_storage_url(value: str) -> bool:
+def _is_invalid_storage_url(value: str, allowed_schemes: set[str]) -> bool:
     try:
         parsed = urlparse(value)
+        port = parsed.port
     except ValueError:
         return True
-    return not parsed.scheme or not parsed.hostname
+    if parsed.scheme.lower() not in allowed_schemes:
+        return True
+    if not parsed.hostname:
+        return True
+    return bool(port is not None and port == 0)
 
 
 class CloudProviderConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     provider: str = "dashscope_realtime"
     adapter: str = "cloud_realtime"
     model: str = "qwen3.5-omni-plus-realtime"
@@ -53,6 +80,8 @@ class CloudProviderConfig(BaseModel):
 
 
 class LocalProviderConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     provider: str = "vllm"
     adapter: str = "local_omni"
     model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -73,6 +102,8 @@ class LocalProviderConfig(BaseModel):
 
 
 class Settings(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     app_name: str = "gcmw-agent"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
@@ -95,39 +126,48 @@ class Settings(BaseModel):
     cloud: CloudProviderConfig = Field(default_factory=CloudProviderConfig)
     local: LocalProviderConfig = Field(default_factory=LocalProviderConfig)
 
+    @model_validator(mode="after")
+    def _validate_model(self):
+        self.validate_for_environment()
+        return self
+
     def validate_for_environment(self) -> None:
+        missing = []
+        if self.active_provider == "cloud" and not os.getenv(self.cloud.api_key_env):
+            missing.append(self.cloud.api_key_env)
         if self.environment in {"production", "staging"}:
-            missing = []
             if (
                 not self.redis_url
-                or _is_invalid_storage_url(self.redis_url)
+                or _is_invalid_storage_url(self.redis_url, {"redis", "rediss"})
                 or _is_loopback_url(self.redis_url)
             ):
                 missing.append(
-                    "GCMW_REDIS_URL (production must be valid remote URL, not localhost)"
+                    "GCMW_REDIS_URL (production must be valid redis/rediss remote URL, not localhost)"
                 )
             if (
                 not self.database_url
-                or _is_invalid_storage_url(self.database_url)
+                or _is_invalid_storage_url(
+                    self.database_url, {"postgres", "postgresql"}
+                )
                 or _is_loopback_url(self.database_url)
             ):
                 missing.append(
-                    "GCMW_DATABASE_URL (production must be valid remote URL, not localhost)"
+                    "GCMW_DATABASE_URL (production must be valid postgres/postgresql remote URL, not localhost)"
                 )
-            if self.active_provider == "cloud" and not os.getenv(
-                self.cloud.api_key_env
-            ):
-                missing.append(self.cloud.api_key_env)
+            if self.active_provider != "local":
+                missing.append(
+                    "GCMW_ACTIVE_PROVIDER (production/staging must be local)"
+                )
             if (
                 self.active_provider == "local"
                 and self.local.api_key_env
                 and not os.getenv(self.local.api_key_env)
             ):
                 missing.append(self.local.api_key_env)
-            if missing:
-                raise RuntimeError(
-                    f"Missing/invalid required configuration in {self.environment}: {missing}"
-                )
+        if missing:
+            raise RuntimeError(
+                f"Missing/invalid required configuration in {self.environment}: {missing}"
+            )
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -141,7 +181,15 @@ class Settings(BaseModel):
                 raise ValueError(f"{name} must be an integer, got: {raw!r}") from exc
 
         def _bool(name: str, default: bool = False) -> bool:
-            return os.getenv(name, "1" if default else "0") == "1"
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+            raise ValueError(f"{name} must be a boolean, got: {raw!r}")
 
         cloud = CloudProviderConfig(
             provider=os.getenv("GCMW_CLOUD_PROVIDER", "dashscope_realtime"),
@@ -190,5 +238,4 @@ class Settings(BaseModel):
             cloud=cloud,
             local=local,
         )
-        settings.validate_for_environment()
         return settings
