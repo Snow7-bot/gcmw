@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import DOMPurify from 'dompurify'
 
 interface Props {
   path: string
@@ -31,7 +32,7 @@ watch(
 
     try {
       const data = await window.api.getMarkdown(path)
-      content.value = data
+      content.value = DOMPurify.sanitize(data)
 
       await nextTick()
       await typesetMath()
@@ -127,7 +128,7 @@ const linkModalUrl = ref<string | null>(null)
 
 function isSafeExternalUrl(url: string): boolean {
   const trimmed = url.trim().toLowerCase()
-  return trimmed.startsWith('rc:') || /^(https?|mailto):/i.test(trimmed)
+  return trimmed.startsWith('rc:') || /^https?:/i.test(trimmed)
 }
 
 function handleMarkdownLink(href: string): void {

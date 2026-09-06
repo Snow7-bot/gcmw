@@ -26,7 +26,8 @@ const openProxy = computed({
 function isSafeIframeUrl(url: string | null): url is string {
   if (!url) return false
   const trimmed = url.trim().toLowerCase()
-  return trimmed.startsWith('rc:') || /^https?:/i.test(trimmed)
+  // First version only allows local media. External domains require approved allowlist later.
+  return trimmed.startsWith('rc:')
 }
 
 const safeUrl = computed(() => (isSafeIframeUrl(props.url) ? props.url : null))
@@ -41,11 +42,11 @@ const safeUrl = computed(() => (isSafeIframeUrl(props.url) ? props.url : null))
       >
         <AnimatedModalContent class="flex-1 p-0">
           <iframe
-              v-if="safeUrl"
-              :src="safeUrl"
-              class="h-full w-full border-none"
-              sandbox="allow-scripts allow-same-origin allow-presentation"
-            />
+            v-if="safeUrl"
+            :src="safeUrl"
+            class="h-full w-full border-none"
+            sandbox="allow-scripts allow-same-origin allow-presentation"
+          />
         </AnimatedModalContent>
 
         <AnimatedModalFooter class="gap-2">

@@ -132,6 +132,19 @@ function getResourceDir(): string {
 
 const resourceDir = getResourceDir()
 
+function isRealPathInside(base: string, target: string): boolean {
+  let realBase: string
+  let realTarget: string
+  try {
+    realBase = fs.realpathSync(base)
+    realTarget = fs.realpathSync(target)
+  } catch {
+    return false
+  }
+  const rel = path.relative(realBase, realTarget)
+  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
+}
+
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'rc',
@@ -163,16 +176,15 @@ app.whenReady().then(() => {
       const rawPath = request.url.replace(/^rc:\/\//, '')
       const urlPath = decodeURIComponent(rawPath)
       const filePath = path.resolve(path.join(resourceDir, urlPath))
-      const baseDir = path.resolve(resourceDir)
-
-      // 防目录穿越
-      if (!filePath.startsWith(baseDir)) {
-        return new Response(null, { status: 403 })
-      }
 
       if (!fs.existsSync(filePath)) {
         console.error(`[rc://] File not found: ${filePath} (requested: ${request.url})`)
         return new Response(null, { status: 404 })
+      }
+
+      // 防目录穿越，使用 realpath 防止符号链接逃逸
+      if (!isRealPathInside(resourceDir, filePath)) {
+        return new Response(null, { status: 403 })
       }
 
       const stat = fs.statSync(filePath)

@@ -16,7 +16,15 @@ function getResourceDir(): string {
 const resourceDir = getResourceDir()
 
 function isPathInside(base: string, target: string): boolean {
-  const rel = path.relative(base, target)
+  let realBase: string
+  let realTarget: string
+  try {
+    realBase = fs.realpathSync(base)
+    realTarget = fs.realpathSync(target)
+  } catch {
+    return false
+  }
+  const rel = path.relative(realBase, realTarget)
   return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
 }
 
@@ -66,7 +74,6 @@ import MarkdownIt from 'markdown-it'
 // import mathjax from 'markdown-it-mathjax3'
 import footnote from 'markdown-it-footnote'
 import toc from 'markdown-it-table-of-contents'
-import mermaid from 'markdown-it-mermaid'
 import { IpcMainInvokeEvent } from 'electron'
 
 const md = new MarkdownIt({
@@ -77,6 +84,7 @@ const md = new MarkdownIt({
 
 md.validateLink = (url: string): boolean => {
   const normalized = url.trim().toLowerCase()
+  if (normalized.startsWith('#')) return true
   if (normalized.startsWith('rc:')) return true
   return /^(https?|mailto):/i.test(normalized)
 }
@@ -90,9 +98,6 @@ md.use(toc, {
   includeLevel: [1, 2, 3, 4, 5],
   containerClass: 'table-of-contents'
 })
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-md.use((mermaid as any).default ?? mermaid)
 
 export const hasMarkdown = (_e: IpcMainInvokeEvent, mdPath: string): boolean => {
   const fullPath = path.isAbsolute(mdPath) ? mdPath : path.join(resourceDir, mdPath)
