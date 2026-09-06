@@ -156,6 +156,9 @@ def test_invalid_boolean_raises(monkeypatch):
         "redis://0x7f000001:6379/0",
         "redis://0x7f.0.0.1:6379/0",
         "redis://017700000001:6379/0",
+        "redis://0.0.0.0:6379/0",
+        "redis://[::]:6379/0",
+        "redis://foo.localhost:6379/0",
     ],
 )
 def test_production_rejects_ipv4_mapped_decimal_and_trailing_dot(monkeypatch, url):
@@ -218,5 +221,8 @@ def test_legacy_ipv4_loopback_helper_recognized():
         "redis://0x7f.0.0.1:6379/0",
         "redis://017700000001:6379/0",
         "redis://[::ffff:127.0.0.1]:6379/0",
+        "redis://0.0.0.0:6379/0",
+        "redis://[::]:6379/0",
+        "redis://foo.localhost:6379/0",
     ]:
         assert _is_loopback_url(value), value

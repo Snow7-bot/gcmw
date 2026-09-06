@@ -26,13 +26,13 @@ def _normalized_host(value: str) -> str:
 
 def _is_loopback_url(value: str) -> bool:
     host = _normalized_host(value)
-    if host == "localhost":
+    if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
         ip = ipaddress.ip_address(host)
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
-        return ip.is_loopback
+        return ip.is_loopback or ip.is_unspecified
     except ValueError:
         # Reject legacy IPv4 forms that resolve to loopback without DNS.
         try:
