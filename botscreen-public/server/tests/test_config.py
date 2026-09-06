@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from pydantic import ValidationError
 
@@ -226,3 +228,13 @@ def test_legacy_ipv4_loopback_helper_recognized():
         "redis://foo.localhost:6379/0",
     ]:
         assert _is_loopback_url(value), value
+
+
+def test_load_dotenv_from_file(tmp_path, monkeypatch):
+    from app.config import load_dotenv
+
+    env_file = tmp_path / ".env"
+    env_file.write_text('GCMW_TEST_KEY="abc"\nGCMW_EMPTY=\n')
+    monkeypatch.delenv("GCMW_TEST_KEY", raising=False)
+    load_dotenv(env_file)
+    assert os.getenv("GCMW_TEST_KEY") == "abc"

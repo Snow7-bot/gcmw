@@ -9,12 +9,37 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
+
+
+def load_dotenv(path: str | Path | None = None) -> None:
+    """Load a simple .env file without adding a dependency.
+
+    Existing environment variables take precedence.
+    """
+    if path is None:
+        path = Path(__file__).resolve().parent.parent / ".env"
+    path = Path(path)
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_dotenv()
 
 
 def _normalized_host(value: str) -> str:
