@@ -1,12 +1,17 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { join } from 'node:path'
-import { getMarkdown, getYaml, hasMarkdown, hasYaml } from './api'
+import {
+  getMarkdown,
+  getYaml,
+  hasMarkdown,
+  hasYaml,
+  resolveAllowedPath
+} from './api'
 import { protocol } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import { Readable } from 'node:stream'
-import mime from 'mime-types'
 
 let exitArmed = false
 let exitInputBuffer = ''
@@ -132,19 +137,6 @@ function getResourceDir(): string {
 
 const resourceDir = getResourceDir()
 
-function isRealPathInside(base: string, target: string): boolean {
-  let realBase: string
-  let realTarget: string
-  try {
-    realBase = fs.realpathSync(base)
-    realTarget = fs.realpathSync(target)
-  } catch {
-    return false
-  }
-  const rel = path.relative(realBase, realTarget)
-  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
-}
-
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'rc',
@@ -171,27 +163,51 @@ app.whenReady().then(() => {
     optimizer.watchWindowShortcuts(window)
   })
 
+  const RC_ALLOWED_EXTENSIONS = [
+    '.png',
+    '.jpg',
+    '.jpeg',
+    '.webp',
+    '.gif',
+    '.mp4',
+    '.webm',
+    '.ogg',
+    '.mov',
+    '.m4v'
+  ]
+  const RC_MIME: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.mp4': 'video/mp4',
+    '.webm': 'video/webm',
+    '.ogg': 'video/ogg',
+    '.mov': 'video/quicktime',
+    '.m4v': 'video/x-m4v'
+  }
+
   protocol.handle('rc', async (request) => {
     try {
-      const rawPath = request.url.replace(/^rc:\/\//, '')
+      const rawPath = request.url.replace(/^rc:\/\//, '').split(/[?#]/)[0]
       const urlPath = decodeURIComponent(rawPath)
-      const filePath = path.resolve(path.join(resourceDir, urlPath))
+      const canonical = resolveAllowedPath(resourceDir, urlPath, RC_ALLOWED_EXTENSIONS)
 
-      if (!fs.existsSync(filePath)) {
-        console.error(`[rc://] File not found: ${filePath} (requested: ${request.url})`)
+      if (!canonical) {
         return new Response(null, { status: 404 })
       }
 
-      // 防目录穿越，使用 realpath 防止符号链接逃逸
-      if (!isRealPathInside(resourceDir, filePath)) {
-        return new Response(null, { status: 403 })
-      }
-
-      const stat = fs.statSync(filePath)
+      const stat = fs.statSync(canonical)
       const size = stat.size
       const range = request.headers.get('range')
 
-      const mimeType = mime.lookup(filePath) || 'application/octet-stream'
+      const ext = path.extname(canonical).toLowerCase()
+      const mimeType = RC_MIME[ext] || 'application/octet-stream'
+      const commonHeaders = {
+        'Content-Type': mimeType,
+        'X-Content-Type-Options': 'nosniff'
+      }
 
       // ===== Range 请求（视频播放关键）=====
       if (range) {
@@ -209,13 +225,13 @@ app.whenReady().then(() => {
 
         const safeEnd = Math.min(end, size - 1)
 
-        const nodeStream = fs.createReadStream(filePath, { start, end: safeEnd })
+        const nodeStream = fs.createReadStream(canonical, { start, end: safeEnd })
         const webStream = Readable.toWeb(nodeStream)
 
         return new Response(webStream as BodyInit, {
           status: 206,
           headers: {
-            'Content-Type': mimeType,
+            ...commonHeaders,
             'Accept-Ranges': 'bytes',
             'Content-Range': `bytes ${start}-${end}/${size}`,
             'Content-Length': String(end - start + 1)
@@ -224,12 +240,12 @@ app.whenReady().then(() => {
       }
 
       // ===== 普通请求 =====
-      const nodeStream = fs.createReadStream(filePath)
+      const nodeStream = fs.createReadStream(canonical)
       const webStream = Readable.toWeb(nodeStream)
 
       return new Response(webStream as BodyInit, {
         headers: {
-          'Content-Type': mimeType,
+          ...commonHeaders,
           'Accept-Ranges': 'bytes',
           'Content-Length': String(size)
         }

@@ -15,56 +15,49 @@ function getResourceDir(): string {
 
 const resourceDir = getResourceDir()
 
-function isPathInside(base: string, target: string): boolean {
+export function resolveAllowedPath(
+  base: string,
+  requestedPath: string,
+  allowedExtensions: string[]
+): string | null {
+  const resolved = path.isAbsolute(requestedPath)
+    ? requestedPath
+    : path.resolve(base, requestedPath)
+  const rel = path.relative(base, resolved)
+  if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return null
+  }
+
   let realBase: string
   let realTarget: string
   try {
     realBase = fs.realpathSync(base)
-    realTarget = fs.realpathSync(target)
+    realTarget = fs.realpathSync(resolved)
   } catch {
-    return false
+    return null
   }
-  const rel = path.relative(realBase, realTarget)
-  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel))
+  const realRel = path.relative(realBase, realTarget)
+  if (realRel === '..' || realRel.startsWith(`..${path.sep}`) || path.isAbsolute(realRel)) {
+    return null
+  }
+  const ext = path.extname(realTarget).toLowerCase()
+  if (!allowedExtensions.includes(ext)) {
+    return null
+  }
+  return realTarget
 }
 
 export const hasYaml = (_e: IpcMainInvokeEvent, ymlPath: string): boolean => {
-  const fullPath = path.isAbsolute(ymlPath) ? ymlPath : path.join(resourceDir, ymlPath)
-
-  if (!fs.existsSync(fullPath)) {
-    return false
-  }
-
-  if (!fullPath.endsWith('.yml')) {
-    return false
-  }
-
-  const resolved = path.resolve(resourceDir, ymlPath)
-  if (!isPathInside(resourceDir, resolved)) {
-    return false
-  }
-
-  return true
+  return resolveAllowedPath(resourceDir, ymlPath, ['.yml']) !== null
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const getYaml = async (_e: IpcMainInvokeEvent, ymlPath: string): Promise<any> => {
-  const fullPath = path.isAbsolute(ymlPath) ? ymlPath : path.join(resourceDir, ymlPath)
-
-  if (!fs.existsSync(fullPath)) {
-    throw new Error(`Yaml file not found: ${fullPath}`)
+  const canonical = resolveAllowedPath(resourceDir, ymlPath, ['.yml'])
+  if (!canonical) {
+    throw new Error('Yaml file not found or invalid path')
   }
-
-  if (!fullPath.endsWith('.yml')) {
-    throw new Error('Only yaml files are allowed')
-  }
-
-  const resolved = path.resolve(resourceDir, ymlPath)
-  if (!isPathInside(resourceDir, resolved)) {
-    throw new Error('Invalid path')
-  }
-
-  const raw = fs.readFileSync(fullPath, 'utf-8')
+  const raw = fs.readFileSync(canonical, 'utf-8')
   const parsed = YAML.parse(raw)
 
   return parsed
@@ -78,15 +71,14 @@ import { IpcMainInvokeEvent } from 'electron'
 
 const md = new MarkdownIt({
   html: false,
-  linkify: true,
+  linkify: false,
   typographer: true
 })
 
 md.validateLink = (url: string): boolean => {
   const normalized = url.trim().toLowerCase()
   if (normalized.startsWith('#')) return true
-  if (normalized.startsWith('rc:')) return true
-  return /^(https?|mailto):/i.test(normalized)
+  return normalized.startsWith('rc://')
 }
 
 // md.use(mathjax)
@@ -100,22 +92,7 @@ md.use(toc, {
 })
 
 export const hasMarkdown = (_e: IpcMainInvokeEvent, mdPath: string): boolean => {
-  const fullPath = path.isAbsolute(mdPath) ? mdPath : path.join(resourceDir, mdPath)
-
-  if (!fs.existsSync(fullPath)) {
-    return false
-  }
-
-  if (!fullPath.endsWith('.md')) {
-    return false
-  }
-
-  const resolved = path.resolve(resourceDir, mdPath)
-  if (!isPathInside(resourceDir, resolved)) {
-    return false
-  }
-
-  return true
+  return resolveAllowedPath(resourceDir, mdPath, ['.md']) !== null
 }
 
 import crypto from 'node:crypto'
@@ -142,26 +119,16 @@ interface MarkdownFileCache {
   html: string
 }
 export const getMarkdown = async (_e: IpcMainInvokeEvent, mdPath: string): Promise<string> => {
-  const fullPath = path.isAbsolute(mdPath) ? mdPath : path.join(resourceDir, mdPath)
-
-  if (!fs.existsSync(fullPath)) {
-    throw new Error(`Markdown file not found: ${fullPath}`)
-  }
-
-  if (!fullPath.endsWith('.md')) {
-    throw new Error('Only markdown files are allowed')
-  }
-
-  const resolved = path.resolve(fullPath)
-  if (!isPathInside(resourceDir, resolved)) {
-    throw new Error('Invalid path')
+  const canonical = resolveAllowedPath(resourceDir, mdPath, ['.md'])
+  if (!canonical) {
+    throw new Error('Markdown file not found or invalid path')
   }
 
   ensureCacheDir()
 
-  const stat = fs.statSync(resolved)
+  const stat = fs.statSync(canonical)
   const mtimeMs = stat.mtimeMs
-  const cacheFile = getCacheFilePath(resolved)
+  const cacheFile = getCacheFilePath(canonical)
 
   // —— 1. 尝试命中缓存 ——
   if (fs.existsSync(cacheFile)) {
@@ -177,7 +144,7 @@ export const getMarkdown = async (_e: IpcMainInvokeEvent, mdPath: string): Promi
   }
 
   // —— 2. 重新渲染 ——
-  const raw = fs.readFileSync(resolved, 'utf-8')
+  const raw = fs.readFileSync(canonical, 'utf-8')
   const html = md.render(raw)
 
   // —— 3. 写入缓存（原子替换，避免半写） ——

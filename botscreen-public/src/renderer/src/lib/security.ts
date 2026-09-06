@@ -1,11 +1,42 @@
-import DOMPurify from 'dompurify'
+import createDOMPurify, { type UponSanitizeAttributeHook } from 'dompurify'
 
-const ALLOWED_URI_REGEXP = /^(?:(?:https?|rc):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$))/i
+const ALLOWED_URI_REGEXP = /^(?:#|rc:\/\/)/i
+
+const markdownPurifier = createDOMPurify(window)
+
+const sanitizeUri: UponSanitizeAttributeHook = (_node, data) => {
+  const attr = data.attrName.toLowerCase()
+  if (attr !== 'href' && attr !== 'src') return
+
+  const value = data.attrValue.trim().toLowerCase()
+  const allowed =
+    attr === 'href'
+      ? value.startsWith('#') || value.startsWith('rc://')
+      : value.startsWith('rc://')
+
+  if (!allowed) {
+    data.keepAttr = false
+  }
+}
+
+markdownPurifier.addHook('uponSanitizeAttribute', sanitizeUri)
 
 export function sanitizeMarkdownHtml(html: string): string {
-  const sanitized = DOMPurify.sanitize(html, { ALLOWED_URI_REGEXP })
-  // Defense-in-depth: remove any remaining dangerous URI attributes.
-  return sanitized.replace(/\s(?:href|src)=["'](?:javascript|data|file):[^"']*["']/gi, '')
+  return markdownPurifier.sanitize(html, {
+    ALLOWED_URI_REGEXP,
+    FORBID_TAGS: [
+      'style',
+      'iframe',
+      'object',
+      'embed',
+      'svg',
+      'form',
+      'input',
+      'button',
+      'textarea'
+    ],
+    FORBID_ATTR: ['style']
+  })
 }
 
 const RC_VIDEO_EXTENSIONS = /\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/i
