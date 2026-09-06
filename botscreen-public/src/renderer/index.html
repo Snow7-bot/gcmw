@@ -3,16 +3,31 @@
   <head>
     <meta charset="UTF-8" />
     <title>Electron</title>
+    <!--
+      CSP: the renderer never loads remote code. Only this app's own bundled
+      scripts may execute (script-src 'self'; no unsafe-eval, no data:/blob:
+      script payloads). Markdown is sanitized before it reaches the DOM
+      (html:false in main + DOMPurify allowlist, src/href limited to # and rc://).
+      - style-src 'unsafe-inline' is required by MathJax v3 SVG output and UI
+        components that set style attributes (verified via Electron smoke);
+        styles can never execute code.
+      - media-src/img-src keep rc: for local content; connect-src is pinned to
+        the local QA backend (127.0.0.1:8000) instead of all localhost ports.
+      - No worker-src grant: MathJax v3 (mathjax-full) typesets on the main
+        thread and spawns no workers.
+    -->
     <meta
       http-equiv="Content-Security-Policy"
       content="
-        default-src 'self' rc: data: blob:;
-        script-src 'self' rc: data: blob:;
-        style-src 'self' 'unsafe-inline' rc: data: blob:;
-        img-src 'self' rc: data: blob: *;
-        frame-src 'self' rc: data: blob: *;
+        default-src 'self';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' rc: data: blob:;
+        frame-src 'none';
+        object-src 'none';
+        base-uri 'none';
         media-src 'self' rc: data: blob:;
-        connect-src 'self' http://127.0.0.1:* http://localhost:*;
+        connect-src 'self' http://127.0.0.1:8000;
       "
     />
   </head>

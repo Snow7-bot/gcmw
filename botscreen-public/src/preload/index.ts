@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import { electronAPI } from '@electron-toolkit/preload'
 
+// Minimal, frozen API surface. Sandboxed preloads may only load Electron's
+// built-in renderer modules, so this file must stay free of any third-party
+// or node: imports — electron-vite keeps dependencies external, and sandboxed
+// preloads cannot load them.
 const api = {
   getYaml: (path: string) => ipcRenderer.invoke('getyml', path),
   getMarkdown: (path: string) => ipcRenderer.invoke('getmd', path),
@@ -8,12 +11,4 @@ const api = {
   hasMarkdown: (path: string) => ipcRenderer.invoke('hasmd', path)
 }
 
-if (process.contextIsolated) {
-  contextBridge.exposeInMainWorld('electron', electronAPI)
-  contextBridge.exposeInMainWorld('api', api)
-} else {
-  // @ts-ignore - electronAPI types are not available in non-isolated context
-  window.electron = electronAPI
-  // @ts-ignore - api type is declared globally for renderer
-  window.api = api
-}
+contextBridge.exposeInMainWorld('api', Object.freeze(api))
