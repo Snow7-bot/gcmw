@@ -147,10 +147,15 @@ def test_invalid_boolean_raises(monkeypatch):
 @pytest.mark.parametrize(
     "url",
     [
-        "redis://::ffff:127.0.0.1:6379/0",
+        "redis://[::ffff:127.0.0.1]:6379/0",
         "redis://2130706433:6379/0",
         "redis://localhost.:6379/0",
         "redis://127.0.0.2:6379/0",
+        "redis://127.1:6379/0",
+        "redis://127.0.1:6379/0",
+        "redis://0x7f000001:6379/0",
+        "redis://0x7f.0.0.1:6379/0",
+        "redis://017700000001:6379/0",
     ],
 )
 def test_production_rejects_ipv4_mapped_decimal_and_trailing_dot(monkeypatch, url):
@@ -177,3 +182,41 @@ def test_settings_is_frozen():
     with pytest.raises(ValidationError):
         settings = Settings()
         settings.environment = "production"
+
+
+def test_staging_requires_local_provider(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "staging")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "cloud")
+    monkeypatch.setenv("GCMW_REDIS_URL", "redis://redis.internal:6379/0")
+    monkeypatch.setenv(
+        "GCMW_DATABASE_URL", "postgresql://gcmw:secret@db.internal:5432/gcmw"
+    )
+    monkeypatch.setenv("GCMW_CLOUD_API_KEY", "test-secret")
+    with pytest.raises(RuntimeError) as exc:
+        Settings.from_env()
+    assert "GCMW_ACTIVE_PROVIDER" in str(exc.value)
+
+
+def test_staging_local_valid_passes(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "staging")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "local")
+    monkeypatch.setenv("GCMW_REDIS_URL", "rediss://redis.internal:6379/0")
+    monkeypatch.setenv(
+        "GCMW_DATABASE_URL", "postgresql://gcmw:secret@db.internal:5432/gcmw"
+    )
+    settings = Settings.from_env()
+    assert settings.active_provider == "local"
+
+
+def test_legacy_ipv4_loopback_helper_recognized():
+    from app.config import _is_loopback_url
+
+    for value in [
+        "redis://127.1:6379/0",
+        "redis://127.0.1:6379/0",
+        "redis://0x7f000001:6379/0",
+        "redis://0x7f.0.0.1:6379/0",
+        "redis://017700000001:6379/0",
+        "redis://[::ffff:127.0.0.1]:6379/0",
+    ]:
+        assert _is_loopback_url(value), value

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import socket
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -28,15 +29,17 @@ def _is_loopback_url(value: str) -> bool:
     if host == "localhost":
         return True
     try:
-        if host.isdigit():
-            ip = ipaddress.ip_address(int(host))
-        else:
-            ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(host)
         if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
         return ip.is_loopback
     except ValueError:
-        return False
+        # Reject legacy IPv4 forms that resolve to loopback without DNS.
+        try:
+            packed = socket.inet_aton(host)
+            return packed[0] == 127
+        except OSError:
+            return False
 
 
 def _is_invalid_storage_url(value: str, allowed_schemes: set[str]) -> bool:
@@ -227,5 +230,4 @@ class Settings(BaseModel):
             cloud=cloud,
             local=local,
         )
-        settings.validate_for_environment()
         return settings
