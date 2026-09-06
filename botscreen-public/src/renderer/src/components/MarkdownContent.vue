@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import DOMPurify from 'dompurify'
+import { isSafeMarkdownExternalUrl, sanitizeMarkdownHtml } from '@renderer/lib/security'
 
 interface Props {
   path: string
@@ -32,7 +32,7 @@ watch(
 
     try {
       const data = await window.api.getMarkdown(path)
-      content.value = DOMPurify.sanitize(data)
+      content.value = sanitizeMarkdownHtml(data)
 
       await nextTick()
       await typesetMath()
@@ -126,14 +126,9 @@ import IntraLinkModal from '@renderer/components/IntraLinkModal.vue'
 const linkModalOpen = ref(false)
 const linkModalUrl = ref<string | null>(null)
 
-function isSafeExternalUrl(url: string): boolean {
-  const trimmed = url.trim().toLowerCase()
-  return trimmed.startsWith('rc:') || /^https?:/i.test(trimmed)
-}
-
 function handleMarkdownLink(href: string): void {
   if (!href.startsWith('#')) {
-    if (!isSafeExternalUrl(href)) {
+    if (!isSafeMarkdownExternalUrl(href)) {
       console.warn('Blocked unsafe link:', href)
       return
     }

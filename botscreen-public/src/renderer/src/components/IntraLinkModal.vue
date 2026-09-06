@@ -6,6 +6,7 @@ import {
   AnimatedModalFooter
 } from '@renderer/components/ui/animated-modal'
 import { computed } from 'vue'
+import { isSafeLocalVideoUrl } from '@renderer/lib/security'
 
 interface Props {
   open: boolean
@@ -23,14 +24,7 @@ const openProxy = computed({
   set: (v) => emit('update:open', v)
 })
 
-function isSafeIframeUrl(url: string | null): url is string {
-  if (!url) return false
-  const trimmed = url.trim().toLowerCase()
-  // First version only allows local media. External domains require approved allowlist later.
-  return trimmed.startsWith('rc:')
-}
-
-const safeUrl = computed(() => (isSafeIframeUrl(props.url) ? props.url : null))
+const safeVideoUrl = computed(() => (isSafeLocalVideoUrl(props.url) ? props.url : null))
 </script>
 
 <template>
@@ -41,12 +35,7 @@ const safeUrl = computed(() => (isSafeIframeUrl(props.url) ? props.url : null))
         class="flex w-full h-full max-w-7xl max-h-100vh m-[2em] flex-col"
       >
         <AnimatedModalContent class="flex-1 p-0">
-          <iframe
-            v-if="safeUrl"
-            :src="safeUrl"
-            class="h-full w-full border-none"
-            sandbox="allow-scripts allow-same-origin allow-presentation"
-          />
+          <video v-if="safeVideoUrl" :src="safeVideoUrl" class="h-full w-full" controls />
         </AnimatedModalContent>
 
         <AnimatedModalFooter class="gap-2">
