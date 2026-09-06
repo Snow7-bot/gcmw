@@ -6,11 +6,12 @@ references cause startup to fail.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
 
@@ -24,7 +25,18 @@ def _normalized_host(value: str) -> str:
 
 def _is_loopback_url(value: str) -> bool:
     host = _normalized_host(value)
-    return host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127.")
+    if host == "localhost":
+        return True
+    try:
+        if host.isdigit():
+            ip = ipaddress.ip_address(int(host))
+        else:
+            ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        return ip.is_loopback
+    except ValueError:
+        return False
 
 
 def _is_invalid_storage_url(value: str, allowed_schemes: set[str]) -> bool:
@@ -79,6 +91,8 @@ class LocalProviderConfig(BaseModel):
 
 
 class Settings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     app_name: str = "gcmw-agent"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
@@ -107,8 +121,10 @@ class Settings(BaseModel):
         return self
 
     def validate_for_environment(self) -> None:
+        missing = []
+        if self.active_provider == "cloud" and not os.getenv(self.cloud.api_key_env):
+            missing.append(self.cloud.api_key_env)
         if self.environment in {"production", "staging"}:
-            missing = []
             if (
                 not self.redis_url
                 or _is_invalid_storage_url(self.redis_url, {"redis", "rediss"})
@@ -131,20 +147,16 @@ class Settings(BaseModel):
                 missing.append(
                     "GCMW_ACTIVE_PROVIDER (production/staging must be local)"
                 )
-            if self.active_provider == "cloud" and not os.getenv(
-                self.cloud.api_key_env
-            ):
-                missing.append(self.cloud.api_key_env)
             if (
                 self.active_provider == "local"
                 and self.local.api_key_env
                 and not os.getenv(self.local.api_key_env)
             ):
                 missing.append(self.local.api_key_env)
-            if missing:
-                raise RuntimeError(
-                    f"Missing/invalid required configuration in {self.environment}: {missing}"
-                )
+        if missing:
+            raise RuntimeError(
+                f"Missing/invalid required configuration in {self.environment}: {missing}"
+            )
 
     @classmethod
     def from_env(cls) -> Settings:

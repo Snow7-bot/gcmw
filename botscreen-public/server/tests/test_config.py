@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 
@@ -141,3 +142,38 @@ def test_invalid_boolean_raises(monkeypatch):
     monkeypatch.setenv("GCMW_DEBUG", "maybe")
     with pytest.raises(ValueError):
         Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "redis://::ffff:127.0.0.1:6379/0",
+        "redis://2130706433:6379/0",
+        "redis://localhost.:6379/0",
+        "redis://127.0.0.2:6379/0",
+    ],
+)
+def test_production_rejects_ipv4_mapped_decimal_and_trailing_dot(monkeypatch, url):
+    monkeypatch.setenv("GCMW_ENV", "production")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "local")
+    monkeypatch.setenv("GCMW_REDIS_URL", url)
+    monkeypatch.setenv(
+        "GCMW_DATABASE_URL", "postgresql://gcmw:secret@db.internal:5432/gcmw"
+    )
+    with pytest.raises(RuntimeError):
+        Settings.from_env()
+
+
+def test_development_cloud_missing_key_fails(monkeypatch):
+    monkeypatch.setenv("GCMW_ENV", "development")
+    monkeypatch.setenv("GCMW_ACTIVE_PROVIDER", "cloud")
+    monkeypatch.delenv("GCMW_CLOUD_API_KEY", raising=False)
+    with pytest.raises(RuntimeError) as exc:
+        Settings.from_env()
+    assert "GCMW_CLOUD_API_KEY" in str(exc.value)
+
+
+def test_settings_is_frozen():
+    with pytest.raises(ValidationError):
+        settings = Settings()
+        settings.environment = "production"
