@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .errors import ErrorCode
+
 
 class ContentType(str, Enum):
     TEXT = "text"
@@ -82,7 +84,7 @@ class ModelResponse(BaseModel):
     finish_reason: str = ""
     usage: dict[str, Any] = Field(default_factory=dict)
     latency_ms: int = 0
-    error_code: str | None = None
+    error_code: ErrorCode | None = None
 
 
 class ModelEvent(BaseModel):

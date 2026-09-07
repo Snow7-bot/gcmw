@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from .common import Channel
+from .errors import ErrorCode
 
 
 class RiskLevel(str, Enum):
@@ -67,7 +68,7 @@ class ToolResult(BaseModel):
     tool_name: str = Field(..., min_length=1, max_length=128)
     ok: bool = True
     data: Any = None
-    error_code: str | None = None
+    error_code: ErrorCode | None = None
     error_message: str | None = None
 
 
