@@ -6,7 +6,13 @@
 - routing is deterministic: the first registered (and enabled) agent whose
   ``supported_intents`` matches wins;
 - agents never talk to each other directly — the registry is the single
-  dispatch source for Manager (V2.3 §6.4).
+  dispatch source for Manager (V2.3 §6.4);
+- the registry stores and returns deep copies: external mutation of a
+  registered manifest (or of a returned manifest) can never corrupt registry
+  state; ``enabled`` doubles as the declared default at registration time and
+  the runtime flag thereafter — mutate it only through enable/disable;
+- RegistryError exposes ``.code`` (ErrorCode) so the #36 boundary maps every
+  registry failure onto a single envelope path.
 """
 
 from __future__ import annotations
@@ -49,7 +55,7 @@ class AgentRegistry:
                 f"agent {manifest.agent_id!r} already registered",
             )
         self._entries[manifest.agent_id] = AgentEntry(
-            manifest=manifest, registered_order=self._order
+            manifest=manifest.model_copy(deep=True), registered_order=self._order
         )
         self._order += 1
 
@@ -70,7 +76,7 @@ class AgentRegistry:
                 ErrorCode.NOT_FOUND_AGENT, f"agent {agent_id!r} not found"
             )
         # manifest dataclass holds pydantic model — replace with toggled copy
-        toggled = entry.manifest.model_copy(update={"enabled": enabled})
+        toggled = entry.manifest.model_copy(deep=True, update={"enabled": enabled})
         self._entries[agent_id] = AgentEntry(
             manifest=toggled, registered_order=entry.registered_order
         )
@@ -90,7 +96,7 @@ class AgentRegistry:
             raise RegistryError(
                 ErrorCode.NOT_FOUND_AGENT, f"agent {agent_id!r} not found"
             )
-        return entry.manifest
+        return entry.manifest.model_copy(deep=True)
 
     def is_enabled(self, agent_id: str) -> bool:
         return self.get(agent_id).enabled
@@ -98,7 +104,7 @@ class AgentRegistry:
     def list_agents(self) -> list[AgentManifest]:
         """All manifests in registration order (enabled and disabled)."""
         return [
-            e.manifest
+            e.manifest.model_copy(deep=True)
             for e in sorted(self._entries.values(), key=lambda e: e.registered_order)
         ]
 
@@ -108,7 +114,7 @@ class AgentRegistry:
         for entry in sorted(self._entries.values(), key=lambda e: e.registered_order):
             manifest = entry.manifest
             if manifest.enabled and intent in manifest.supported_intents:
-                return manifest
+                return manifest.model_copy(deep=True)
         return None
 
     def __len__(self) -> int:

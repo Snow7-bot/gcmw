@@ -68,6 +68,30 @@ class TestEnableDisable:
         assert registry.get("manager").enabled is False
 
 
+class TestAliasSafety:
+    def test_register_stores_deep_copy(self, registry):
+        orig = _manifest("ghost", ["g"])
+        registry.register(orig)
+        orig.risk_level = RiskLevel.CRITICAL
+        orig.supported_intents.append("mutated")
+        assert registry.get("ghost").risk_level is RiskLevel.LOW
+        assert "mutated" not in registry.get("ghost").supported_intents
+
+    def test_returns_are_deep_copies(self, registry):
+        got = registry.get("manager")
+        got.supported_intents.append("mutated")
+        assert registry.resolve("mutated") is None
+        listed = registry.list_agents()[0]
+        listed.allowed_tools.append("mutated_tool")
+        assert registry.get("manager").allowed_tools == []
+
+    def test_registered_disabled_manifest_stays_disabled(self):
+        reg = AgentRegistry()
+        reg.register(_manifest("off", ["x"], enabled=False))
+        assert reg.is_enabled("off") is False
+        assert reg.resolve("x") is None
+
+
 class TestRouting:
     def test_resolve_first_registered_enabled_wins(self):
         reg = AgentRegistry()
