@@ -56,6 +56,7 @@ class ErrorCode(str, Enum):
     NOT_FOUND_SESSION = "E_NOT_FOUND_SESSION"
     NOT_FOUND_RUN = "E_NOT_FOUND_RUN"
     NOT_FOUND_KNOWLEDGE = "E_NOT_FOUND_KNOWLEDGE"
+    NOT_FOUND_AGENT = "E_NOT_FOUND_AGENT"
     # timeouts / availability
     TIMEOUT_AGENT = "E_TIMEOUT_AGENT"
     TIMEOUT_PROVIDER = "E_TIMEOUT_PROVIDER"
@@ -225,6 +226,14 @@ _register(
     False,
     True,
     "未找到匹配的已审核资料",
+)
+_register(
+    ErrorCode.NOT_FOUND_AGENT,
+    ErrorCategory.NOT_FOUND,
+    404,
+    False,
+    True,
+    "Agent 不存在或已停用",
 )
 _register(
     ErrorCode.TIMEOUT_AGENT, ErrorCategory.TIMEOUT, 504, True, True, "处理超时，请重试"
