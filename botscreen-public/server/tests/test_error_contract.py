@@ -136,11 +136,16 @@ class TestContractIntegration:
 
     def test_audit_record_error_code_is_enum_and_optional(self):
         rec = AuditRecord(
-            tenant_id="t", actor_type="user", actor_id_hash="h", request_id="r", action="run"
+            tenant_id="t",
+            actor_type="user",
+            actor_id_hash="h",
+            request_id="r",
+            action="run",
         )
         assert rec.error_code is None
         rec2 = AuditRecord(
-            tenant_id="t", actor_type="user",
+            tenant_id="t",
+            actor_type="user",
             actor_id_hash="h",
             request_id="r",
             action="run",
@@ -149,7 +154,8 @@ class TestContractIntegration:
         assert rec2.error_code is ErrorCode.SAFETY_BLOCKED
         with pytest.raises(ValidationError):
             AuditRecord(
-                tenant_id="t", actor_type="user",
+                tenant_id="t",
+                actor_type="user",
                 actor_id_hash="h",
                 request_id="r",
                 action="run",
