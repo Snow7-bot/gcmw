@@ -58,6 +58,9 @@ class TestStream:
             ev.data["delta"] for ev in events if ev.type is ModelEventType.DELTA
         )
         assert deltas == "mock-ok"
+        # normal completion must not be flagged as a cancellation
+        assert provider.stream_cancelled is False
+        assert provider.stream_finished is True
 
     @mark.asyncio
     async def test_stream_cancellation_is_observed(self):
@@ -128,7 +131,7 @@ class TestGatewayIntegration:
 
 
 def asyncio_create_task(coro):
-    return asyncio.get_event_loop().create_task(coro)
+    return asyncio.get_running_loop().create_task(coro)
 
 
 async def asyncio_sleep(ms: int) -> None:

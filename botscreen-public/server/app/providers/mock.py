@@ -55,6 +55,7 @@ class MockProvider:
         self.supports_function_calling = supports_function_calling
         self.sessions_opened = 0
         self.stream_cancelled = False
+        self.stream_finished = False
 
     # -- helpers -------------------------------------------------------------
 
@@ -75,14 +76,15 @@ class MockProvider:
         return ""
 
     def _apply_rules(self, request: ModelRequest) -> None:
+        """Raise when the request matches an error trigger rule.
+
+        Canned replies are resolved separately in ``_reply_for``; rules only
+        cover forced-error scenarios used by the contract regression matrix.
+        """
         text = self._last_user_text(request)
         for needle, code in self._error_triggers.items():
             if needle in text:
                 raise ModelGatewayError(code, f"mock trigger {needle!r}")
-        for needle in self._canned:
-            if needle in text:
-                return
-        # no canned rule matched — fine, default reply used below
 
     def _reply_for(self, request: ModelRequest) -> str:
         text = self._last_user_text(request)
@@ -134,8 +136,13 @@ class MockProvider:
                 model_id=self.model_id,
                 model_version=self.model_version,
             )
+        except (GeneratorExit, asyncio.CancelledError):
+            # cancelled at an await point (aclose/task cancel): observed
+            # distinctly from a normal completion
+            self.stream_cancelled = True
+            raise
         finally:
-            self.stream_cancelled = True  # set on normal exit AND cancellation
+            self.stream_finished = True
 
     async def open_realtime_session(self, request: ModelRequest) -> RealtimeSessionInfo:
         await self._maybe_delay()
