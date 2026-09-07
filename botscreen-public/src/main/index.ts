@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { join } from 'node:path'
 import { getMarkdown, getYaml, hasMarkdown, hasYaml } from './api'
@@ -7,11 +7,24 @@ import { protocol } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import { Readable } from 'node:stream'
+import { isTrustedAppUrl, registerTrustedIpc } from './securityGuards'
 
 let exitArmed = false
 let exitInputBuffer = ''
 let exitArmedAt = 0
 const EXIT_PASSWORD = process.env.GCMW_EXIT_PASSWORD || ''
+
+// Trusted renderer origin, used by the navigation guard and the IPC sender checks.
+// ELECTRON_RENDERER_URL is only ever trusted in dev — the packaged build never loads it.
+const rendererDir = join(__dirname, '../renderer')
+const isTrustedUrl = (url: string): boolean =>
+  isTrustedAppUrl(url, {
+    devUrl: is.dev ? process.env.ELECTRON_RENDERER_URL : undefined,
+    rendererDir
+  })
+
+// CI smoke mode: dev-only (never in packaged builds, even with the env set).
+const isSmokeRun = !app.isPackaged && process.env.ELECTRON_SMOKE === '1'
 
 function createWindow(): void {
   // Create the browser window.
@@ -29,7 +42,10 @@ function createWindow(): void {
     // ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webviewTag: false,
       devTools: !app.isPackaged
     }
   })
@@ -100,14 +116,32 @@ function createWindow(): void {
     })
   })
 
+  // Kiosk: never grant permission requests (camera, microphone, geolocation,
+  // notifications, clipboard-read, …).
+  mainWindow.webContents.session.setPermissionRequestHandler(
+    (_webContents, _permission, callback) => callback(false)
+  )
+  mainWindow.webContents.session.setPermissionCheckHandler(() => false)
+
   app.on('render-process-gone', () => {
+    // Smoke runs must fail fast: relaunching could loop forever on a crash.
+    if (isSmokeRun) {
+      smokeFail('render-process-gone')
+      return
+    }
     app.relaunch()
     app.exit()
   })
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
-    return { action: 'deny' }
+  // Deny all new windows by default. External opening must go through an approved IPC flow in future.
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+
+  // The app never navigates away from its own document. Block everything else
+  // (external links, drag-and-dropped files, …) as defense in depth.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedUrl(url)) {
+      event.preventDefault()
+    }
   })
 
   // HMR for renderer base on electron-vite cli.
@@ -117,6 +151,103 @@ function createWindow(): void {
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
+
+  // CI smoke gate: verify preload/api/IPC and fail on preload/CSP/uncaught errors.
+  // Never active in packaged builds (see isSmokeRun).
+  if (isSmokeRun) {
+    attachSmokeProbe(mainWindow)
+  }
+}
+
+// ===== CI smoke probe (dev only, gated by isSmokeRun above) =====
+const SMOKE_ERROR_PATTERN = /preload|Content Security Policy|Refused to|Unable to load|Uncaught/i
+const smokeProblems: string[] = []
+
+function smokeFail(reason: string): void {
+  smokeProblems.push(reason)
+  console.log(`SMOKE_RESULT ${JSON.stringify({ problems: smokeProblems })}`)
+  app.exit(1)
+}
+
+function attachSmokeProbe(win: BrowserWindow): void {
+  // Watchdog: never let CI hang if the renderer stalls.
+  setTimeout(() => smokeFail('watchdog timeout'), 60_000)
+
+  win.webContents.on('console-message', (details) => {
+    const message = details.message
+    const severity = details.level
+    if ((severity === 'error' || severity === 'warning') && SMOKE_ERROR_PATTERN.test(message)) {
+      smokeProblems.push(`console[${severity}]: ${message}`)
+    }
+  })
+  win.webContents.on('preload-error', (_event, preloadPath, error) => {
+    smokeFail(`preload-error ${preloadPath}: ${error.message ?? String(error)}`)
+  })
+  // Renderer crash: fail immediately instead of relying on the watchdog.
+  win.webContents.on('render-process-gone', (_event, details) => {
+    smokeFail(`render-process-gone: ${details.reason}`)
+  })
+  win.webContents.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+    if (isMainFrame) smokeFail(`did-fail-load ${code} ${description} ${url}`)
+  })
+  win.webContents.once('did-finish-load', () => {
+    void runSmokeProbe(win).then(
+      (code) => app.exit(code),
+      (error) => smokeFail(String(error))
+    )
+  })
+}
+
+async function runSmokeProbe(win: BrowserWindow): Promise<number> {
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+  // Let first paint, fonts, lazy chunks and any MathJax startup settle.
+  await sleep(2000)
+
+  const apiShape = await win.webContents.executeJavaScript(
+    `typeof window.api === 'object' &&
+     typeof window.api.getYaml === 'function' &&
+     typeof window.api.getMarkdown === 'function' &&
+     typeof window.api.hasYaml === 'function' &&
+     typeof window.api.hasMarkdown === 'function'`
+  )
+  const ipcOk = await win.webContents.executeJavaScript(
+    `Promise.resolve(window.api.hasMarkdown('/__smoke_absent__.md')).then((v) => v === false)`
+  )
+  // Real math rendering: uses the project's own `$...$` delimiters (MJ.config.tex)
+  // and requires an mjx-container to actually exist — typesetPromise resolving
+  // without producing output must fail the smoke.
+  const mathjaxProbe = await win.webContents.executeJavaScript(
+    `(async () => {
+      const mj = window.MathJax
+      if (!mj || typeof mj.typesetPromise !== 'function') return 'no-mathjax-global'
+      const el = document.createElement('div')
+      el.textContent = '$x^2$'
+      document.body.appendChild(el)
+      try {
+        await mj.typesetPromise([el])
+        return el.querySelectorAll('mjx-container').length > 0
+          ? 'typeset-ok'
+          : 'typeset-no-output'
+      } catch (e) {
+        return 'typeset-failed: ' + (e && e.message ? e.message : String(e))
+      }
+    })()`
+  )
+  await sleep(1500) // flush late CSP/worker console messages
+
+  const result = {
+    apiShape: Boolean(apiShape),
+    ipcRoundtrip: Boolean(ipcOk),
+    mathjax: mathjaxProbe,
+    problems: smokeProblems
+  }
+  const ok =
+    result.apiShape &&
+    result.ipcRoundtrip &&
+    result.mathjax === 'typeset-ok' &&
+    result.problems.length === 0
+  console.log(`SMOKE_RESULT ${JSON.stringify(result)}`)
+  return ok ? 0 : 1
 }
 
 function getResourceDir(): string {
@@ -225,10 +356,10 @@ app.whenReady().then(() => {
     }
   })
 
-  ipcMain.handle('getyml', getYaml)
-  ipcMain.handle('getmd', getMarkdown)
-  ipcMain.handle('hasyml', hasYaml)
-  ipcMain.handle('hasmd', hasMarkdown)
+  registerTrustedIpc(ipcMain, 'getyml', getYaml, isTrustedUrl)
+  registerTrustedIpc(ipcMain, 'getmd', getMarkdown, isTrustedUrl)
+  registerTrustedIpc(ipcMain, 'hasyml', hasYaml, isTrustedUrl)
+  registerTrustedIpc(ipcMain, 'hasmd', hasMarkdown, isTrustedUrl)
 
   createWindow()
 
