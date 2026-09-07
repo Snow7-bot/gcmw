@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # ErrorCode: stable, enumerable error identifiers. Free-form strings are not
@@ -109,6 +109,8 @@ def _register(
     terminal: bool,
     message: str,
 ) -> None:
+    if code in ERROR_REGISTRY:
+        raise ValueError(f"error code {code.value!r} is registered twice")
     spec = ErrorSpec(
         code=code,
         category=category,
@@ -361,11 +363,23 @@ class ErrorEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     code: ErrorCode
-    message: str
+    # message is optional on input and is always taken from the registry: a
+    # caller-supplied message that differs from the registry entry is rejected,
+    # so free-form (potentially leaking) text can never ride through an envelope.
+    message: str | None = None
     request_id: str = Field(..., min_length=1, max_length=128)
     trace_id: str = Field(..., min_length=1, max_length=128)
     retryable: bool = False
     retry_after_ms: int | None = Field(None, ge=0)
+
+    @model_validator(mode="after")
+    def _registry_message_only(self) -> ErrorEnvelope:
+        spec = lookup(self.code)
+        if self.message is not None and self.message != spec.message:
+            raise ValueError("envelope message must come from the error registry")
+        self.message = spec.message
+        self.retryable = spec.retryable
+        return self
 
     @classmethod
     def build(
@@ -376,12 +390,9 @@ class ErrorEnvelope(BaseModel):
         retry_after_ms: int | None = None,
     ) -> ErrorEnvelope:
         """Build a safe envelope from a registry entry (message comes from the registry)."""
-        spec = lookup(code)
         return cls(
             code=code,
-            message=spec.message,
             request_id=request_id,
             trace_id=trace_id,
-            retryable=spec.retryable,
             retry_after_ms=retry_after_ms,
         )

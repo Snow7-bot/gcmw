@@ -82,6 +82,13 @@ class TestEnvelope:
         with pytest.raises(ValidationError):
             ErrorEnvelope(**{**_envelope(), "details": "provider said: boom"})
 
+    def test_freeform_message_rejected_message_comes_from_registry(self):
+        with pytest.raises(ValidationError):
+            ErrorEnvelope(**{**_envelope(), "message": "provider leaked: /etc/passwd"})
+        env = ErrorEnvelope(**_envelope())
+        assert env.message == lookup(ErrorCode.TIMEOUT_PROVIDER).message
+        assert env.retryable == lookup(ErrorCode.TIMEOUT_PROVIDER).retryable
+
     def test_unknown_string_code_rejected(self):
         with pytest.raises(ValueError):
             ErrorCode("E_NOT_IN_THE_ENUM")
