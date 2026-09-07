@@ -12,7 +12,7 @@ electron-builder 自 26.15 起取消了隐式 ad-hoc 签名 fallback（上游 el
 - builder 26.8.1 产物：自动 ad-hoc 签名，`codesign --verify --deep --strict` 通过；
 - builder 26.16.0 产物：跳过应用签名，同一验证退出 1（仅 Electron 框架 linker-signed adhoc）。
 
-因此 `electron-builder --dir` 退出码 0 只代表打包完成，不代表 macOS 产物可分发或可验证签名。当前团队没有 Developer ID 证书、notarization 通道或 macOS 生产发布需求。
+因此 `electron-builder --dir` 退出码 0 只代表打包完成，不代表 macOS 产物可分发或可验证签名。当前团队没有 Developer ID 证书、notarization 通道，且**尚无经批准的 macOS 生产发布范围**（生产 OS 未确定）。
 
 ## 决策
 
@@ -30,7 +30,7 @@ electron-builder 自 26.15 起取消了隐式 ad-hoc 签名 fallback（上游 el
 ## 替代方案
 
 - 保留 26.8.1 以维持隐式 ad-hoc：不可行——旧版本存在 critical tar 供应链漏洞且不再获得安全更新，且隐式 ad-hoc 本就不构成可分发签名。
-- 本轮引入 Developer ID/notarization：范围外——无证书与发布需求，不应为占位行为引入生产签名义务。
+- 本轮引入 Developer ID/notarization：范围外——无证书且尚无经批准的 macOS 生产发布范围，不应为占位行为引入生产签名义务。
 
 ## 参考
 
