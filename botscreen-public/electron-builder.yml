@@ -40,5 +40,5 @@ linux:
 appImage:
   artifactName: ${name}-${version}.${ext}
 npmRebuild: false
-electronDownload:
-  mirror: https://npmmirror.com/mirrors/electron/
+# Electron binary downloads use official sources. Restricted networks must
+# inject a mirror per-environment (ELECTRON_MIRROR) — never commit one here.

@@ -66,6 +66,8 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
           cache-dependency-path: botscreen-public/package-lock.json
+      - name: Lockfile registry whitelist (pre-install)
+        run: node scripts/check-lockfile-registry.mjs
       - name: Install dependencies
         run: npm ci
       - name: Test
@@ -97,6 +99,8 @@ jobs:
             libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
             libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
             libgbm1 libasound2t64 libpango-1.0-0 libcairo2
+      - name: Lockfile registry whitelist (pre-install)
+        run: node scripts/check-lockfile-registry.mjs
       - name: Install dependencies
         run: npm ci
       - name: Build
@@ -127,6 +131,8 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: botscreen-public/package-lock.json
+      - name: Lockfile registry whitelist (pre-install)
+        run: node scripts/check-lockfile-registry.mjs
       - name: Install dependencies
         run: npm ci
       - name: Build
