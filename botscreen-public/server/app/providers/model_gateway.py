@@ -108,9 +108,21 @@ class ModelGateway:
         except asyncio.TimeoutError as exc:
             raise ModelGatewayError(ErrorCode.TIMEOUT_PROVIDER) from exc
 
-    def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
-        """Streaming events; caller cancellation propagates into the adapter."""
-        return self._resolve(request.provider_hint).stream(request)
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        """Streaming events with a gateway-enforced overall deadline.
+
+        Caller cancellation (``aclose``/task cancel) propagates into the
+        adapter; adapters MUST react to ``CancelledError`` promptly. Uncaught
+        adapter exceptions are intentionally NOT swallowed here — the #36
+        boundary maps them to safe envelopes.
+        """
+        adapter = self._resolve(request.provider_hint)
+        try:
+            async with asyncio.timeout(request.deadline_ms / 1000):
+                async for event in adapter.stream(request):
+                    yield event
+        except TimeoutError as exc:
+            raise ModelGatewayError(ErrorCode.TIMEOUT_PROVIDER) from exc
 
     async def open_realtime_session(self, request: ModelRequest) -> RealtimeSessionInfo:
         """Backend-controlled realtime session (vendors never reach the UI)."""

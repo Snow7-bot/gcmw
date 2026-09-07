@@ -24,12 +24,22 @@ from app.providers.model_gateway import ModelGateway, ModelGatewayError
 class FakeAdapter:
     provider_id = "fake"
 
-    def __init__(self, *, delay_ms: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        delay_ms: int = 0,
+        stream_delay_ms: int = 0,
+        raise_value_error: bool = False,
+    ) -> None:
         self.delay_ms = delay_ms
+        self.stream_delay_ms = stream_delay_ms
+        self.raise_value_error = raise_value_error
         self.sessions_opened = 0
         self.available = True
 
     async def chat(self, request: ModelRequest) -> ModelResponse:
+        if self.raise_value_error:
+            raise ValueError("provider exploded internally")
         if self.delay_ms:
             await asyncio_sleep(self.delay_ms)
         return ModelResponse(
@@ -40,6 +50,8 @@ class FakeAdapter:
         )
 
     async def stream(self, request: ModelRequest):
+        if self.stream_delay_ms:
+            await asyncio_sleep(self.stream_delay_ms)
         yield ModelEvent(
             type=ModelEventType.DELTA,
             provider_id=self.provider_id,
@@ -142,6 +154,34 @@ class TestAgentCalls:
         events = [ev async for ev in gateway.stream(_request())]
         assert len(events) == 1
         assert events[0].type is ModelEventType.DELTA
+
+    @mark.asyncio
+    async def test_stream_overall_deadline_maps_to_timeout(self):
+        slow = FakeAdapter(stream_delay_ms=300)
+        slow.provider_id = "slowstream"
+        gw = ModelGateway(active_provider_id="slowstream")
+        gw.register(slow)
+        with pytest.raises(ModelGatewayError) as exc:
+            async for _ in gw.stream(_request(deadline_ms=10)):
+                pass
+        assert exc.value.code is ErrorCode.TIMEOUT_PROVIDER
+
+    @mark.asyncio
+    async def test_stream_within_deadline_yields_events(self, gateway):
+        events = [ev async for ev in gateway.stream(_request(deadline_ms=5000))]
+        assert len(events) == 1
+        assert events[0].type is ModelEventType.DELTA
+
+    @mark.asyncio
+    async def test_adapter_raw_exception_propagates_to_boundary(self):
+        bad = FakeAdapter(raise_value_error=True)
+        bad.provider_id = "bad"
+        gw = ModelGateway(active_provider_id="bad")
+        gw.register(bad)
+        # gateway must not swallow or leak; the #36 boundary maps it to an
+        # INTERNAL_UNKNOWN envelope
+        with pytest.raises(ValueError):
+            await gw.chat(_request())
 
     @mark.asyncio
     async def test_health_and_model_info(self, gateway):
