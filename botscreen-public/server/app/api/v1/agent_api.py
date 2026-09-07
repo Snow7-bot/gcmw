@@ -13,6 +13,7 @@ ErrorEnvelope by the app-level handlers in ``app/main.py``.
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -66,6 +67,7 @@ class RunRecord:
     created_at: datetime
     events: list[SSEEvent] = field(default_factory=list)
     idempotency_key: str | None = None
+    request_fingerprint: str | None = None
 
 
 class MemoryStore:
@@ -103,10 +105,27 @@ class MemoryStore:
             del self.runs[run_id]
         return removed
 
+    def fingerprint(self, req: CreateRunRequest) -> str:
+        payload = {
+            "session_id": req.session_id,
+            "device_id": req.device_id,
+            "channel": req.channel.value
+            if hasattr(req.channel, "value")
+            else str(req.channel),
+            "text": req.input.text,
+            "locale": req.locale,
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
     def create_run(self, session: SessionRecord, req: CreateRunRequest) -> RunRecord:
         key = (session.session_id, req.idempotency_key)
-        existing = self.idempotency.get(key)
-        if existing is not None and existing in self.runs:
+        fingerprint = self.fingerprint(req)
+        existing_run_id = self.idempotency.get(key)
+        if existing_run_id is not None and existing_run_id in self.runs:
+            existing = self.runs[existing_run_id]
+            # idempotent replay: same key + same payload returns the original run
+            if existing.request_fingerprint == fingerprint:
+                return existing
             raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
         run = RunRecord(
             run_id=uuid.uuid4().hex,
@@ -116,6 +135,7 @@ class MemoryStore:
             state=RunState.ACCEPTED,
             created_at=datetime.now(timezone.utc),
             idempotency_key=req.idempotency_key,
+            request_fingerprint=fingerprint,
         )
         run.events.append(
             SSEEvent(
@@ -197,6 +217,9 @@ async def delete_session(session_id: str) -> None:
 )
 async def create_run(req: CreateRunRequest) -> RunStatusResponse:
     session = _require_session(req.session_id)
+    if session.device_id != req.device_id:
+        # session/device binding: a session belongs to one device (isolation)
+        raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
     run = STORE.create_run(session, req)
     return RunStatusResponse(
         run_id=run.run_id,

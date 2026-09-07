@@ -87,7 +87,7 @@ class TestRuns:
         assert res.status_code == 404
         assert _parse_envelope(res).code == "E_NOT_FOUND_SESSION"
 
-    def test_idempotency_conflict(self):
+    def test_idempotent_replay_returns_original_run(self):
         session_id = self._new_session()
         payload = {
             "session_id": session_id,
@@ -97,9 +97,41 @@ class TestRuns:
         }
         first = client.post("/api/v1/agent/runs", json=payload)
         assert first.status_code == 200
-        second = client.post("/api/v1/agent/runs", json=payload)
-        assert second.status_code == 409
-        assert _parse_envelope(second).code == "E_CONFLICT_IDEMPOTENCY"
+        replay = client.post("/api/v1/agent/runs", json=payload)
+        assert replay.status_code == 200
+        assert replay.json()["run_id"] == first.json()["run_id"]
+        events = client.get(
+            f"/api/v1/agent/runs/{first.json()['run_id']}/events"
+        ).json()
+        assert len(events["events"]) == 1
+
+    def test_same_key_different_payload_conflicts(self):
+        session_id = self._new_session()
+        payload = {
+            "session_id": session_id,
+            "device_id": "d1",
+            "input": {"type": "text", "text": "first"},
+            "idempotency_key": "same-key-2",
+        }
+        assert client.post("/api/v1/agent/runs", json=payload).status_code == 200
+        changed = dict(payload, input={"type": "text", "text": "second"})
+        res = client.post("/api/v1/agent/runs", json=changed)
+        assert res.status_code == 409
+        assert _parse_envelope(res).code == "E_CONFLICT_IDEMPOTENCY"
+
+    def test_run_device_must_match_session_device(self):
+        session_id = self._new_session()  # bound to device d1
+        res = client.post(
+            "/api/v1/agent/runs",
+            json={
+                "session_id": session_id,
+                "device_id": "OTHER-DEVICE",
+                "input": {"type": "text", "text": "hi"},
+                "idempotency_key": "k-dev",
+            },
+        )
+        assert res.status_code == 403
+        assert _parse_envelope(res).code == "E_AUTHZ_FORBIDDEN"
 
     def test_events_replay_after_seq(self):
         session_id = self._new_session()
