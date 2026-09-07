@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .errors import ErrorCode
 
@@ -95,3 +103,76 @@ class ModelEvent(BaseModel):
     model_id: str = Field(..., min_length=1, max_length=128)
     model_version: str = Field(..., min_length=1, max_length=64)
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# ModelGateway types (issue #37). Provider adapters and health/schema
+# reporting share these contracts; Agent code only ever talks to ModelGateway.
+# ---------------------------------------------------------------------------
+
+
+class ProviderStatus(str, Enum):
+    AVAILABLE = "available"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
+class ProviderHealth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_id: str = Field(..., min_length=1, max_length=64)
+    status: ProviderStatus
+    latency_ms: int = Field(0, ge=0)
+    checked_at: AwareDatetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    # safe, generic message only — never raw provider output
+    message: str = ""
+
+
+class ModelInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_id: str = Field(..., min_length=1, max_length=64)
+    model_id: str = Field(..., min_length=1, max_length=128)
+    model_version: str = Field(..., min_length=1, max_length=64)
+    supported_modalities: list[ContentType] = Field(default_factory=list)
+    supports_function_calling: bool = False
+    supports_streaming: bool = False
+    supports_realtime: bool = False
+    supports_json_schema: bool = False
+    # locked snapshot / alias policy (e.g. "2026-03-15" pinned snapshot)
+    snapshot: str = ""
+
+
+class SwitchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_provider_id: str = Field(..., min_length=1, max_length=64)
+    release_id: str = Field(..., min_length=1, max_length=128)
+    reason: str = Field(..., min_length=1, max_length=256)
+
+
+class SwitchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    previous_provider_id: str
+    active_provider_id: str
+    release_id: str
+    switched_at: AwareDatetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    error_code: ErrorCode | None = None
+
+
+class RealtimeSessionInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(..., min_length=1, max_length=128)
+    provider_id: str = Field(..., min_length=1, max_length=64)
+    model_id: str = Field(..., min_length=1, max_length=128)
+    opened_at: AwareDatetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Never carries the provider URL, API key or long-lived tokens: browsers and
+    # ROS endpoints must not be able to reach the vendor directly (V2.3 §8.2).
