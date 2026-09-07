@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
+from .errors import ErrorCode
+
 
 class AuditRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -32,5 +34,5 @@ class AuditRecord(BaseModel):
     citation_ids: list[str] = Field(default_factory=list)
     answer_hash: str = ""
     result: str = ""
-    error_code: str = ""
+    error_code: ErrorCode | None = None
     latency_ms: int = 0
