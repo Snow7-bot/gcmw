@@ -38,6 +38,12 @@ class EventLayer(str, Enum):
     ANSWER = "answer"
 
 
+class ContentOrigin(str, Enum):
+    AI_GENERATED = "ai_generated"
+    APPROVED_FAQ = "approved_faq"
+    HUMAN = "human"
+
+
 class SSEEventType(str, Enum):
     RUN_ACCEPTED = "run.accepted"
     PROCESS_STATUS = "process.status"
@@ -158,6 +164,18 @@ class SSEEvent(BaseModel):
                 raise ValueError(
                     f"data key {key!r} is not allowed for event {self.event.value!r}"
                 )
+        # value-domain constraints (issue #30 review hardening)
+        if self.event is SSEEventType.ANSWER_DELTA:
+            delta = self.data.get("delta")
+            if not isinstance(delta, str) or not delta.strip():
+                raise ValueError("answer.delta requires a non-empty string delta")
+        if (
+            self.event is SSEEventType.ANSWER_COMPLETED
+            and "content_origin" in self.data
+        ):
+            origin = self.data["content_origin"]
+            if origin not in {o.value for o in ContentOrigin}:
+                raise ValueError(f"invalid content_origin {origin!r}")
         return self
 
 

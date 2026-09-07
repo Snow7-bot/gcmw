@@ -137,6 +137,36 @@ class TestDataAllowlist:
             assert event in EVENT_DATA_ALLOWED_KEYS
 
 
+class TestValueDomains:
+    def test_answer_delta_requires_nonempty_delta(self):
+        with pytest.raises(ValidationError, match="non-empty string delta"):
+            SSEEvent(**_event(SSEEventType.ANSWER_DELTA, layer="answer", data={}))
+        with pytest.raises(ValidationError, match="non-empty string delta"):
+            SSEEvent(
+                **_event(
+                    SSEEventType.ANSWER_DELTA, layer="answer", data={"delta": "   "}
+                )
+            )
+
+    def test_content_origin_value_domain_enforced(self):
+        with pytest.raises(ValidationError, match="invalid content_origin"):
+            SSEEvent(
+                **_event(
+                    SSEEventType.ANSWER_COMPLETED,
+                    layer="answer",
+                    data={"content_origin": "origin:leaked-internal"},
+                )
+            )
+        # optional key: absent content_origin stays valid
+        SSEEvent(
+            **_event(
+                SSEEventType.ANSWER_COMPLETED,
+                layer="answer",
+                data={"citations": []},
+            )
+        )
+
+
 class TestMisc:
     def test_seq_must_be_positive(self):
         with pytest.raises(ValidationError):
