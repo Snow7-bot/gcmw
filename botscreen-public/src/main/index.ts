@@ -8,6 +8,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import { isTrustedAppUrl, registerTrustedIpc } from './securityGuards'
+import { resolveRange } from './range'
 
 let exitArmed = false
 let exitInputBuffer = ''
@@ -312,21 +313,23 @@ app.whenReady().then(() => {
 
       // ===== Range 请求（视频播放关键）=====
       if (range) {
-        const match = /bytes=(\d+)-(\d*)/.exec(range)
-        if (!match) {
-          return new Response(null, { status: 416 })
+        const resolved = resolveRange(range, size)
+        if (resolved.status === 416) {
+          return new Response(null, {
+            status: 416,
+            headers: {
+              'Content-Range': `bytes */${size}`,
+              'Accept-Ranges': 'bytes'
+            }
+          })
         }
 
-        const start = Number(match[1])
-        const end = match[2] ? Number(match[2]) : size - 1
-
-        if (start >= size || start > end) {
-          return new Response(null, { status: 416 })
-        }
-
-        const safeEnd = Math.min(end, size - 1)
-
-        const nodeStream = fs.createReadStream(canonical, { start, end: safeEnd })
+        // 显式 end 超出文件大小时 resolveRange 已裁剪到 size-1；
+        // Content-Range / Content-Length 必须按裁剪后的实际范围声明。
+        const nodeStream = fs.createReadStream(canonical, {
+          start: resolved.start,
+          end: resolved.end
+        })
         const webStream = Readable.toWeb(nodeStream)
 
         return new Response(webStream as BodyInit, {
@@ -334,8 +337,8 @@ app.whenReady().then(() => {
           headers: {
             ...commonHeaders,
             'Accept-Ranges': 'bytes',
-            'Content-Range': `bytes ${start}-${end}/${size}`,
-            'Content-Length': String(end - start + 1)
+            'Content-Range': `bytes ${resolved.start}-${resolved.end}/${size}`,
+            'Content-Length': String(resolved.length)
           }
         })
       }
