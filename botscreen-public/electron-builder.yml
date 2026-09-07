@@ -3,18 +3,14 @@ productName: botscreen
 directories:
   buildResources: build
 files:
-  # 'public' used to be a tracked, non-portable symlink (public -> D:/config on
-  # the original dev machine) that broke packaging on every other OS. It is now
-  # an empty directory and stays out of packaged apps; runtime resources are
-  # supplied via the RCPATH env var.
-  - '!public{,/**}'
-  - '!**/.vscode/*'
-  - '!src/*'
-  - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
-  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
-  - '!packaging/*'
+  # Positive runtime whitelist: a packaged app contains ONLY the built renderer
+  # output and the app manifest. electron-builder adds the production
+  # node_modules itself (all code is bundled by electron-vite, so upgrades in
+  # SCA-1 may shrink that further). Everything else — server/, scripts/,
+  # tests, swagger, configs, docs, .env*, certificates — is excluded by
+  # construction and additionally enforced by scripts/asar-manifest.mjs --check.
+  - 'out/**'
+  - 'package.json'
 asarUnpack:
   - resources/**
 win:
