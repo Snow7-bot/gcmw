@@ -1,3 +1,5 @@
+// Plain-JS CI helper (no TS type annotations).
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
 // app.asar dependency manifest: lists every top-level node_modules package
 // packaged inside the app.asar produced by `electron-builder --dir`.
 //
@@ -8,14 +10,7 @@
 // The manifest is the SCA baseline: dependency-upgrade PRs must show app.asar
 // contents only change deliberately (compare against this baseline).
 import { createRequire } from 'node:module'
-import {
-  existsSync,
-  readFileSync,
-  writeFileSync,
-  readdirSync,
-  statSync,
-  mkdirSync
-} from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
