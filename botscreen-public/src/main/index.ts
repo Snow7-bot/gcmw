@@ -315,7 +315,13 @@ app.whenReady().then(() => {
       if (range) {
         const resolved = resolveRange(range, size)
         if (resolved.status === 416) {
-          return new Response(null, { status: 416 })
+          return new Response(null, {
+            status: 416,
+            headers: {
+              'Content-Range': `bytes */${size}`,
+              'Accept-Ranges': 'bytes'
+            }
+          })
         }
 
         // 显式 end 超出文件大小时 resolveRange 已裁剪到 size-1；

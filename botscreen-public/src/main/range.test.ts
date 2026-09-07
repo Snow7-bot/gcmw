@@ -56,4 +56,22 @@ describe('resolveRange', () => {
     expect(resolveRange('items=0-5', SIZE).status).toBe(416)
     expect(resolveRange('garbage', SIZE).status).toBe(416)
   })
+
+  it('rejects multi-range lists, embedded junk and prefix garbage (anchored match)', () => {
+    // 全字符串匹配：不能只匹配到 "bytes=0-1" 前缀就放行
+    expect(resolveRange('bytes=0-1,4-5', SIZE).status).toBe(416)
+    expect(resolveRange('bytes=0-1,', SIZE).status).toBe(416)
+    expect(resolveRange('bytes=0-1junk', SIZE).status).toBe(416)
+    expect(resolveRange('xbytes=0-1', SIZE).status).toBe(416)
+    expect(resolveRange('bytes=0-1 ', SIZE).status).toBe(416)
+    expect(resolveRange(' bytes=0-1', SIZE).status).toBe(416)
+  })
+
+  it('rejects non-safe integers instead of silently wrapping', () => {
+    const HUGE = '99999999999999999999'
+    expect(resolveRange(`bytes=${HUGE}-`, SIZE).status).toBe(416)
+    expect(resolveRange(`bytes=0-${HUGE}`, SIZE).status).toBe(416)
+    expect(resolveRange('bytes=9007199254740992-', SIZE).status).toBe(416) // MAX_SAFE_INTEGER+1
+    expect(resolveRange(`bytes=500-${HUGE}`, SIZE).status).toBe(416)
+  })
 })
