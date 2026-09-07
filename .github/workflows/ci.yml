@@ -68,6 +68,8 @@ jobs:
           cache-dependency-path: botscreen-public/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Lockfile registry whitelist
+        run: node scripts/check-lockfile-registry.mjs
       - name: Test
         run: npm test
       - name: Typecheck
