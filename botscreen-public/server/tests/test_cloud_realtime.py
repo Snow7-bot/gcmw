@@ -129,6 +129,7 @@ class TestHardConstraints:
             "audio/pcm; rate=8000; channels=1; bits=16",
             "audio/pcm; rate=16000; channels=2; bits=16",
             "audio/pcm; rate=16000; channels=1; bits=8",
+            "audio/pcm; rate=abc; channels=1; bits=16",
         ],
     )
     def test_audio_validation_rejects_unsupported_formats(self, mime):
@@ -262,6 +263,43 @@ class TestNormalization:
 
 
 class TestChatAndStream:
+    @mark.asyncio
+    async def test_chat_handshake_error_maps_to_registry_code(self):
+        wire = FakeWire(
+            [{"type": "error", "error": {"code": "invalid_api_key", "message": "x"}}]
+        )
+        provider = CloudRealtimeProvider(wire_factory=lambda: wire)
+        with pytest.raises(ModelGatewayError) as exc:
+            await provider.chat(_text_request())
+        assert exc.value.code is ErrorCode.AUTH_INVALID_CREDENTIALS
+        assert wire.closed is True  # handshake failure closes the wire
+
+    @mark.asyncio
+    async def test_open_session_handshake_error_closes_wire(self):
+        wire = FakeWire(
+            [{"type": "error", "error": {"code": "overloaded", "message": "x"}}]
+        )
+        provider = CloudRealtimeProvider(wire_factory=lambda: wire)
+        with pytest.raises(ModelGatewayError) as exc:
+            await provider.open_realtime_session(_text_request())
+        assert exc.value.code is ErrorCode.UNAVAILABLE_OVERLOADED
+        assert wire.closed is True
+
+    @mark.asyncio
+    async def test_connect_timeout_closes_half_open_wire(self):
+        class SlowWire(FakeWire):
+            async def open(self, url: str, api_key: str) -> None:
+                await asyncio.sleep(60)
+
+        wire = SlowWire()
+        provider = CloudRealtimeProvider(
+            wire_factory=lambda: wire, connect_timeout_ms=30
+        )
+        with pytest.raises(ModelGatewayError) as exc:
+            await provider.chat(_text_request())
+        assert exc.value.code is ErrorCode.TIMEOUT_PROVIDER
+        assert wire.closed is True  # no leaked half-open connection
+
     @mark.asyncio
     async def test_chat_roundtrip_over_wire(self):
         wire = FakeWire(

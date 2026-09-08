@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -45,6 +46,8 @@ from app.contracts.model import (
     RealtimeSessionInfo,
 )
 from app.providers.model_gateway import ModelGatewayError
+
+_LOGGER = logging.getLogger(__name__)
 
 # official audio entry: PCM 16 kHz / mono / 16-bit little-endian
 AUDIO_RATE_HZ = 16_000
@@ -117,9 +120,15 @@ def validate_audio_part(part: ContentPart) -> None:
                 ErrorCode.VALIDATION_UNSUPPORTED_FORMAT,
                 "audio must be raw PCM; other container formats are not accepted",
             )
-    rate = int(params.get("rate", params.get("samplerate", AUDIO_RATE_HZ)))
-    channels = int(params.get("channels", params.get("ch", AUDIO_CHANNELS)))
-    bits = int(params.get("bits", params.get("samplebits", AUDIO_BITS)))
+    try:
+        rate = int(params.get("rate", params.get("samplerate", AUDIO_RATE_HZ)))
+        channels = int(params.get("channels", params.get("ch", AUDIO_CHANNELS)))
+        bits = int(params.get("bits", params.get("samplebits", AUDIO_BITS)))
+    except (TypeError, ValueError):
+        raise ModelGatewayError(
+            ErrorCode.VALIDATION_UNSUPPORTED_FORMAT,
+            "audio format parameters must be integers",
+        ) from None
     if (rate, channels, bits) != (AUDIO_RATE_HZ, AUDIO_CHANNELS, AUDIO_BITS):
         raise ModelGatewayError(
             ErrorCode.VALIDATION_UNSUPPORTED_FORMAT,
@@ -274,6 +283,10 @@ class CloudRealtimeProvider:
                 timeout=self._connect_timeout_ms / 1000,
             )
         except asyncio.TimeoutError as exc:
+            try:
+                await wire.close()  # never leak a half-open connection
+            except Exception:
+                _LOGGER.debug("wire close after connect timeout failed", exc_info=True)
             raise ModelGatewayError(ErrorCode.TIMEOUT_PROVIDER) from exc
         return wire
 
@@ -378,11 +391,22 @@ class CloudRealtimeProvider:
                             return str(part.get("text", ""))
         return ""
 
+    def _handshake_error_code(self, payload: dict[str, Any]) -> ErrorCode | None:
+        """Map a vendor error received before session.created onto a registry
+        code (None when the payload is not an error)."""
+        if payload.get("type") != "error":
+            return None
+        vendor_code = (payload.get("error") or {}).get("code", "")
+        return _VENDOR_ERROR_MAP.get(vendor_code, ErrorCode.PROVIDER_UNREACHABLE)
+
     async def _wait_bookkeeping(self, wire: RealtimeWire, expected: str) -> None:
         while True:
             payload = await wire.recv()
             if payload.get("type") == expected:
                 return
+            code = self._handshake_error_code(payload)
+            if code is not None:
+                raise ModelGatewayError(code, "vendor rejected the session handshake")
             normalize_server_event(payload)  # validate but keep waiting
 
     # -- realtime sessions (audio in, VAD turns) ------------------------------
@@ -398,6 +422,11 @@ class CloudRealtimeProvider:
                 payload = await wire.recv()
                 if payload.get("type") == "session.created":
                     break
+                code = self._handshake_error_code(payload)
+                if code is not None:
+                    raise ModelGatewayError(
+                        code, "vendor rejected the session handshake"
+                    )
                 normalize_server_event(payload)
         except Exception:
             await wire.close()
