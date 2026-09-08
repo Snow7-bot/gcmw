@@ -1,49 +1,48 @@
-"""Agent API router (issue #36, skeleton).
+"""Agent API router (issue #36, v1 skeleton — revision round).
 
-Implements the API surface with an in-memory store:
-- sessions: create/delete (real TTL persistence moves to Redis in #36b);
-- runs: create (ACCEPTED state + run.accepted event), status, events replay
-  (``after_seq`` — the Last-Event-ID semantics consumers use), cancel;
-- orchestration (Manager/MedicalQA/Verifier) consumes accepted runs later
-  (#52/#55); everything here is deterministic and testable with the store.
-
-Errors are raised as RegistryError/ModelGatewayError/AppError and mapped to
-ErrorEnvelope by the app-level handlers in ``app/main.py``.
+Architecture rules enforced here:
+- ONE state authority per run: ``RunStateMachine`` (#10/#21). Routes never
+  assign ``run.state`` directly; SSE events are appended ONLY through
+  ``emit_sse`` right after a machine transition, and the event sequence is
+  the machine's own ``event_seq`` — terminal events therefore occur at most
+  once per run;
+- idempotency is keyed on (session_id, idempotency_key, payload_hash); the
+  payload hash is a SHA-256 of the canonicalised payload — the raw question
+  text is never stored in fingerprints and only lives in the run snapshot
+  (removed with the session);
+- tenant/device ALWAYS derive from the authenticated DevicePrincipal
+  (default deny); run ownership is enforced on every read/cancel/events call.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.api.v1.auth import DevicePrincipal, get_device_principal
+from app.api.v1.errors import AppError
 from app.contracts.api import (
-    Channel,
     CreateRunRequest,
     CreateSessionRequest,
     RunStatusResponse,
     SessionResponse,
 )
+from app.contracts.common import Channel
 from app.contracts.errors import ErrorCode
 from app.contracts.events import SSEEvent, SSEEventType
-from app.contracts.run import TERMINAL_STATES, RunState
+from app.contracts.run import RunState
+from app.orchestration.state_machine import RunStateMachine
 
 router = APIRouter(prefix="/api/v1")
 
 
-class AppError(RuntimeError):
-    """Application-level failure with a stable ErrorCode (#35)."""
-
-    def __init__(self, code: ErrorCode, message: str = "") -> None:
-        self.code = code
-        super().__init__(message or code.value)
-
-
 # ---------------------------------------------------------------------------
-# In-memory store (Redis-backed replacement lands in #36b).
+# Records
 # ---------------------------------------------------------------------------
 
 
@@ -53,35 +52,63 @@ class SessionRecord:
     tenant_id: str
     device_id: str
     channel: Channel
+    locale: str
     created_at: datetime
     ttl_s: int = 1800
+
+
+@dataclass
+class RunSnapshot:
+    """Minimal snapshot the future Manager/QA agents need to execute a run.
+
+    Short-lived: owned by the run record and deleted with its session. The
+    request_id/trace_id are persisted here for audit correlation only.
+    """
+
+    tenant_id: str
+    device_id: str
+    session_id: str
+    channel: Channel
+    text: str
+    locale: str
+    request_id: str
+    trace_id: str
 
 
 @dataclass
 class RunRecord:
     run_id: str
     session_id: str
-    tenant_id: str
-    device_id: str
-    state: RunState
-    created_at: datetime
-    events: list[SSEEvent] = field(default_factory=list)
-    idempotency_key: str | None = None
-    request_fingerprint: str | None = None
+    machine: RunStateMachine
+    snapshot: RunSnapshot
+    payload_hash: str
+    sse_events: list[SSEEvent] = field(default_factory=list)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# In-memory store (Redis-backed replacement lands in #36b).
+# ---------------------------------------------------------------------------
 
 
 class MemoryStore:
     def __init__(self) -> None:
         self.sessions: dict[str, SessionRecord] = {}
         self.runs: dict[str, RunRecord] = {}
-        self.idempotency: dict[tuple[str, str], str] = {}  # (session,key) -> run_id
+        # (session_id, idempotency_key) -> (run_id, payload_hash)
+        self.idempotency: dict[tuple[str, str], tuple[str, str]] = {}
 
-    def create_session(self, req: CreateSessionRequest) -> SessionResponse:
+    # -- sessions -----------------------------------------------------------
+
+    def create_session(
+        self, principal: DevicePrincipal, req: CreateSessionRequest
+    ) -> SessionResponse:
         record = SessionRecord(
             session_id=uuid.uuid4().hex,
-            tenant_id=req.tenant_id,
-            device_id=req.device_id,
+            tenant_id=principal.tenant_id,
+            device_id=principal.device_id,
             channel=req.channel,
+            locale=req.locale,
             created_at=datetime.now(timezone.utc),
         )
         self.sessions[record.session_id] = record
@@ -94,86 +121,133 @@ class MemoryStore:
             ttl_s=record.ttl_s,
         )
 
-    def get_session(self, session_id: str) -> SessionRecord | None:
-        return self.sessions.get(session_id)
-
-    def delete_session(self, session_id: str) -> bool:
-        removed = self.sessions.pop(session_id, None) is not None
+    def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise AppError(ErrorCode.NOT_FOUND_SESSION)
+        if not self._owns(session, principal):
+            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+        del self.sessions[session_id]
         for run_id in [
             r for r in list(self.runs) if self.runs[r].session_id == session_id
         ]:
             del self.runs[run_id]
-        return removed
+        for key in [k for k in list(self.idempotency) if k[0] == session_id]:
+            del self.idempotency[key]
 
-    def fingerprint(self, req: CreateRunRequest) -> str:
-        payload = {
-            "session_id": req.session_id,
-            "device_id": req.device_id,
-            "channel": req.channel.value
-            if hasattr(req.channel, "value")
-            else str(req.channel),
-            "text": req.input.text,
-            "locale": req.locale,
-        }
-        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
-
-    def create_run(self, session: SessionRecord, req: CreateRunRequest) -> RunRecord:
-        key = (session.session_id, req.idempotency_key)
-        fingerprint = self.fingerprint(req)
-        existing_run_id = self.idempotency.get(key)
-        if existing_run_id is not None and existing_run_id in self.runs:
-            existing = self.runs[existing_run_id]
-            # idempotent replay: same key + same payload returns the original run
-            if existing.request_fingerprint == fingerprint:
-                return existing
-            raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
-        run = RunRecord(
-            run_id=uuid.uuid4().hex,
-            session_id=session.session_id,
-            tenant_id=session.tenant_id,
-            device_id=session.device_id,
-            state=RunState.ACCEPTED,
-            created_at=datetime.now(timezone.utc),
-            idempotency_key=req.idempotency_key,
-            request_fingerprint=fingerprint,
+    def _owns(self, session: SessionRecord, principal: DevicePrincipal) -> bool:
+        return (
+            session.tenant_id == principal.tenant_id
+            and session.device_id == principal.device_id
         )
-        run.events.append(
-            SSEEvent(
-                seq=1,
+
+    def require_owned_session(
+        self, principal: DevicePrincipal, session_id: str
+    ) -> SessionRecord:
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise AppError(ErrorCode.NOT_FOUND_SESSION)
+        if not self._owns(session, principal):
+            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+        return session
+
+    # -- runs ---------------------------------------------------------------
+
+    @staticmethod
+    def payload_hash(session: SessionRecord, req: CreateRunRequest) -> str:
+        canonical = json.dumps(
+            {
+                "text": req.input.text,
+                "locale": session.locale,
+                "channel": session.channel.value,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def emit_sse(self, run: RunRecord, event_type: SSEEventType, data: dict) -> None:
+        """THE only place SSE events are appended.
+
+        Called right after the corresponding RunStateMachine transition; the
+        SSE sequence equals the machine's event_seq (single sequence source).
+        """
+        event = SSEEvent(
+            seq=run.machine.event_seq,
+            tenant_id=run.snapshot.tenant_id,
+            device_id=run.snapshot.device_id,
+            session_id=run.snapshot.session_id,
+            run_id=run.run_id,
+            layer="process",
+            event=event_type,
+            data=data,
+        )
+        run.sse_events.append(event)
+
+    def create_run(
+        self,
+        principal: DevicePrincipal,
+        req: CreateRunRequest,
+        request_id: str,
+        trace_id: str,
+    ) -> RunRecord:
+        session = self.require_owned_session(principal, req.session_id)
+        payload_hash = self.payload_hash(session, req)
+        key = (session.session_id, req.idempotency_key)
+        existing = self.idempotency.get(key)
+        if existing is not None:
+            run_id, stored_hash = existing
+            if run_id in self.runs:
+                if stored_hash == payload_hash:
+                    # idempotent replay: original run returned untouched
+                    return self.runs[run_id]
+                raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+
+        run_id = uuid.uuid4().hex
+        machine = RunStateMachine(run_id)  # initial ACCEPTED, event_seq == 1
+        run = RunRecord(
+            run_id=run_id,
+            session_id=session.session_id,
+            machine=machine,
+            snapshot=RunSnapshot(
                 tenant_id=session.tenant_id,
                 device_id=session.device_id,
                 session_id=session.session_id,
-                run_id=run.run_id,
-                layer="process",
-                event=SSEEventType.RUN_ACCEPTED,
-                data={"status": "accepted", "message": "问题已接收"},
-            )
+                channel=session.channel,
+                text=req.input.text,
+                locale=session.locale,
+                request_id=request_id,
+                trace_id=trace_id,
+            ),
+            payload_hash=payload_hash,
+        )
+        self.emit_sse(
+            run,
+            SSEEventType.RUN_ACCEPTED,
+            {"status": "accepted", "message": "问题已接收"},
         )
         self.runs[run.run_id] = run
-        self.idempotency[key] = run.run_id
+        self.idempotency[key] = (run.run_id, payload_hash)
         return run
 
-    def get_run(self, run_id: str) -> RunRecord | None:
-        return self.runs.get(run_id)
-
-    def cancel_run(self, run_id: str) -> RunRecord | None:
+    def require_owned_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
         run = self.runs.get(run_id)
         if run is None:
-            return None
-        if run.state not in TERMINAL_STATES:
-            run.state = RunState.CANCELLED
-            run.events.append(
-                SSEEvent(
-                    seq=len(run.events) + 1,
-                    tenant_id=run.tenant_id,
-                    device_id=run.device_id,
-                    session_id=run.session_id,
-                    run_id=run.run_id,
-                    layer="process",
-                    event=SSEEventType.RUN_COMPLETED,
-                    data={"status": "cancelled"},
-                )
-            )
+            raise AppError(ErrorCode.NOT_FOUND_RUN)
+        snap = run.snapshot
+        if (
+            snap.tenant_id != principal.tenant_id
+            or snap.device_id != principal.device_id
+        ):
+            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+        return run
+
+    def cancel_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
+        run = self.require_owned_run(principal, run_id)
+        if run.machine.is_terminal:
+            return run
+        run.machine.transition(RunState.CANCELLED)
+        self.emit_sse(run, SSEEventType.RUN_COMPLETED, {"status": "cancelled"})
         return run
 
 
@@ -185,83 +259,76 @@ STORE = MemoryStore()
 # ---------------------------------------------------------------------------
 
 
-def _require_session(session_id: str) -> SessionRecord:
-    session = STORE.get_session(session_id)
-    if session is None:
-        raise AppError(ErrorCode.NOT_FOUND_SESSION)
-    return session
-
-
-def _require_run(run_id: str) -> RunRecord:
-    run = STORE.get_run(run_id)
-    if run is None:
-        raise AppError(ErrorCode.NOT_FOUND_RUN)
-    return run
+def _status(run: RunRecord) -> RunStatusResponse:
+    return RunStatusResponse(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        state=run.machine.current,
+        created_at=run.created_at,
+        cancelled=run.machine.current is RunState.CANCELLED,
+    )
 
 
 @router.post(
     "/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED
 )
-async def create_session(req: CreateSessionRequest) -> SessionResponse:
-    return STORE.create_session(req)
+async def create_session(
+    req: CreateSessionRequest,
+    principal: DevicePrincipal = Depends(get_device_principal),
+) -> SessionResponse:
+    return STORE.create_session(principal, req)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(session_id: str) -> None:
-    if not STORE.delete_session(session_id):
-        raise AppError(ErrorCode.NOT_FOUND_SESSION)
+async def delete_session(
+    session_id: str,
+    principal: DevicePrincipal = Depends(get_device_principal),
+) -> None:
+    STORE.delete_session(principal, session_id)
 
 
-@router.post(
-    "/agent/runs", response_model=RunStatusResponse, status_code=status.HTTP_200_OK
-)
-async def create_run(req: CreateRunRequest) -> RunStatusResponse:
-    session = _require_session(req.session_id)
-    if session.device_id != req.device_id:
-        # session/device binding: a session belongs to one device (isolation)
-        raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
-    run = STORE.create_run(session, req)
-    return RunStatusResponse(
-        run_id=run.run_id,
-        session_id=run.session_id,
-        state=run.state.value,
-        created_at=run.created_at,
+@router.post("/agent/runs", response_model=RunStatusResponse)
+async def create_run(
+    req: CreateRunRequest,
+    request: Request,
+    principal: DevicePrincipal = Depends(get_device_principal),
+) -> RunStatusResponse:
+    run = STORE.create_run(
+        principal,
+        req,
+        request_id=request.state.request_id,
+        trace_id=request.state.trace_id,
     )
+    return _status(run)
 
 
 @router.get("/agent/runs/{run_id}", response_model=RunStatusResponse)
-async def get_run(run_id: str) -> RunStatusResponse:
-    run = _require_run(run_id)
-    return RunStatusResponse(
-        run_id=run.run_id,
-        session_id=run.session_id,
-        state=run.state.value,
-        created_at=run.created_at,
-        cancelled=run.state is RunState.CANCELLED,
-    )
+async def get_run(
+    run_id: str,
+    principal: DevicePrincipal = Depends(get_device_principal),
+) -> RunStatusResponse:
+    return _status(STORE.require_owned_run(principal, run_id))
 
 
 @router.delete("/agent/runs/{run_id}", response_model=RunStatusResponse)
-async def cancel_run(run_id: str) -> RunStatusResponse:
-    run = _require_run(run_id)
-    run = STORE.cancel_run(run_id)
-    assert run is not None
-    return RunStatusResponse(
-        run_id=run.run_id,
-        session_id=run.session_id,
-        state=run.state.value,
-        created_at=run.created_at,
-        cancelled=run.state is RunState.CANCELLED,
-    )
+async def cancel_run(
+    run_id: str,
+    principal: DevicePrincipal = Depends(get_device_principal),
+) -> RunStatusResponse:
+    return _status(STORE.cancel_run(principal, run_id))
 
 
 @router.get("/agent/runs/{run_id}/events")
-async def get_run_events(run_id: str, after_seq: int = 0) -> dict:
-    run = _require_run(run_id)
-    events = [e for e in run.events if e.seq > after_seq]
+async def get_run_events(
+    run_id: str,
+    principal: DevicePrincipal = Depends(get_device_principal),
+    after_seq: int = Query(0, ge=0),
+) -> dict:
+    run = STORE.require_owned_run(principal, run_id)
+    events = [e for e in run.sse_events if e.seq > after_seq]
     return {
         "run_id": run_id,
-        "next_seq": max((e.seq for e in run.events), default=0),
+        "next_seq": run.machine.event_seq,
         "events": [e.model_dump(mode="json") for e in events],
     }
 
@@ -273,7 +340,5 @@ async def live() -> dict:
 
 @router.get("/health/ready")
 async def ready() -> dict:
-    return {
-        "status": "ready",
-        "checks": {"store": {"sessions": len(STORE.sessions), "runs": len(STORE.runs)}},
-    }
+    # component status only — never expose session/run counts publicly
+    return {"status": "ready", "checks": {"core": "ok"}}

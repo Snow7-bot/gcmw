@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from fastapi import FastAPI, Request
@@ -23,9 +24,20 @@ from app.api.v1.agent_api import router as agent_router
 from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 from app.providers.model_gateway import ModelGatewayError
 
+X_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
 
 def _request_ids(request: Request) -> tuple[str, str]:
-    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    """Mint request/trace ids exactly once per request.
+
+    A client-supplied X-Request-ID is honoured only when it matches the
+    restricted format; anything else is replaced (never echoed back raw).
+    """
+    existing = getattr(request.state, "request_id", None)
+    if existing is not None:
+        return existing, request.state.trace_id
+    header = request.headers.get("x-request-id") or ""
+    request_id = header if X_REQUEST_ID_RE.match(header) else uuid.uuid4().hex
     trace_id = uuid.uuid4().hex
     request.state.request_id = request_id
     request.state.trace_id = trace_id
