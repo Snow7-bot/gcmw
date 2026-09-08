@@ -326,11 +326,15 @@ class TestChatAndStream:
     @mark.asyncio
     async def test_stream_cancellation_closes_wire_promptly(self):
         class BlockingWire(FakeWire):
+            def __init__(self, replies):
+                super().__init__(replies)
+                self.block = asyncio.Event()
+
             async def recv(self):
                 if self._replies:
                     return self._replies.pop(0)
-                await asyncio.sleep(60)
-                raise AssertionError("unreachable")
+                await self.block.wait()
+                raise AssertionError("recv resumed after cancel")
 
         never = BlockingWire([SESSION_ACK])
 
@@ -341,9 +345,10 @@ class TestChatAndStream:
         provider = CloudRealtimeProvider(wire_factory=lambda: never)
         task = asyncio.create_task(drain())
         await asyncio.sleep(0)
+        assert not task.done()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=5)
         assert never.closed is True
 
     @mark.asyncio
