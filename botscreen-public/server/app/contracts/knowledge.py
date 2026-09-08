@@ -71,11 +71,9 @@ class KnowledgeItem(BaseModel):
 
     def is_production_ready(self, at: datetime | None = None) -> bool:
         """Approved, in its validity window, not revoked/superseded."""
-        if self.review_status is not ReviewStatus.APPROVED:
-            return False
         now = at or datetime.now(timezone.utc)
-        if self.valid_from is not None and now < self.valid_from:
-            return False
-        if self.valid_to is not None and now >= self.valid_to:
-            return False
-        return True
+        return (
+            self.review_status is ReviewStatus.APPROVED
+            and (self.valid_from is None or now >= self.valid_from)
+            and (self.valid_to is None or now < self.valid_to)
+        )
