@@ -134,6 +134,47 @@ class TestApprovalAndProduction:
         assert [i.source_id for i in store.production_items("t2")] == ["b"]
 
 
+class TestReviewGuards:
+    def test_mark_in_review_on_approved_item_requires_revoke_first(self, store):
+        store.add_candidate(_item())
+        store.approve("faq-1", reviewer="dr-li")
+        with pytest.raises(KnowledgeGovernanceError, match="revoke before re-review"):
+            store.mark_in_review("faq-1")
+        assert store.production_items("t1")  # still in production
+
+    def test_superseded_version_is_recorded_on_direct_reapproval(self, store):
+        store.add_candidate(_item(content="旧内容"))
+        store.approve("faq-1", reviewer="dr-li")
+        # direct re-approval supersedes v1 with v2 (same candidate content or
+        # revised through an in-review copy in the production workflow)
+        second = store.approve("faq-1", reviewer="dr-wang")
+        assert second.knowledge_version == "faq-1-v2"
+        history = store.history("faq-1")
+        old = next(h for h in history if h.knowledge_version == "faq-1-v1")
+        assert old.superseded_by == "faq-1-v2"
+
+    def test_concurrent_approvals_produce_contiguous_versions(self, store):
+        from concurrent.futures import ThreadPoolExecutor
+
+        store.add_candidate(_item(content="并发批准基座"))
+
+        def fire(i):
+            return store.approve("faq-1", reviewer=f"reviewer-{i}")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(fire, range(10)))
+        versions = {r.knowledge_version for r in results}
+        assert versions == {f"faq-1-v{i}" for i in range(1, 11)}
+        assert store.get("faq-1").knowledge_version == "faq-1-v10"
+        # history() returns the active v10 plus the 9 superseded records
+        history = store.history("faq-1")
+        superseded = [h for h in history if h.superseded_by]
+        assert len(superseded) == 9
+        assert (
+            len([h for h in history if h.review_status is ReviewStatus.APPROVED]) == 10
+        )
+
+
 class TestRevoke:
     def test_revoke_removes_from_production_keeps_audit(self, store):
         store.add_candidate(_item())

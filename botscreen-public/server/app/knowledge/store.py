@@ -58,6 +58,12 @@ class KnowledgeStore:
     def mark_in_review(self, source_id: str) -> KnowledgeItem:
         with self._lock:
             item = self._require(source_id)
+            if item.review_status is ReviewStatus.APPROVED:
+                # approved items must go through revoke before re-review, so the
+                # production view never loses an approved item without an audit
+                raise KnowledgeGovernanceError(
+                    f"source {source_id!r} is APPROVED — revoke before re-review"
+                )
             updated = item.model_copy(
                 deep=True, update={"review_status": ReviewStatus.IN_REVIEW}
             )
@@ -103,6 +109,13 @@ class KnowledgeStore:
                 1 for h in history if h.review_status is ReviewStatus.APPROVED
             )
             version_no = approved_count + 1
+            if prior.review_status is ReviewStatus.APPROVED:
+                # record which version superseded the moved entry
+                superseded = prior.model_copy(
+                    deep=True,
+                    update={"superseded_by": f"{source_id}-v{version_no}"},
+                )
+                history[-1] = superseded
             approved = item.model_copy(
                 deep=True,
                 update={
