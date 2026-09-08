@@ -1,26 +1,29 @@
-"""Agent API router (issue #36, v1 skeleton — revision round).
+"""Agent API router (issue #36, v1 skeleton — revision round 2).
 
 Architecture rules enforced here:
-- ONE state authority per run: ``RunStateMachine`` (#10/#21). Routes never
-  assign ``run.state`` directly; SSE events are appended ONLY through
-  ``emit_sse`` right after a machine transition, and the event sequence is
-  the machine's own ``event_seq`` — terminal events therefore occur at most
-  once per run;
-- idempotency is keyed on (session_id, idempotency_key, payload_hash); the
-  payload hash is a SHA-256 of the canonicalised payload — the raw question
-  text is never stored in fingerprints and only lives in the run snapshot
-  (removed with the session);
-- tenant/device ALWAYS derive from the authenticated DevicePrincipal
-  (default deny); run ownership is enforced on every read/cancel/events call.
+- ONE state authority per run: ``RunStateMachine`` (#10/#21); the legacy
+  RunCoordinator/RunIdempotencyRegistry are deleted — no second machine set
+  or request_id-keyed dedup may reappear (request_id is tracing only);
+- state transition + SSE append happen inside ONE locked lifecycle service
+  (``RunAdmissionService``): the SSE seq comes from the transition's own
+  returned event_seq, so state and SSE can never diverge;
+- admission is atomic: idempotent replay returns the original run, one active
+  (non-terminal) run per session at a time, all under a single RLock;
+- sessions expire on an injectable clock; expiry removes session, its runs,
+  the idempotency entries and the raw question snapshots;
+- tenant/device always derive from the DevicePrincipal (default deny); run
+  ownership is enforced on read/cancel/events.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Query, Request, status
 
@@ -40,6 +43,8 @@ from app.orchestration.state_machine import RunStateMachine
 
 router = APIRouter(prefix="/api/v1")
 
+DEFAULT_SESSION_TTL_S = 1800
+
 
 # ---------------------------------------------------------------------------
 # Records
@@ -54,15 +59,19 @@ class SessionRecord:
     channel: Channel
     locale: str
     created_at: datetime
-    ttl_s: int = 1800
+    ttl_s: int = DEFAULT_SESSION_TTL_S
+
+    @property
+    def expires_at(self) -> datetime:
+        return self.created_at + timedelta(seconds=self.ttl_s)
 
 
 @dataclass
 class RunSnapshot:
     """Minimal snapshot the future Manager/QA agents need to execute a run.
 
-    Short-lived: owned by the run record and deleted with its session. The
-    request_id/trace_id are persisted here for audit correlation only.
+    Short-lived: removed on session expiry/deletion (never persisted beyond
+    the store). request_id/trace_id are kept for audit correlation only.
     """
 
     tenant_id: str
@@ -87,47 +96,26 @@ class RunRecord:
 
 
 # ---------------------------------------------------------------------------
-# In-memory store (Redis-backed replacement lands in #36b).
+# RunAdmissionService: the single lifecycle authority (atomic, TTL-aware).
 # ---------------------------------------------------------------------------
 
 
-class MemoryStore:
-    def __init__(self) -> None:
+class RunAdmissionService:
+    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._lock = threading.RLock()
         self.sessions: dict[str, SessionRecord] = {}
         self.runs: dict[str, RunRecord] = {}
         # (session_id, idempotency_key) -> (run_id, payload_hash)
         self.idempotency: dict[tuple[str, str], tuple[str, str]] = {}
 
-    # -- sessions -----------------------------------------------------------
+    def now(self) -> datetime:
+        return self._clock()
 
-    def create_session(
-        self, principal: DevicePrincipal, req: CreateSessionRequest
-    ) -> SessionResponse:
-        record = SessionRecord(
-            session_id=uuid.uuid4().hex,
-            tenant_id=principal.tenant_id,
-            device_id=principal.device_id,
-            channel=req.channel,
-            locale=req.locale,
-            created_at=datetime.now(timezone.utc),
-        )
-        self.sessions[record.session_id] = record
-        return SessionResponse(
-            session_id=record.session_id,
-            tenant_id=record.tenant_id,
-            device_id=record.device_id,
-            channel=record.channel,
-            created_at=record.created_at,
-            ttl_s=record.ttl_s,
-        )
+    # -- expiry ---------------------------------------------------------------
 
-    def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise AppError(ErrorCode.NOT_FOUND_SESSION)
-        if not self._owns(session, principal):
-            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
-        del self.sessions[session_id]
+    def _purge_session(self, session_id: str) -> None:
+        self.sessions.pop(session_id, None)
         for run_id in [
             r for r in list(self.runs) if self.runs[r].session_id == session_id
         ]:
@@ -135,23 +123,64 @@ class MemoryStore:
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
 
-    def _owns(self, session: SessionRecord, principal: DevicePrincipal) -> bool:
+    def _session_expired(self, session: SessionRecord) -> bool:
+        return self.now() >= session.expires_at
+
+    def _expire_if_needed(self, session_id: str) -> None:
+        """Called under the admission lock. Expired sessions vanish entirely —
+        session, runs, idempotency and the raw text snapshots included."""
+        session = self.sessions.get(session_id)
+        if session is not None and self._session_expired(session):
+            self._purge_session(session_id)
+
+    # -- sessions --------------------------------------------------------------
+
+    def create_session(
+        self,
+        principal: DevicePrincipal,
+        req: CreateSessionRequest,
+        ttl_s: int = DEFAULT_SESSION_TTL_S,
+    ) -> SessionResponse:
+        with self._lock:
+            record = SessionRecord(
+                session_id=uuid.uuid4().hex,
+                tenant_id=principal.tenant_id,
+                device_id=principal.device_id,
+                channel=req.channel,
+                locale=req.locale,
+                created_at=self.now(),
+                ttl_s=ttl_s,
+            )
+            self.sessions[record.session_id] = record
+            return SessionResponse(
+                session_id=record.session_id,
+                tenant_id=record.tenant_id,
+                device_id=record.device_id,
+                channel=record.channel,
+                created_at=record.created_at,
+                ttl_s=record.ttl_s,
+            )
+
+    def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise AppError(ErrorCode.NOT_FOUND_SESSION)
+            if self._session_expired(session):
+                self._purge_session(session_id)
+                raise AppError(ErrorCode.NOT_FOUND_SESSION)
+            if not self._owns(session, principal):
+                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+            self._purge_session(session_id)
+
+    @staticmethod
+    def _owns(session: SessionRecord, principal: DevicePrincipal) -> bool:
         return (
             session.tenant_id == principal.tenant_id
             and session.device_id == principal.device_id
         )
 
-    def require_owned_session(
-        self, principal: DevicePrincipal, session_id: str
-    ) -> SessionRecord:
-        session = self.sessions.get(session_id)
-        if session is None:
-            raise AppError(ErrorCode.NOT_FOUND_SESSION)
-        if not self._owns(session, principal):
-            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
-        return session
-
-    # -- runs ---------------------------------------------------------------
+    # -- runs -------------------------------------------------------------------
 
     @staticmethod
     def payload_hash(session: SessionRecord, req: CreateRunRequest) -> str:
@@ -166,14 +195,18 @@ class MemoryStore:
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def emit_sse(self, run: RunRecord, event_type: SSEEventType, data: dict) -> None:
-        """THE only place SSE events are appended.
+    def _advance(
+        self, run: RunRecord, target: RunState, event_type: SSEEventType, data: dict
+    ) -> None:
+        """State transition + SSE append in one locked step.
 
-        Called right after the corresponding RunStateMachine transition; the
-        SSE sequence equals the machine's event_seq (single sequence source).
+        The SSE sequence is taken from the event returned by transition(), so
+        state history and SSE events can never diverge or skip numbers.
         """
-        event = SSEEvent(
-            seq=run.machine.event_seq,
+        run_event = run.machine.transition(target)
+        seq = run_event.event_seq
+        sse = SSEEvent(
+            seq=seq,
             tenant_id=run.snapshot.tenant_id,
             device_id=run.snapshot.device_id,
             session_id=run.snapshot.session_id,
@@ -182,7 +215,7 @@ class MemoryStore:
             event=event_type,
             data=data,
         )
-        run.sse_events.append(event)
+        run.sse_events.append(sse)
 
     def create_run(
         self,
@@ -191,67 +224,116 @@ class MemoryStore:
         request_id: str,
         trace_id: str,
     ) -> RunRecord:
-        session = self.require_owned_session(principal, req.session_id)
-        payload_hash = self.payload_hash(session, req)
-        key = (session.session_id, req.idempotency_key)
-        existing = self.idempotency.get(key)
-        if existing is not None:
-            run_id, stored_hash = existing
-            if run_id in self.runs:
-                if stored_hash == payload_hash:
-                    # idempotent replay: original run returned untouched
-                    return self.runs[run_id]
-                raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+        with self._lock:
+            self._expire_if_needed(req.session_id)
+            session = self.sessions.get(req.session_id)
+            if session is None:
+                raise AppError(ErrorCode.NOT_FOUND_SESSION)
+            if not self._owns(session, principal):
+                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
 
-        run_id = uuid.uuid4().hex
-        machine = RunStateMachine(run_id)  # initial ACCEPTED, event_seq == 1
-        run = RunRecord(
-            run_id=run_id,
-            session_id=session.session_id,
-            machine=machine,
-            snapshot=RunSnapshot(
-                tenant_id=session.tenant_id,
-                device_id=session.device_id,
+            payload_hash = self.payload_hash(session, req)
+            key = (session.session_id, req.idempotency_key)
+            existing = self.idempotency.get(key)
+            if existing is not None:
+                run_id, stored_hash = existing
+                if run_id in self.runs:
+                    if stored_hash == payload_hash:
+                        return self.runs[run_id]  # idempotent replay
+                    raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+
+            # one active (non-terminal) run per session
+            for run in self.runs.values():
+                if run.session_id == session.session_id and not run.machine.is_terminal:
+                    raise AppError(ErrorCode.CONFLICT_ACTIVE_RUN)
+
+            run_id = uuid.uuid4().hex
+            machine = RunStateMachine(run_id)  # ACCEPTED, event_seq == 1
+            run = RunRecord(
+                run_id=run_id,
                 session_id=session.session_id,
-                channel=session.channel,
-                text=req.input.text,
-                locale=session.locale,
-                request_id=request_id,
-                trace_id=trace_id,
-            ),
-            payload_hash=payload_hash,
-        )
-        self.emit_sse(
-            run,
-            SSEEventType.RUN_ACCEPTED,
-            {"status": "accepted", "message": "问题已接收"},
-        )
-        self.runs[run.run_id] = run
-        self.idempotency[key] = (run.run_id, payload_hash)
-        return run
+                machine=machine,
+                snapshot=RunSnapshot(
+                    tenant_id=session.tenant_id,
+                    device_id=session.device_id,
+                    session_id=session.session_id,
+                    channel=session.channel,
+                    text=req.input.text,
+                    locale=session.locale,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                ),
+                payload_hash=payload_hash,
+            )
+            # accepted SSE event is appended by _advance-equivalent under the
+            # same lock; initial machine event_seq is 1
+            run.sse_events.append(
+                SSEEvent(
+                    seq=1,
+                    tenant_id=run.snapshot.tenant_id,
+                    device_id=run.snapshot.device_id,
+                    session_id=run.snapshot.session_id,
+                    run_id=run.run_id,
+                    layer="process",
+                    event=SSEEventType.RUN_ACCEPTED,
+                    data={"status": "accepted", "message": "问题已接收"},
+                )
+            )
+            self.runs[run.run_id] = run
+            self.idempotency[key] = (run.run_id, payload_hash)
+            return run
 
-    def require_owned_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
-        run = self.runs.get(run_id)
-        if run is None:
-            raise AppError(ErrorCode.NOT_FOUND_RUN)
-        snap = run.snapshot
-        if (
-            snap.tenant_id != principal.tenant_id
-            or snap.device_id != principal.device_id
-        ):
-            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
-        return run
+    def get_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
+        with self._lock:
+            run = self.runs.get(run_id)
+            if run is None:
+                raise AppError(ErrorCode.NOT_FOUND_RUN)
+            self._expire_if_needed(run.snapshot.session_id)
+            run = self.runs.get(run_id)
+            if run is None:  # expired while we looked
+                raise AppError(ErrorCode.NOT_FOUND_RUN)
+            if not self._owns_run(run, principal):
+                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+            return run
 
     def cancel_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
-        run = self.require_owned_run(principal, run_id)
-        if run.machine.is_terminal:
+        with self._lock:
+            run = self.runs.get(run_id)
+            if run is None:
+                raise AppError(ErrorCode.NOT_FOUND_RUN)
+            self._expire_if_needed(run.snapshot.session_id)
+            run = self.runs.get(run_id)
+            if run is None:
+                raise AppError(ErrorCode.NOT_FOUND_RUN)
+            if not self._owns_run(run, principal):
+                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+            if run.machine.is_terminal:
+                return run
+            self._advance(
+                run,
+                RunState.CANCELLED,
+                SSEEventType.RUN_COMPLETED,
+                {"status": "cancelled"},
+            )
             return run
-        run.machine.transition(RunState.CANCELLED)
-        self.emit_sse(run, SSEEventType.RUN_COMPLETED, {"status": "cancelled"})
-        return run
+
+    def events(
+        self, principal: DevicePrincipal, run_id: str, after_seq: int
+    ) -> tuple[RunRecord, list[SSEEvent]]:
+        with self._lock:
+            run = self.get_run(principal, run_id)
+            return run, [e for e in run.sse_events if e.seq > after_seq]
+
+    @staticmethod
+    def _owns_run(run: RunRecord, principal: DevicePrincipal) -> bool:
+        snap = run.snapshot
+        return (
+            snap.tenant_id == principal.tenant_id
+            and snap.device_id == principal.device_id
+        )
 
 
-STORE = MemoryStore()
+SERVICE = RunAdmissionService()
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +358,7 @@ async def create_session(
     req: CreateSessionRequest,
     principal: DevicePrincipal = PrincipalDep,
 ) -> SessionResponse:
-    return STORE.create_session(principal, req)
+    return SERVICE.create_session(principal, req)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -284,7 +366,7 @@ async def delete_session(
     session_id: str,
     principal: DevicePrincipal = PrincipalDep,
 ) -> None:
-    STORE.delete_session(principal, session_id)
+    SERVICE.delete_session(principal, session_id)
 
 
 @router.post("/agent/runs", response_model=RunStatusResponse)
@@ -293,7 +375,7 @@ async def create_run(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
-    run = STORE.create_run(
+    run = SERVICE.create_run(
         principal,
         req,
         request_id=request.state.request_id,
@@ -307,7 +389,7 @@ async def get_run(
     run_id: str,
     principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
-    return _status(STORE.require_owned_run(principal, run_id))
+    return _status(SERVICE.get_run(principal, run_id))
 
 
 @router.delete("/agent/runs/{run_id}", response_model=RunStatusResponse)
@@ -315,7 +397,7 @@ async def cancel_run(
     run_id: str,
     principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
-    return _status(STORE.cancel_run(principal, run_id))
+    return _status(SERVICE.cancel_run(principal, run_id))
 
 
 @router.get("/agent/runs/{run_id}/events")
@@ -324,8 +406,7 @@ async def get_run_events(
     principal: DevicePrincipal = PrincipalDep,
     after_seq: int = Query(0, ge=0),
 ) -> dict:
-    run = STORE.require_owned_run(principal, run_id)
-    events = [e for e in run.sse_events if e.seq > after_seq]
+    run, events = SERVICE.events(principal, run_id, after_seq)
     return {
         "run_id": run_id,
         "next_seq": run.machine.event_seq,
