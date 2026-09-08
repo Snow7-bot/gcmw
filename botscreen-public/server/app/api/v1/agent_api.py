@@ -22,9 +22,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Query, Request, status
 
-from app.api.v1.auth import DevicePrincipal, get_device_principal
+from app.api.v1.auth import DevicePrincipal, PrincipalDep
 from app.api.v1.errors import AppError
 from app.contracts.api import (
     CreateRunRequest,
@@ -274,7 +274,7 @@ def _status(run: RunRecord) -> RunStatusResponse:
 )
 async def create_session(
     req: CreateSessionRequest,
-    principal: DevicePrincipal = Depends(get_device_principal),
+    principal: DevicePrincipal = PrincipalDep,
 ) -> SessionResponse:
     return STORE.create_session(principal, req)
 
@@ -282,7 +282,7 @@ async def create_session(
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_session(
     session_id: str,
-    principal: DevicePrincipal = Depends(get_device_principal),
+    principal: DevicePrincipal = PrincipalDep,
 ) -> None:
     STORE.delete_session(principal, session_id)
 
@@ -291,7 +291,7 @@ async def delete_session(
 async def create_run(
     req: CreateRunRequest,
     request: Request,
-    principal: DevicePrincipal = Depends(get_device_principal),
+    principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
     run = STORE.create_run(
         principal,
@@ -305,7 +305,7 @@ async def create_run(
 @router.get("/agent/runs/{run_id}", response_model=RunStatusResponse)
 async def get_run(
     run_id: str,
-    principal: DevicePrincipal = Depends(get_device_principal),
+    principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
     return _status(STORE.require_owned_run(principal, run_id))
 
@@ -313,7 +313,7 @@ async def get_run(
 @router.delete("/agent/runs/{run_id}", response_model=RunStatusResponse)
 async def cancel_run(
     run_id: str,
-    principal: DevicePrincipal = Depends(get_device_principal),
+    principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
     return _status(STORE.cancel_run(principal, run_id))
 
@@ -321,7 +321,7 @@ async def cancel_run(
 @router.get("/agent/runs/{run_id}/events")
 async def get_run_events(
     run_id: str,
-    principal: DevicePrincipal = Depends(get_device_principal),
+    principal: DevicePrincipal = PrincipalDep,
     after_seq: int = Query(0, ge=0),
 ) -> dict:
     run = STORE.require_owned_run(principal, run_id)

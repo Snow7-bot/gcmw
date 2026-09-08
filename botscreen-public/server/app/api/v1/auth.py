@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fastapi import Request
+from fastapi import Depends, Request
 
 from app.contracts.errors import ErrorCode
 
@@ -31,3 +31,6 @@ async def get_device_principal(request: Request) -> DevicePrincipal:
     refuses every call; tests override this dependency with fake principals.
     """
     raise AppError(ErrorCode.AUTH_MISSING_CREDENTIALS)
+
+
+PrincipalDep = Depends(get_device_principal)
