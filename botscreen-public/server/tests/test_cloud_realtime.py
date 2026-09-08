@@ -346,9 +346,11 @@ class TestChatAndStream:
         task = asyncio.create_task(drain())
         await asyncio.sleep(0)
         assert not task.done()
+        # note: no asyncio.wait_for wrapper — on Python 3.11 wait_for converts
+        # an inner-task CancelledError into TimeoutError
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5)
+            await task
         assert never.closed is True
 
     @mark.asyncio
