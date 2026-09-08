@@ -392,6 +392,96 @@ class TestConcurrency:
             assert run.snapshot.session_id in SERVICE.sessions, f"orphan run {run_id}"
 
 
+class TestImmutability:
+    def test_failed_sse_validation_leaves_state_and_events_untouched(self):
+        """SSE 校验失败时：状态、event_seq、事件列表全部不变（事务性）。"""
+        session_id = RunAdmissionSeed.session()
+        run = SERVICE.create_run(
+            PRINCIPAL,
+            CreateRunRequest(
+                session_id=session_id,
+                input=RunInput(type="text", text="tx"),
+                idempotency_key="tx-1",
+            ),
+            "req",
+            "trace",
+        )
+        rec = SERVICE.runs[run.run_id]
+        assert rec.machine.current is RunState.ACCEPTED
+        assert rec.machine.event_seq == 1
+        assert len(rec.sse_events) == 1
+
+        with pytest.raises(Exception):  # noqa: B017 - validation failure expected
+            # data key not in the RUN_COMPLETED allowlist -> SSEEvent raises
+            SERVICE._advance(rec, RunState.CANCELLED, {"bogus_key": 1})
+
+        # nothing moved: no state change, no sequence bump, no extra event
+        assert rec.machine.current is RunState.ACCEPTED
+        assert rec.machine.event_seq == 1
+        assert [e.event.value for e in rec.sse_events] == ["run.accepted"]
+
+    def test_concurrent_cancel_event_pages_are_consistent(self):
+        session_id = RunAdmissionSeed.session()
+        run = SERVICE.create_run(
+            PRINCIPAL,
+            CreateRunRequest(
+                session_id=session_id,
+                input=RunInput(type="text", text="cc"),
+                idempotency_key="cc-imm",
+            ),
+            "req",
+            "trace",
+        )
+        run_id = run.run_id
+
+        def cancel():
+            return SERVICE.cancel_run(PRINCIPAL, run_id)
+
+        def read_page():
+            page = SERVICE.events(PRINCIPAL, run_id, 0)
+            seqs = [e.seq for e in page.events]
+            assert seqs == list(range(1, page.next_seq + 1))  # no gaps, no tails
+            return page.next_seq
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            cancels = pool.submit(lambda: [cancel() for _ in range(8)])
+            while not cancels.done():
+                read_page()
+            cancels.result()
+        final = SERVICE.events(PRINCIPAL, run_id, 0)
+        assert final.next_seq == 2
+        assert [e.seq for e in final.events] == [1, 2]
+
+    def test_status_state_cancelled_always_consistent(self):
+        session_id = RunAdmissionSeed.session()
+        run = SERVICE.create_run(
+            PRINCIPAL,
+            CreateRunRequest(
+                session_id=session_id,
+                input=RunInput(type="text", text="sc"),
+                idempotency_key="sc-1",
+            ),
+            "req",
+            "trace",
+        )
+        snap = SERVICE.get_run(PRINCIPAL, run.run_id)
+        assert snap.cancelled is False
+        assert snap.state is RunState.ACCEPTED
+        cancelled = SERVICE.cancel_run(PRINCIPAL, run.run_id)
+        assert cancelled.cancelled is True
+        assert cancelled.state is RunState.CANCELLED
+        after = SERVICE.get_run(PRINCIPAL, run.run_id)
+        assert after.cancelled is True
+        assert after.state is RunState.CANCELLED
+
+
+class RunAdmissionSeed:
+    @staticmethod
+    def session() -> str:
+        req = CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+        return SERVICE.create_session(PRINCIPAL, req).session_id
+
+
 class TestRequestIds:
     def test_malformed_x_request_id_replaced(self, client):
         c, _ = client

@@ -1,8 +1,8 @@
 # ADR-0002: request_id / idempotency_key / trace_id 语义与身份派生
 
 - 日期：2026-09-07
-- 状态：已接受
-- 决策人：Technical Lead、Security/SRE、Change Authority
+- 状态：提议
+- 决策人：Technical Lead、Security/SRE、Change Authority（**待真实确认后更新为已接受**）
 - 相关 Issue：#36（Agent API）；对齐 V2.3 §13 可观测性
 
 ## 背景

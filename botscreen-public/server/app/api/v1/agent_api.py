@@ -24,6 +24,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 
 from fastapi import APIRouter, Query, Request, status
 
@@ -98,6 +99,29 @@ class RunRecord:
 # ---------------------------------------------------------------------------
 # RunAdmissionService: the single lifecycle authority (atomic, TTL-aware).
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunStatusSnapshot:
+    """Immutable status DTO produced under the admission lock."""
+
+    run_id: str
+    session_id: str
+    state: RunState
+    created_at: datetime
+
+    @property
+    def cancelled(self) -> bool:
+        return self.state is RunState.CANCELLED
+
+
+@dataclass(frozen=True)
+class EventPage:
+    """Immutable event page: next_seq and events are captured atomically."""
+
+    run_id: str
+    next_seq: int
+    events: tuple[SSEEvent, ...]
 
 
 class RunAdmissionService:
@@ -195,18 +219,24 @@ class RunAdmissionService:
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _advance(
-        self, run: RunRecord, target: RunState, event_type: SSEEventType, data: dict
-    ) -> None:
-        """State transition + SSE append in one locked step.
+    # closed state -> SSE event mapping (no caller-supplied event types)
+    _STATE_EVENT: ClassVar[dict[RunState, SSEEventType]] = {
+        RunState.CANCELLED: SSEEventType.RUN_COMPLETED,
+    }
 
-        The SSE sequence is taken from the event returned by transition(), so
-        state history and SSE events can never diverge or skip numbers.
+    def _advance(self, run: RunRecord, target: RunState, data: dict) -> None:
+        """State transition + SSE append that is transactional under the lock.
+
+        Order: (1) build the SSE event with the expected next seq — full
+        contract validation runs here and any failure aborts BEFORE the state
+        changes; (2) transition the machine (illegal transitions raise before
+        mutating); (3) append the already-validated event. State history and
+        SSE events can therefore never diverge, even when validation fails.
         """
-        run_event = run.machine.transition(target)
-        seq = run_event.event_seq
+        event_type = self._STATE_EVENT[target]  # KeyError = programming bug
+        next_seq = run.machine.event_seq + 1
         sse = SSEEvent(
-            seq=seq,
+            seq=next_seq,
             tenant_id=run.snapshot.tenant_id,
             device_id=run.snapshot.device_id,
             session_id=run.snapshot.session_id,
@@ -215,7 +245,17 @@ class RunAdmissionService:
             event=event_type,
             data=data,
         )
+        run_event = run.machine.transition(target)
+        assert run_event.event_seq == next_seq
         run.sse_events.append(sse)
+
+    def _snapshot(self, run: RunRecord) -> RunStatusSnapshot:
+        return RunStatusSnapshot(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            state=run.machine.current,
+            created_at=run.created_at,
+        )
 
     def create_run(
         self,
@@ -223,7 +263,7 @@ class RunAdmissionService:
         req: CreateRunRequest,
         request_id: str,
         trace_id: str,
-    ) -> RunRecord:
+    ) -> RunStatusSnapshot:
         with self._lock:
             self._expire_if_needed(req.session_id)
             session = self.sessions.get(req.session_id)
@@ -239,7 +279,7 @@ class RunAdmissionService:
                 run_id, stored_hash = existing
                 if run_id in self.runs:
                     if stored_hash == payload_hash:
-                        return self.runs[run_id]  # idempotent replay
+                        return self._snapshot(self.runs[run_id])  # idempotent replay
                     raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
 
             # one active (non-terminal) run per session
@@ -281,48 +321,43 @@ class RunAdmissionService:
             )
             self.runs[run.run_id] = run
             self.idempotency[key] = (run.run_id, payload_hash)
-            return run
+            return self._snapshot(run)
 
-    def get_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
-        with self._lock:
-            run = self.runs.get(run_id)
-            if run is None:
-                raise AppError(ErrorCode.NOT_FOUND_RUN)
-            self._expire_if_needed(run.snapshot.session_id)
-            run = self.runs.get(run_id)
-            if run is None:  # expired while we looked
-                raise AppError(ErrorCode.NOT_FOUND_RUN)
-            if not self._owns_run(run, principal):
-                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
-            return run
+    def _lock_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
+        """Owned-run lookup; must be called under the admission lock."""
+        run = self.runs.get(run_id)
+        if run is None:
+            raise AppError(ErrorCode.NOT_FOUND_RUN)
+        self._expire_if_needed(run.snapshot.session_id)
+        run = self.runs.get(run_id)
+        if run is None:  # expired while we looked
+            raise AppError(ErrorCode.NOT_FOUND_RUN)
+        if not self._owns_run(run, principal):
+            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+        return run
 
-    def cancel_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
+    def get_run(self, principal: DevicePrincipal, run_id: str) -> RunStatusSnapshot:
         with self._lock:
-            run = self.runs.get(run_id)
-            if run is None:
-                raise AppError(ErrorCode.NOT_FOUND_RUN)
-            self._expire_if_needed(run.snapshot.session_id)
-            run = self.runs.get(run_id)
-            if run is None:
-                raise AppError(ErrorCode.NOT_FOUND_RUN)
-            if not self._owns_run(run, principal):
-                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+            return self._snapshot(self._lock_run(principal, run_id))
+
+    def cancel_run(self, principal: DevicePrincipal, run_id: str) -> RunStatusSnapshot:
+        with self._lock:
+            run = self._lock_run(principal, run_id)
             if run.machine.is_terminal:
-                return run
-            self._advance(
-                run,
-                RunState.CANCELLED,
-                SSEEventType.RUN_COMPLETED,
-                {"status": "cancelled"},
-            )
-            return run
+                return self._snapshot(run)
+            self._advance(run, RunState.CANCELLED, {"status": "cancelled"})
+            return self._snapshot(run)
 
     def events(
         self, principal: DevicePrincipal, run_id: str, after_seq: int
-    ) -> tuple[RunRecord, list[SSEEvent]]:
+    ) -> EventPage:
         with self._lock:
-            run = self.get_run(principal, run_id)
-            return run, [e for e in run.sse_events if e.seq > after_seq]
+            run = self._lock_run(principal, run_id)
+            return EventPage(
+                run_id=run_id,
+                next_seq=run.machine.event_seq,
+                events=tuple(e for e in run.sse_events if e.seq > after_seq),
+            )
 
     @staticmethod
     def _owns_run(run: RunRecord, principal: DevicePrincipal) -> bool:
@@ -341,13 +376,13 @@ SERVICE = RunAdmissionService()
 # ---------------------------------------------------------------------------
 
 
-def _status(run: RunRecord) -> RunStatusResponse:
+def _snapshot_response(snap: RunStatusSnapshot) -> RunStatusResponse:
     return RunStatusResponse(
-        run_id=run.run_id,
-        session_id=run.session_id,
-        state=run.machine.current,
-        created_at=run.created_at,
-        cancelled=run.machine.current is RunState.CANCELLED,
+        run_id=snap.run_id,
+        session_id=snap.session_id,
+        state=snap.state,
+        created_at=snap.created_at,
+        cancelled=snap.cancelled,
     )
 
 
@@ -375,13 +410,13 @@ async def create_run(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
-    run = SERVICE.create_run(
+    snap = SERVICE.create_run(
         principal,
         req,
         request_id=request.state.request_id,
         trace_id=request.state.trace_id,
     )
-    return _status(run)
+    return _snapshot_response(snap)
 
 
 @router.get("/agent/runs/{run_id}", response_model=RunStatusResponse)
@@ -389,7 +424,7 @@ async def get_run(
     run_id: str,
     principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
-    return _status(SERVICE.get_run(principal, run_id))
+    return _snapshot_response(SERVICE.get_run(principal, run_id))
 
 
 @router.delete("/agent/runs/{run_id}", response_model=RunStatusResponse)
@@ -397,7 +432,7 @@ async def cancel_run(
     run_id: str,
     principal: DevicePrincipal = PrincipalDep,
 ) -> RunStatusResponse:
-    return _status(SERVICE.cancel_run(principal, run_id))
+    return _snapshot_response(SERVICE.cancel_run(principal, run_id))
 
 
 @router.get("/agent/runs/{run_id}/events")
@@ -406,11 +441,11 @@ async def get_run_events(
     principal: DevicePrincipal = PrincipalDep,
     after_seq: int = Query(0, ge=0),
 ) -> dict:
-    run, events = SERVICE.events(principal, run_id, after_seq)
+    page = SERVICE.events(principal, run_id, after_seq)
     return {
         "run_id": run_id,
-        "next_seq": run.machine.event_seq,
-        "events": [e.model_dump(mode="json") for e in events],
+        "next_seq": page.next_seq,
+        "events": [e.model_dump(mode="json") for e in page.events],
     }
 
 
