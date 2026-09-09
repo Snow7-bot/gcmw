@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from fastapi import APIRouter, Query, Request, status
 
@@ -41,6 +41,7 @@ from app.contracts.errors import ErrorCode
 from app.contracts.events import SSEEvent, SSEEventType
 from app.contracts.run import RunState
 from app.orchestration.state_machine import RunStateMachine
+from app.storage.event_store import EventStoreError
 
 router = APIRouter(prefix="/api/v1")
 
@@ -125,13 +126,20 @@ class EventPage:
 
 
 class RunAdmissionService:
-    def __init__(self, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], datetime] | None = None,
+        event_store: Any | None = None,
+    ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
         self.sessions: dict[str, SessionRecord] = {}
         self.runs: dict[str, RunRecord] = {}
         # (session_id, idempotency_key) -> (run_id, payload_hash)
         self.idempotency: dict[tuple[str, str], tuple[str, str]] = {}
+        # durable mirror for validated SSE events (#36b); None keeps the
+        # single-process in-memory behaviour of the base API
+        self._event_store = event_store
 
     def now(self) -> datetime:
         return self._clock()
@@ -143,9 +151,44 @@ class RunAdmissionService:
         for run_id in [
             r for r in list(self.runs) if self.runs[r].session_id == session_id
         ]:
+            self._delete_durable(run_id)
             del self.runs[run_id]
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
+
+    # -- durable event mirror (#36b) -------------------------------------------
+
+    def _run_store_key(self, run_id: str) -> str:
+        return f"run:{run_id}"
+
+    def _mirror_append(self, run: RunRecord, sse: Any) -> None:
+        """Durably mirror one already-validated SSE event.
+
+        The storage layer re-checks seq contiguity (multi-worker guard) and
+        raises loudly when Redis is unavailable — there is no silent fallback
+        to memory writes. The in-memory run record stays the single authority
+        for the process-local machine.
+        """
+        if self._event_store is None:
+            return
+        try:
+            self._event_store.append(
+                self._run_store_key(run.run_id),
+                sse.seq,
+                sse.model_dump_json().encode("utf-8"),
+            )
+        except EventStoreError as exc:
+            raise AppError(exc.code) from exc
+
+    def _delete_durable(self, run_id: str) -> None:
+        """Best-effort durable cleanup on session purge: deletion drift must
+        never block session expiry handling."""
+        if self._event_store is None:
+            return
+        try:
+            self._event_store.delete(self._run_store_key(run_id))
+        except EventStoreError:
+            pass  # cleanup is not the authority path
 
     def _session_expired(self, session: SessionRecord) -> bool:
         return self.now() >= session.expires_at
@@ -248,6 +291,7 @@ class RunAdmissionService:
         run_event = run.machine.transition(target)
         assert run_event.event_seq == next_seq
         run.sse_events.append(sse)
+        self._mirror_append(run, sse)
 
     def _snapshot(self, run: RunRecord) -> RunStatusSnapshot:
         return RunStatusSnapshot(
@@ -319,6 +363,7 @@ class RunAdmissionService:
                     data={"status": "accepted", "message": "问题已接收"},
                 )
             )
+            self._mirror_append(run, run.sse_events[-1])
             self.runs[run.run_id] = run
             self.idempotency[key] = (run.run_id, payload_hash)
             return self._snapshot(run)
