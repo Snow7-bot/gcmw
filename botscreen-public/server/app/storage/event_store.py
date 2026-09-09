@@ -42,8 +42,14 @@ local entries = redis.call('XREVRANGE', KEYS[1], '+', '-', 'COUNT', 1)
 local expected = tonumber(ARGV[1])
 local last = 0
 if entries[1] then
-  local raw = entries[1][2]['seq']
-  last = tonumber(raw)
+  -- RESP2: an entry is {id, f1, v1, f2, v2, ...} — scan the flat pairs
+  local fields = entries[1]
+  for i = 2, #fields - 1, 2 do
+    if fields[i] == 'seq' then
+      last = tonumber(fields[i + 1])
+      break
+    end
+  end
 end
 if last + 1 ~= expected then
   return 0
