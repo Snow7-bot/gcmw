@@ -1,29 +1,25 @@
-"""Tests for the SSE event storage layer (issue #36b).
+"""Tests for the SSE event storage layer (issue #36b, remediation round).
 
 Coverage:
-- MemoryEventStore: seq contiguity guard (first=1, no gaps, no duplicates),
-  MAXLEN trimming of the oldest entries, TTL expiry on access, proactive
-  sweep, atomic paged reads under concurrent appends (no torn windows),
-  key lifecycle (expire/delete/keys);
-- RedisStreamEventStore: append/read round-trip over a fake redis duck,
-  contiguity enforcement from the newest entry, unavailable client surfaces
-  EventStoreUnavailable (never silent);
-- service integration: a configured store receives every validated event in
-  seq order, purges on session deletion, and a store outage surfaces an
-  explicit AppError instead of a silent memory fallback.
+- MemoryEventStore: contiguous append (first=1, no gaps/duplicates), MAXLEN
+  trim of oldest, whole-key TTL (never per-event — no seq holes), proactive
+  sweep, atomic paged reads under concurrent appends, SCAN listing;
+- RedisStreamEventStore: append/read round-trip over a fake redis duck whose
+  eval() runs the Lua compare-and-append twin atomically; a concurrent probe
+  proves duplicate seq ([1,2,2]) is impossible; outage → EventStoreUnavailable;
+  prefix listing is SCAN-based; run-level TTL is applied;
+- real-Redis integration (skipped unless GCMW_REDIS_TEST_URL is set — CI runs
+  it against the redis service container).
 """
 
-import json
+import os
 import threading
 
 import pytest
 
-from app.api.v1.agent_api import RunAdmissionService
-from app.api.v1.auth import DevicePrincipal
-from app.api.v1.errors import AppError
-from app.contracts.api import Channel, CreateRunRequest, CreateSessionRequest, RunInput
 from app.contracts.errors import ErrorCode
 from app.storage.event_store import (
+    _LUA_APPEND,
     DEFAULT_MAX_EVENTS_PER_RUN,
     EventStoreError,
     EventStoreUnavailable,
@@ -31,41 +27,16 @@ from app.storage.event_store import (
     RedisStreamEventStore,
 )
 
-PRINCIPAL = DevicePrincipal(tenant_id="t1", device_id="d1")
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.value = __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        )
-
-    def __call__(self):
-        return self.value
-
-    def advance(self, seconds: float) -> None:
-        import datetime
-
-        self.value = self.value + datetime.timedelta(seconds=seconds)
-
-
-def _request(text="你好", channel="text"):
-    return CreateRunRequest(
-        session_id="unused",
-        idempotency_key="k1",
-        input=RunInput(text=text),
-    )
-
 
 class TestMemoryStore:
     def test_first_seq_must_be_one(self):
-        store = MemoryEventStore()
+        store = MemoryEventStore(default_ttl_s=None)
         with pytest.raises(EventStoreError) as exc:
             store.append("r", 0, b"x")
         assert exc.value.code is ErrorCode.CONFLICT_IDEMPOTENCY
 
     def test_gaps_and_duplicates_rejected(self):
-        store = MemoryEventStore()
+        store = MemoryEventStore(default_ttl_s=None)
         store.append("r", 1, b"a")
         with pytest.raises(EventStoreError):
             store.append("r", 3, b"c")  # gap
@@ -74,48 +45,51 @@ class TestMemoryStore:
             store.append("r", 2, b"dup")  # duplicate
 
     def test_read_pages_after_seq(self):
-        store = MemoryEventStore()
+        store = MemoryEventStore(default_ttl_s=None)
         for seq in range(1, 6):
             store.append("r", seq, f"e{seq}".encode())
         page = store.read("r", after_seq=2, limit=2)
         assert [seq for seq, _ in page] == [3, 4]
 
-    def test_maxlen_trims_oldest(self):
-        store = MemoryEventStore(max_len=3)
+    def test_maxlen_trims_oldest_keeps_tail_contiguous(self):
+        store = MemoryEventStore(max_len=3, default_ttl_s=None)
         for seq in range(1, 6):
             store.append("r", seq, b"x")
         assert [seq for seq, _ in store.read("r")] == [3, 4, 5]
-        assert store.next_seq("r") == 6
+        assert store.next_seq("r") == 6  # tail stays contiguous
 
-    def test_ttl_expires_entries_on_access(self):
+    def test_whole_key_ttl_expires_atomically(self):
         monotonic = {"now": 100.0}
-        store = MemoryEventStore(default_ttl_s=None, monotonic=lambda: monotonic["now"])
-        store.append("r", 1, b"a", ttl_s=10)
+        store = MemoryEventStore(default_ttl_s=10, monotonic=lambda: monotonic["now"])
+        store.append("r", 1, b"a")
+        store.append("r", 2, b"b")
         monotonic["now"] = 115.0
         with pytest.raises(EventStoreError) as exc:
-            store.read("r")
+            store.read("r")  # whole key gone — no per-event holes
         assert exc.value.code is ErrorCode.NOT_FOUND_RUN
+        assert store.next_seq("r") == 0
 
     def test_sweep_expired_removes_keys(self):
         monotonic = {"now": 100.0}
         store = MemoryEventStore(default_ttl_s=None, monotonic=lambda: monotonic["now"])
-        store.append("a:1", 1, b"x", ttl_s=5)
-        store.append("a:2", 1, b"x", ttl_s=5)
-        store.append("b:1", 1, b"x", ttl_s=1000)
+        store.append("a:1", 1, b"x")
+        store._streams["a:1"] = (monotonic["now"] + 5, store._streams["a:1"][1])
+        store.append("a:2", 1, b"x")
+        store._streams["a:2"] = (monotonic["now"] + 5, store._streams["a:2"][1])
         monotonic["now"] = 200.0
         assert store.sweep_expired("a:") == 2
-        assert store.keys("a:") == []
+        assert store.scan("a:") == []
 
-    def test_concurrent_appends_yield_no_torn_pages(self):
-        store = MemoryEventStore(max_len=10_000)
-        errors: list[Exception] = []
+    def test_concurrent_appends_never_duplicate_seq(self):
+        store = MemoryEventStore(max_len=10_000, default_ttl_s=None)
+        conflicts = []
 
         def writer(start: int):
-            try:
-                for seq in range(start, start + 50):
+            for seq in range(start, start + 50):
+                try:
                     store.append("r", seq, b"x")
-            except Exception as exc:  # noqa: BLE001 - collected below
-                errors.append(exc)
+                except EventStoreError:
+                    conflicts.append(seq)
 
         threads = [
             threading.Thread(target=writer, args=(1,)),
@@ -125,66 +99,98 @@ class TestMemoryStore:
             t.start()
         for t in threads:
             t.join()
-        # one writer wins every seq; the other only ever hits conflicts
-        assert not errors or all(isinstance(e, EventStoreError) for e in errors)
-        page = store.read("r", after_seq=0, limit=1000)
+        page = store.read("r", after_seq=0, limit=10_000)
         seqs = [seq for seq, _ in page]
-        assert seqs == list(range(1, len(seqs) + 1))  # contiguous, no tearing
+        assert seqs == list(range(1, 51))  # exactly once each, contiguous
+        assert conflicts  # the loser writer only ever saw conflicts
 
-    def test_expire_delete_keys(self):
-        store = MemoryEventStore()
-        store.append("r", 1, b"x")
-        store.expire("r", 10)
-        assert store.keys("run:") == []
+    def test_scan_and_delete(self):
+        store = MemoryEventStore(default_ttl_s=None)
+        store.append("run:r1", 1, b"x")
         store.append("run:r2", 1, b"x")
-        assert store.keys("run:") == ["run:r2"]
-        store.delete("run:r2")
-        assert store.keys("run:") == []
+        store.append("other:k", 1, b"x")
+        assert sorted(store.scan("run:")) == ["run:r1", "run:r2"]
+        store.delete("run:r1")
+        assert store.scan("run:") == ["run:r2"]
 
 
 class FakeRedis:
-    """In-memory redis duck: streams with monotonic ids."""
+    """Redis duck whose eval() executes the Lua compare-and-append twin.
+
+    The twin runs under one lock, mirroring the atomicity of the server-side
+    script — the concurrency probe therefore exercises the exact invariant.
+    """
 
     def __init__(self) -> None:
         self.streams: dict[str, list[tuple[str, dict]]] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._ttls: dict[str, int] = {}
         self.unavailable = False
 
-    def _fail(self):
-        if self.unavailable:
-            raise ConnectionError("redis down")
+    def _lock_for(self, name: str) -> threading.Lock:
+        lock = self._locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            self._locks[name] = lock
+        return lock
 
     def _next_id(self, name: str) -> str:
-        index = len(self.streams.get(name, [])) + 1
-        return f"{index}-0"
+        return f"{len(self.streams.get(name, [])) + 1}-0"
 
-    def xadd(self, name, fields, *, maxlen=None):
-        self._fail()
+    def _twin_append(self, name, seq, maxlen, data, ttl_s):
+        entries = self.xrevrange(name, "+", "-", count=1)
+        last = 0
+        if entries:
+            last = int(entries[0][1]["seq"])
+        if last + 1 != seq:
+            return 0
         stream = self.streams.setdefault(name, [])
-        stream.append((self._next_id(name), dict(fields)))
-        if maxlen is not None and len(stream) > maxlen:
+        stream.append((self._next_id(name), {"seq": str(seq), "data": data}))
+        if len(stream) > maxlen:
             del stream[: len(stream) - maxlen]
-        return stream[-1][0]
+        if ttl_s > 0:
+            self._ttls[name] = ttl_s
+        return 1
 
-    def xrange(self, name, start="-", end="+"):
-        self._fail()
-        return list(self.streams.get(name, []))
+    # -- client duck -----------------------------------------------------------
+
+    def eval(self, script, numkeys, *keys_and_args):
+        if self.unavailable:
+            raise ConnectionError("redis down")
+        assert script == _LUA_APPEND, "fake only understands the append script"
+        name = keys_and_args[0]
+        seq, maxlen, data, ttl_s = keys_and_args[1:5]
+        with self._lock_for(name):
+            return self._twin_append(name, int(seq), int(maxlen), data, int(ttl_s))
+
+    def xrevrange(self, name, start="+", end="-", *, count=None):
+        if self.unavailable:
+            raise ConnectionError("redis down")
+        entries = list(reversed(list(self.streams.get(name, []))))
+        if count is not None:
+            entries = entries[:count]
+        return entries
 
     def xlen(self, name):
-        self._fail()
+        if self.unavailable:
+            raise ConnectionError("redis down")
         return len(self.streams.get(name, []))
 
     def delete(self, name):
-        self._fail()
+        if self.unavailable:
+            raise ConnectionError("redis down")
         return 1 if self.streams.pop(name, None) is not None else 0
 
-    def expire(self, name, ttl_s):
-        self._fail()
-        return name in self.streams
+    def scan(self, cursor=0, match=None):
+        if self.unavailable:
+            raise ConnectionError("redis down")
+        prefix = match.split("*")[0]
+        return (0, sorted(k for k in self.streams if k.startswith(prefix)))
 
-    def keys(self, pattern):
-        self._fail()
-        prefix = pattern.split("*")[0]
-        return [k for k in self.streams if k.startswith(prefix)]
+    def ttl(self, name):
+        if self.unavailable:
+            raise ConnectionError("redis down")
+        return self._ttls.get(name, -2)
 
 
 class TestRedisStore:
@@ -198,21 +204,52 @@ class TestRedisStore:
         page = store.read("r", after_seq=1, limit=1)
         assert [seq for seq, _ in page] == [2]
 
-    def test_contiguity_from_newest_entry(self):
+    def test_compare_and_append_rejects_conflict(self):
         redis = FakeRedis()
         store = RedisStreamEventStore(redis, default_ttl_s=None)
         store.append("r", 1, b"a")
         with pytest.raises(EventStoreError) as exc:
             store.append("r", 3, b"c")
         assert exc.value.code is ErrorCode.CONFLICT_IDEMPOTENCY
+        with pytest.raises(EventStoreError):
+            store.append("r", 1, b"dup")
 
-    def test_maxlen_approximate_trim_on_append(self):
+    def test_concurrent_probe_never_duplicates_seq(self):
+        """Reproduces the reviewer's [1,2,2] probe against the Lua twin."""
+        redis = FakeRedis()
+        store = RedisStreamEventStore(redis, default_ttl_s=None)
+        conflicts = []
+
+        def writer(start: int):
+            for seq in range(start, start + 60):
+                try:
+                    store.append("r", seq, f"w{seq}".encode())
+                except EventStoreError:
+                    conflicts.append(seq)
+
+        threads = [threading.Thread(target=writer, args=(1,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        seqs = [seq for seq, _ in store.read("r")]
+        assert seqs == list(range(1, 61))  # no [1,2,2]
+        assert len(seqs) == len(set(seqs))
+        assert conflicts  # losers observed conflicts, never duplicated
+
+    def test_run_level_ttl_refreshed_on_append(self):
+        redis = FakeRedis()
+        store = RedisStreamEventStore(redis, default_ttl_s=100)
+        store.append("r", 1, b"a")
+        store.append("r", 2, b"b")
+        assert store.ttl("r") == 100  # whole key, refreshed
+
+    def test_maxlen_trimmed_by_lua_append(self):
         redis = FakeRedis()
         store = RedisStreamEventStore(redis, max_len=2, default_ttl_s=None)
         for seq in range(1, 5):
             store.append("r", seq, b"x")
-        assert store.trim("r", max_len=2) == 0  # already trimmed by MAXLEN
-        assert len(store.read("r")) == 2
+        assert [seq for seq, _ in store.read("r")] == [3, 4]
 
     def test_unavailable_client_raises_explicitly(self):
         redis = FakeRedis()
@@ -223,12 +260,13 @@ class TestRedisStore:
         with pytest.raises(EventStoreUnavailable):
             store.read("r")
 
-    def test_keys_prefix(self):
+    def test_scan_never_uses_keys(self):
         redis = FakeRedis()
         store = RedisStreamEventStore(redis, default_ttl_s=None)
         store.append("run:r1", 1, b"x")
         store.append("run:r2", 1, b"x")
-        assert sorted(store.keys("run:")) == [
+        found = store.scan("run:")
+        assert sorted(found) == [
             "gcmw:run-events:run:r1",
             "gcmw:run-events:run:r2",
         ]
@@ -237,72 +275,38 @@ class TestRedisStore:
         assert DEFAULT_MAX_EVENTS_PER_RUN == 10_000
 
 
-class TestServiceIntegration:
-    def _service(self, store=None):
-        return RunAdmissionService(event_store=store)
+@pytest.mark.skipif(
+    not os.getenv("GCMW_REDIS_TEST_URL"),
+    reason="GCMW_REDIS_TEST_URL not set (CI redis service)",
+)
+class TestRealRedisIntegration:
+    @pytest.fixture()
+    def live(self):
+        url = os.environ["GCMW_REDIS_TEST_URL"]
+        store = RedisStreamEventStore.from_url(url)
+        for key in store.scan("test:"):
+            store.delete(key)
+        yield store
+        for key in store.scan("test:"):
+            store.delete(key)
 
-    def test_events_mirrored_in_seq_order(self):
-        store = MemoryEventStore()
-        service = self._service(store)
-        session = service.create_session(
-            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT)
-        )
-        run = service.create_run(
-            PRINCIPAL,
-            CreateRunRequest(
-                session_id=session.session_id,
-                idempotency_key="k1",
-                input=RunInput(text="你好"),
-            ),
-            request_id="req-1",
-            trace_id="trace-1",
-        )
-        service.cancel_run(PRINCIPAL, run.run_id)
-        stored = store.read(f"run:{run.run_id}")
-        seqs = [seq for seq, _ in stored]
-        assert seqs == [1, 2]
-        # durable payload is the same validated contract JSON
-        assert json.loads(stored[0][1])["seq"] == 1
-        assert json.loads(stored[0][1])["event"] == "run.accepted"
+    def test_roundtrip(self, live):
+        for seq in range(1, 4):
+            live.append("test:r", seq, f"e{seq}".encode())
+        assert [seq for seq, _ in live.read("test:r")] == [1, 2, 3]
+        assert live.next_seq("test:r") == 4
 
-    def test_session_delete_purges_durable_keys(self):
-        store = MemoryEventStore()
-        service = self._service(store)
-        session = service.create_session(
-            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT)
-        )
-        run = service.create_run(
-            PRINCIPAL,
-            CreateRunRequest(
-                session_id=session.session_id,
-                idempotency_key="k1",
-                input=RunInput(text="你好"),
-            ),
-            request_id="req-1",
-            trace_id="trace-1",
-        )
-        assert store.keys("run:") == [f"run:{run.run_id}"]
-        service.delete_session(PRINCIPAL, session.session_id)
-        assert store.keys("run:") == []
+    def test_conflict_is_atomic(self, live):
+        live.append("test:r2", 1, b"a")
+        with pytest.raises(EventStoreError) as exc:
+            live.append("test:r2", 3, b"c")
+        assert exc.value.code is ErrorCode.CONFLICT_IDEMPOTENCY
+        assert [seq for seq, _ in live.read("test:r2")] == [1]
 
-    def test_store_outage_surfaces_explicit_error(self):
-        class BrokenStore:
-            def append(self, key, seq, data):
-                raise EventStoreUnavailable("redis down")
-
-        service = self._service(BrokenStore())
-        session = service.create_session(
-            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT)
+    def test_run_level_ttl(self, live):
+        store = RedisStreamEventStore.from_url(
+            os.environ["GCMW_REDIS_TEST_URL"], default_ttl_s=60
         )
-        with pytest.raises(AppError) as exc:
-            service.create_run(
-                PRINCIPAL,
-                CreateRunRequest(
-                    session_id=session.session_id,
-                    idempotency_key="k1",
-                    input=RunInput(text="你好"),
-                ),
-                request_id="req-1",
-                trace_id="trace-1",
-            )
-        assert exc.value.code is ErrorCode.UNAVAILABLE_OVERLOADED
+        store.append("test:ttl", 1, b"x")
+        assert 0 < store.ttl("test:ttl") <= 60
+        store.delete("test:ttl")

@@ -1,30 +1,22 @@
-"""Event storage for run SSE events (issue #36b).
+"""Event storage for run SSE events (issue #36b, remediation round).
 
-Single-sequence-authority stays in the run state machine (#36a): the storage
-layer only *durably mirrors* already-validated events, keyed per run, and
-guards two invariants:
+Reviewer-driven constraints (2026-09 round):
+- run-level TTL only — events are NEVER expired individually, so a stream can
+  never develop sequence holes; the whole run key expires atomically;
+- append is an atomic compare-and-append: "read last seq, then XADD" is not
+  atomic and can duplicate seq under concurrency — Redis appends run through
+  one Lua script (``XREVRANGE ... + - COUNT 1`` read of the newest entry
+  inside the script, then conditional XADD + EXPIRE); the memory reference
+  serializes the same invariant on a single lock;
+- no ``KEYS`` — prefix listing uses SCAN semantics;
+- a store outage raises ``EventStoreUnavailable`` explicitly; there is never a
+  silent fallback to memory writes.
 
-- contiguity — ``append`` accepts seq only when it equals the stored next
-  seq; a mismatch (another worker already advanced the run) raises a conflict
-  instead of tearing the stream;
-- atomic paged reads — ``read(key, after_seq, limit)`` returns one snapshot
-  window ``(after_seq, after_seq+limit]``; concurrent appends can never
-  produce a torn page like ``([1], 2)``.
-
-Two implementations:
-
-- :class:`MemoryEventStore` — deterministic reference used by unit/contract
-  tests and single-process development (explicit choice, never a silent
-  fallback);
-- :class:`RedisStreamEventStore` — Redis Streams (MAXLEN) adapter over an
-  injected client duck; ``from_url`` fails loudly (explicit error) when the
-  redis client is missing or the server is unreachable — there is no silent
-  fallback to memory writes.
-
-TTL and capacity are enforced at write time (oldest trimmed past
-``max_len``, expired keys deleted on access) and by ``sweep_expired`` for
-proactive cleanup across workers (#64 lazy expiry owns in-memory state; this
-module owns the durable copy).
+The run state machine (#36a) stays the single sequence authority for the
+process-local machine; this module durably mirrors already-validated events
+and refuses to persist a non-contiguous append (conflict). Wiring the mirror
+into the lifecycle service only happens once state AND events can be persisted
+atomically (see #65B) — until then the storage layer stands alone.
 """
 
 from __future__ import annotations
@@ -40,6 +32,30 @@ from app.contracts.errors import ErrorCode
 
 DEFAULT_MAX_EVENTS_PER_RUN = 10_000
 DEFAULT_RUN_TTL_S = 3600
+
+# Lua compare-and-append: atomically check the newest entry against the
+# expected seq, XADD with MAXLEN, refresh the run-level TTL. Returns 1 on
+# success, 0 on seq conflict. Errors propagate as Redis exceptions (mapped to
+# EventStoreUnavailable by the caller).
+_LUA_APPEND = """
+local entries = redis.call('XREVRANGE', KEYS[1], '+', '-', 'COUNT', 1)
+local expected = tonumber(ARGV[1])
+local last = 0
+if entries[1] then
+  local raw = entries[1][2]['seq']
+  last = tonumber(raw)
+end
+if last + 1 ~= expected then
+  return 0
+end
+redis.call('XADD', KEYS[1], 'MAXLEN', '~', ARGV[2], '*', 'seq', ARGV[1], 'data', ARGV[3])
+if tonumber(ARGV[4]) > 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[4])
+end
+return 1
+"""
+#: fingerprint used by fakes to dispatch eval() to a python twin
+LUA_APPEND_SHA = "gcmw-caa-v1"
 
 
 class EventStoreError(RuntimeError):
@@ -62,7 +78,7 @@ def _now() -> float:
 
 
 class EventStore(Protocol):
-    """Durable, seq-guarded append-only event log per key."""
+    """Durable, seq-guarded append-only event log per key (run-level TTL)."""
 
     def append(self, key: str, seq: int, data: bytes) -> None: ...
 
@@ -72,22 +88,17 @@ class EventStore(Protocol):
 
     def next_seq(self, key: str) -> int: ...
 
-    def trim(self, key: str, max_len: int) -> int: ...
-
-    def expire(self, key: str, ttl_s: int) -> None: ...
-
     def delete(self, key: str) -> None: ...
 
-    def keys(self, prefix: str) -> list[str]: ...
+    def scan(self, prefix: str) -> list[str]: ...
 
 
 class MemoryEventStore:
     """Deterministic reference store (tests / single-process development).
 
-    Contiguity is enforced per key; the newest entry is trimmed once the key
-    passes ``max_len`` (Redis MAXLEN semantics); TTL is checked on access and
-    by ``sweep_expired``. All operations are serialized on one RLock so a
-    paged read is always a consistent snapshot.
+    Invariants mirror the Redis adapter: contiguous append under one lock,
+    MAXLEN trimming of the oldest entries, whole-key TTL (never per-event
+    expiry, so seq holes cannot form), SCAN-style prefix listing.
     """
 
     def __init__(
@@ -101,57 +112,58 @@ class MemoryEventStore:
         self._default_ttl_s = default_ttl_s
         self._monotonic = monotonic or _now
         self._lock = threading.RLock()
-        # key -> ordered seq -> (expires_at_monotonic | None, payload)
-        self._streams: dict[str, OrderedDict[int, tuple[float | None, bytes]]] = {}
+        # key -> (expires_at_monotonic | None, OrderedDict[seq, bytes])
+        self._streams: dict[str, tuple[float | None, OrderedDict[int, bytes]]] = {}
 
-    # -- helpers ---------------------------------------------------------------
-
-    def _entry_ttl_s(self, ttl_s: int | None) -> float | None:
+    def _deadline(self, ttl_s: int | None) -> float | None:
         if ttl_s is None:
             ttl_s = self._default_ttl_s
         if ttl_s is None:
             return None
         return self._monotonic() + ttl_s
 
-    def _alive(self, expires_at: float | None) -> bool:
-        return expires_at is None or self._monotonic() < expires_at
-
-    def _require_key(self, key: str) -> OrderedDict[int, tuple[float | None, bytes]]:
-        stream = self._streams.get(key)
-        if stream is None:
+    def _require_key(self, key: str) -> OrderedDict[int, bytes]:
+        entry = self._streams.get(key)
+        if entry is None:
             raise EventStoreError(ErrorCode.NOT_FOUND_RUN, f"store key {key!r} absent")
-        # lazy TTL enforcement on access
-        expired = [s for s in stream if not self._alive(stream[s][0])]
-        for seq in expired:
-            del stream[seq]
-        if expired and not stream:
-            del self._streams[key]
+        expires_at, stream = entry
+        if expires_at is not None and self._monotonic() >= expires_at:
+            del self._streams[key]  # whole-key TTL expiry
             raise EventStoreError(ErrorCode.NOT_FOUND_RUN, f"store key {key!r} absent")
         return stream
 
     # -- EventStore --------------------------------------------------------------
 
-    def append(
-        self, key: str, seq: int, data: bytes, *, ttl_s: int | None = None
-    ) -> None:
+    def append(self, key: str, seq: int, data: bytes) -> None:
         with self._lock:
-            stream = self._streams.setdefault(key, OrderedDict())
-            if stream:
+            entry = self._streams.get(key)
+            if entry is None:
+                if seq != 1:
+                    raise EventStoreError(
+                        ErrorCode.CONFLICT_IDEMPOTENCY,
+                        f"{key}: first seq must be 1, got {seq}",
+                    )
+                stream: OrderedDict[int, bytes] = OrderedDict()
+                self._streams[key] = (self._deadline(None), stream)
+            else:
+                expires_at, stream = entry
+                if expires_at is not None and self._monotonic() >= expires_at:
+                    del self._streams[key]
+                    raise EventStoreError(
+                        ErrorCode.NOT_FOUND_RUN, f"store key {key!r} expired"
+                    )
                 latest = next(reversed(stream))
                 if seq != latest + 1:
                     raise EventStoreError(
                         ErrorCode.CONFLICT_IDEMPOTENCY,
                         f"{key}: expected seq {latest + 1}, got {seq}",
                     )
-            else:
-                if seq != 1:
-                    raise EventStoreError(
-                        ErrorCode.CONFLICT_IDEMPOTENCY,
-                        f"{key}: first seq must be 1, got {seq}",
-                    )
-            stream[seq] = (self._entry_ttl_s(ttl_s), data)
+            stream[seq] = data
             while len(stream) > self._max_len:  # MAXLEN semantics
                 stream.popitem(last=False)
+            # whole-key TTL refresh on every append
+            deadline = self._deadline(None)
+            self._streams[key] = (deadline, stream)
 
     def read(
         self, key: str, after_seq: int | None = None, limit: int = 100
@@ -160,86 +172,67 @@ class MemoryEventStore:
             stream = self._require_key(key)
             start = after_seq if after_seq is not None else 0
             return tuple(
-                (seq, payload)
-                for seq, (expires, payload) in stream.items()
-                if seq > start and self._alive(expires)
+                (seq, payload) for seq, payload in stream.items() if seq > start
             )[:limit]
 
     def next_seq(self, key: str) -> int:
         with self._lock:
-            stream = self._streams.get(key)
-            if not stream:
+            entry = self._streams.get(key)
+            if entry is None:
                 return 0
             try:
-                return next(reversed(stream)) + 1
+                return next(reversed(entry[1])) + 1
             except StopIteration:
                 return 0
-
-    def trim(self, key: str, max_len: int) -> int:
-        with self._lock:
-            stream = self._require_key(key)
-            removed = max(len(stream) - max_len, 0)
-            for _ in range(removed):
-                stream.popitem(last=False)
-            return removed
-
-    def expire(self, key: str, ttl_s: int) -> None:
-        with self._lock:
-            stream = self._streams.get(key)
-            if stream is None:
-                return
-            deadline = self._monotonic() + ttl_s
-            for seq in list(stream):
-                stream[seq] = (deadline, stream[seq][1])
 
     def delete(self, key: str) -> None:
         with self._lock:
             self._streams.pop(key, None)
 
-    def keys(self, prefix: str) -> list[str]:
+    def scan(self, prefix: str) -> list[str]:
         with self._lock:
             return [k for k in self._streams if k.startswith(prefix)]
 
     def sweep_expired(self, prefix: str = "") -> int:
-        """Proactive cleanup across workers: delete expired keys matching a
-        prefix; returns the number of keys removed."""
+        """Proactive whole-key cleanup; returns the number of keys removed."""
         with self._lock:
             removed = 0
             for key in [k for k in self._streams if k.startswith(prefix)]:
-                stream = self._streams[key]
-                alive = [
-                    seq for seq, (expires, _) in stream.items() if self._alive(expires)
-                ]
-                if not alive:
+                expires_at, _ = self._streams[key]
+                if expires_at is not None and self._monotonic() >= expires_at:
                     del self._streams[key]
                     removed += 1
-        return removed
+            return removed
 
 
 # ---------------------------------------------------------------------------
-# Redis Streams adapter
+# Redis Streams adapter (atomic compare-and-append)
 # ---------------------------------------------------------------------------
 
 
 class RedisClientDuck(Protocol):
-    """Minimal surface of a Redis client the adapter relies on.
+    """Redis surface the adapter needs.
 
-    ``xadd`` entries carry string fields; IDs returned by the server are not
-    used as sequence numbers — the payload's own ``seq`` field is the single
-    source of truth, so appends stay exactly-once per seq.
+    ``eval`` executes the Lua compare-and-append atomically server-side; the
+    payload's own ``seq`` field stays the single source of truth (server
+    stream IDs are never used as sequence numbers).
     """
 
-    def xadd(self, name: str, fields: dict, *, maxlen: int | None = None) -> Any: ...
+    def eval(self, script: str, numkeys: int, *keys_and_args: Any) -> Any: ...
 
-    def xrange(self, name: str, start: str = "-", end: str = "+") -> list[Any]: ...
+    def xrevrange(
+        self, name: str, start: str = "+", end: str = "-", *, count: int | None = None
+    ) -> list[Any]: ...
 
     def xlen(self, name: str) -> int: ...
 
     def delete(self, name: str) -> int: ...
 
-    def expire(self, name: str, ttl_s: int) -> bool: ...
+    def scan(
+        self, cursor: int = 0, match: str | None = None
+    ) -> tuple[int, list[Any]]: ...
 
-    def keys(self, pattern: str) -> list[str]: ...
+    def ttl(self, name: str) -> int: ...
 
 
 def _encode(data: bytes) -> str:
@@ -251,13 +244,10 @@ def _decode(payload: str) -> bytes:
 
 
 class RedisStreamEventStore:
-    """Redis Streams implementation of the durable event mirror.
+    """Redis Streams durable mirror with atomic compare-and-append.
 
-    One stream per run key; entries carry ``seq`` and base64 ``data`` fields.
-    Contiguity is validated against the newest entry before every append
-    (another worker that already advanced the run → conflict, no tear).
-    Capacity is bounded with ``MAXLEN`` (approximate trim, Redis semantics);
-    TTL is applied per run stream at append time and by ``expire``.
+    One stream per run key with a whole-key TTL refreshed on append (events
+    are never expired individually). Prefix listing uses SCAN, never KEYS.
     """
 
     def __init__(
@@ -277,15 +267,15 @@ class RedisStreamEventStore:
         return f"{self._prefix}{key}"
 
     @staticmethod
-    def _field(fields: Any, name: str) -> str:
-        value = fields.get(name) if isinstance(fields, dict) else fields[name]
+    def _arg(value: Any) -> str:
         return value.decode() if isinstance(value, bytes) else str(value)
 
-    def _last_seq(self, key: str) -> int:
-        entries = self._client.xrange(self._name(key), "+", "+")
-        if not entries:
-            return 0
-        return int(self._field(entries[-1][1], "seq"))
+    @staticmethod
+    def _fields(entry: Any) -> dict[bytes, bytes]:
+        _, fields = entry
+        if isinstance(fields, dict) and all(isinstance(k, bytes) for k in fields):
+            return fields
+        return {str(k).encode(): str(v).encode() for k, v in fields.items()}
 
     @classmethod
     def from_url(
@@ -314,20 +304,25 @@ class RedisStreamEventStore:
 
     # -- EventStore --------------------------------------------------------------
 
-    def append(
-        self, key: str, seq: int, data: bytes, *, ttl_s: int | None = None
-    ) -> None:
+    def append(self, key: str, seq: int, data: bytes) -> None:
+        """Atomic compare-and-append (Lua). Raises CONFLICT_IDEMPOTENCY when
+        another writer already advanced the stream; unavailable clients raise
+        EventStoreUnavailable — never a silent drop."""
         try:
-            expected = self._last_seq(key) + 1
-            if seq != expected:
+            outcome = self._client.eval(
+                _LUA_APPEND,
+                1,
+                self._name(key),
+                str(seq),
+                str(self._max_len),
+                _encode(data),
+                str(self._default_ttl_s or 0),
+            )
+            if int(self._arg(outcome)) != 1:
                 raise EventStoreError(
                     ErrorCode.CONFLICT_IDEMPOTENCY,
-                    f"{key}: expected seq {expected}, got {seq}",
+                    f"{key}: compare-and-append conflict at seq {seq}",
                 )
-            fields: dict[str, Any] = {"seq": str(seq), "data": _encode(data)}
-            self._client.xadd(self._name(key), fields, maxlen=self._max_len)
-            if self._default_ttl_s is not None:
-                self._client.expire(self._name(key), ttl_s or self._default_ttl_s)
         except EventStoreError:
             raise
         except Exception as exc:
@@ -337,40 +332,26 @@ class RedisStreamEventStore:
         self, key: str, after_seq: int | None = None, limit: int = 100
     ) -> tuple[tuple[int, bytes], ...]:
         try:
-            entries = self._client.xrange(self._name(key))
+            entries = self._client.xrevrange(self._name(key), "+", "-")
+            entries.reverse()  # oldest -> newest
             collected: list[tuple[int, bytes]] = []
-            for _, fields in entries:
-                seq = int(self._field(fields, "seq"))
+            for entry in entries:
+                fields = self._fields(entry)
+                seq = int(self._arg(fields[b"seq"]))
                 if seq > (after_seq or 0):
-                    collected.append((seq, _decode(self._field(fields, "data"))))
+                    collected.append((seq, _decode(self._arg(fields[b"data"]))))
             return tuple(collected[:limit])
         except Exception as exc:
             raise EventStoreUnavailable(f"redis read failed: {exc}") from exc
 
     def next_seq(self, key: str) -> int:
         try:
-            return self._last_seq(key) + 1
+            entries = self._client.xrevrange(self._name(key), "+", "-", count=1)
+            if not entries:
+                return 0
+            return int(self._arg(self._fields(entries[0])[b"seq"])) + 1
         except Exception as exc:
             raise EventStoreUnavailable(f"redis read failed: {exc}") from exc
-
-    def trim(self, key: str, max_len: int) -> int:
-        """Report how far the stream exceeds the cap.
-
-        Actual eviction happens approximately via XADD MAXLEN on the next
-        append (Redis semantics); a deterministic trim would need XTRIM,
-        which the duck surface does not carry in v1.
-        """
-        try:
-            total = self._client.xlen(self._name(key))
-            return max(total - max_len, 0)
-        except Exception as exc:
-            raise EventStoreUnavailable(f"redis trim failed: {exc}") from exc
-
-    def expire(self, key: str, ttl_s: int) -> None:
-        try:
-            self._client.expire(self._name(key), ttl_s)
-        except Exception as exc:
-            raise EventStoreUnavailable(f"redis expire failed: {exc}") from exc
 
     def delete(self, key: str) -> None:
         try:
@@ -378,12 +359,24 @@ class RedisStreamEventStore:
         except Exception as exc:
             raise EventStoreUnavailable(f"redis delete failed: {exc}") from exc
 
-    def keys(self, prefix: str) -> list[str]:
+    def scan(self, prefix: str) -> list[str]:
+        """SCAN-based prefix listing (never KEYS)."""
         try:
             pattern = f"{self._prefix}{prefix}*"
-            return [
-                k.decode() if isinstance(k, bytes) else str(k)
-                for k in self._client.keys(pattern)
-            ]
+            cursor = 0
+            found: list[str] = []
+            while True:
+                cursor, batch = self._client.scan(cursor, match=pattern)
+                found.extend(self._arg(k) for k in batch)
+                if not cursor:
+                    break
+            return found
         except Exception as exc:
-            raise EventStoreUnavailable(f"redis keys failed: {exc}") from exc
+            raise EventStoreUnavailable(f"redis scan failed: {exc}") from exc
+
+    def ttl(self, key: str) -> int:
+        """Remaining run-level TTL seconds (-1 = no expiry, -2 = absent)."""
+        try:
+            return int(self._arg(self._client.ttl(self._name(key))))
+        except Exception as exc:
+            raise EventStoreUnavailable(f"redis ttl failed: {exc}") from exc
