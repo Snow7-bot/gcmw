@@ -89,6 +89,36 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _validate_store_options(max_len: int, default_ttl_s: int | None) -> None:
+    """Reject retention policy holes at construction time.
+
+    - ``default_ttl_s`` must be None (no expiry — explicit test/dev choice) or
+      a positive integer; 0/negative would silently mean "expire now" in
+      Memory but "never expire" in Redis — the divergence is refused here;
+    - ``max_len`` must be >= 1; negative values previously crashed Memory with
+      a non-contract KeyError instead of a clean validation error.
+    """
+    if not isinstance(max_len, int) or isinstance(max_len, bool) or max_len < 1:
+        raise ValueError(f"max_len must be a positive integer, got {max_len!r}")
+    if default_ttl_s is not None and (
+        not isinstance(default_ttl_s, int)
+        or isinstance(default_ttl_s, bool)
+        or default_ttl_s <= 0
+    ):
+        raise ValueError(
+            f"default_ttl_s must be None or a positive integer, got {default_ttl_s!r}"
+        )
+
+
+_GLOB_META = ("\\", "*", "?", "[", "]")
+
+
+def _glob_escape(text: str) -> str:
+    """Escape Redis MATCH glob metacharacters so ``scan(prefix)`` matches the
+    literal prefix, mirroring MemoryEventStore's ``startswith`` semantics."""
+    return "".join("\\" + ch if ch in _GLOB_META else ch for ch in text)
+
+
 class EventStore(Protocol):
     """Durable, seq-guarded append-only event log per key (run-level TTL)."""
 
@@ -120,6 +150,7 @@ class MemoryEventStore:
         default_ttl_s: int | None = DEFAULT_RUN_TTL_S,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
+        _validate_store_options(max_len, default_ttl_s)
         self._max_len = max_len
         self._default_ttl_s = default_ttl_s
         self._monotonic = monotonic or _now
@@ -271,6 +302,7 @@ class RedisStreamEventStore:
         max_len: int = DEFAULT_MAX_EVENTS_PER_RUN,
         default_ttl_s: int = DEFAULT_RUN_TTL_S,
     ) -> None:
+        _validate_store_options(max_len, default_ttl_s)
         self._client = client
         self._prefix = prefix
         self._max_len = max_len
@@ -375,9 +407,14 @@ class RedisStreamEventStore:
     def scan(self, prefix: str) -> list[str]:
         """SCAN-based prefix listing (never KEYS). Returns LOGICAL keys — the
         namespace prefix is stripped so ``scan() -> delete() -> scan()`` is a
-        closed loop, exactly like MemoryEventStore."""
+        closed loop, exactly like MemoryEventStore.
+
+        ``prefix`` is matched LITERALLY (Memory ``startswith`` semantics):
+        glob metacharacters in the prefix are escaped so a tenant prefix like
+        ``tenant:*`` can never widen into a cross-tenant delete.
+        """
         try:
-            pattern = f"{self._prefix}{prefix}*"
+            pattern = f"{self._prefix}{_glob_escape(prefix)}*"
             cursor = 0
             found: list[str] = []
             while True:

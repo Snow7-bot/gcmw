@@ -13,6 +13,7 @@ Coverage:
 """
 
 import os
+import re
 import threading
 
 import pytest
@@ -26,6 +27,33 @@ from app.storage.event_store import (
     MemoryEventStore,
     RedisStreamEventStore,
 )
+
+
+class TestOptionValidation:
+    @pytest.mark.parametrize("ttl", [0, -1])
+    def test_memory_rejects_non_positive_ttl(self, ttl):
+        with pytest.raises(ValueError):
+            MemoryEventStore(default_ttl_s=ttl)
+
+    @pytest.mark.parametrize("ttl", [0, -1])
+    def test_redis_rejects_non_positive_ttl(self, ttl):
+        with pytest.raises(ValueError):
+            RedisStreamEventStore(FakeRedis(), default_ttl_s=ttl)
+
+    @pytest.mark.parametrize("max_len", [0, -1])
+    def test_memory_rejects_non_positive_max_len(self, max_len):
+        # max_len=-1 previously crashed with a non-contract KeyError
+        with pytest.raises(ValueError):
+            MemoryEventStore(max_len=max_len)
+
+    @pytest.mark.parametrize("max_len", [0, -1])
+    def test_redis_rejects_non_positive_max_len(self, max_len):
+        with pytest.raises(ValueError):
+            RedisStreamEventStore(FakeRedis(), max_len=max_len)
+
+    def test_none_ttl_is_explicitly_allowed(self):
+        MemoryEventStore(default_ttl_s=None)
+        RedisStreamEventStore(FakeRedis(), default_ttl_s=None)
 
 
 class TestMemoryStore:
@@ -123,6 +151,16 @@ class TestMemoryStore:
             store.delete(key)
         assert store.scan("run:") == []
 
+    def test_scan_prefix_is_literal_and_tenant_safe(self):
+        store = MemoryEventStore(default_ttl_s=None)
+        store.append("run:t1:a", 1, b"x")
+        store.append("run:t1:b", 1, b"x")
+        store.append("run:t2:c", 1, b"x")
+        assert sorted(store.scan("run:t1")) == ["run:t1:a", "run:t1:b"]
+        # glob-looking prefixes must match literally, never widen
+        assert store.scan("run:t1:*") == []
+        assert store.scan("run:t?") == []
+
     def test_scan_excludes_expired_keys(self):
         monotonic = {"now": 100.0}
         store = MemoryEventStore(default_ttl_s=None, monotonic=lambda: monotonic["now"])
@@ -133,11 +171,33 @@ class TestMemoryStore:
         assert store.scan("run:") == ["run:b"]
 
 
+def _glob_to_regex(pattern: str) -> re.Pattern:
+    """Translate a Redis MATCH glob (with backslash escapes) into a regex."""
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    return re.compile("".join(out))
+
+
 class FakeRedis:
     """Redis duck whose eval() executes the Lua compare-and-append twin.
 
     The twin runs under one lock, mirroring the atomicity of the server-side
     script — the concurrency probe therefore exercises the exact invariant.
+    scan() honours Redis glob semantics (including backslash escapes) so the
+    adapter's literal-prefix contract is exercised honestly.
     """
 
     def __init__(self) -> None:
@@ -171,6 +231,13 @@ class FakeRedis:
             self._ttls[name] = ttl_s
         return 1
 
+    def xadd_raw(self, name, fields):
+        """Direct XADD without the Lua guard (plants malformed entries for
+        fail-closed tests)."""
+        stream = self.streams.setdefault(name, [])
+        stream.append((self._next_id(name), dict(fields)))
+        return stream[-1][0]
+
     # -- client duck -----------------------------------------------------------
 
     def eval(self, script, numkeys, *keys_and_args):
@@ -203,8 +270,8 @@ class FakeRedis:
     def scan(self, cursor=0, match=None):
         if self.unavailable:
             raise ConnectionError("redis down")
-        prefix = match.split("*")[0]
-        return (0, sorted(k for k in self.streams if k.startswith(prefix)))
+        pattern = _glob_to_regex(match or "*")
+        return (0, sorted(k for k in self.streams if pattern.fullmatch(k)))
 
     def ttl(self, name):
         if self.unavailable:
@@ -295,6 +362,16 @@ class TestRedisStore:
     def test_default_caps_are_reasonable(self):
         assert DEFAULT_MAX_EVENTS_PER_RUN == 10_000
 
+    def test_scan_escapes_glob_metacharacters(self):
+        redis = FakeRedis()
+        store = RedisStreamEventStore(redis, default_ttl_s=None)
+        store.append("tenant:t1:a", 1, b"x")
+        store.append("tenant:t2:a", 1, b"x")
+        # literal prefix semantics: no cross-tenant widening via glob chars
+        assert sorted(store.scan("tenant:t1")) == ["tenant:t1:a"]
+        assert store.scan("tenant:*") == []  # '*' inside prefix is literal
+        assert store.scan("tenant:?") == []  # '?' inside prefix is literal
+
 
 @pytest.mark.skipif(
     not os.getenv("GCMW_REDIS_TEST_URL"),
@@ -333,22 +410,23 @@ class TestRealRedisIntegration:
         store.delete("test:ttl")
 
     def test_barrier_concurrent_same_seq_single_winner(self, live):
-        """N threads race to append seq=2 after seq=1 — exactly one wins."""
+        """N threads race to append seq=2 after seq=1 — exactly one winner and
+        every loser fails with CONFLICT_IDEMPOTENCY (never Unavailable)."""
         import threading
 
         live.append("test:race", 1, b"seed")
         barrier = threading.Barrier(6)
-        outcomes: list[bool] = []
+        outcomes: list[ErrorCode | None] = []
         lock = threading.Lock()
 
         def racer():
             barrier.wait()
             try:
                 live.append("test:race", 2, b"winner")
-            except EventStoreError:
-                outcome = False
+            except EventStoreError as exc:
+                outcome = exc.code
             else:
-                outcome = True
+                outcome = None
             with lock:
                 outcomes.append(outcome)
 
@@ -357,9 +435,31 @@ class TestRealRedisIntegration:
             t.start()
         for t in threads:
             t.join()
-        assert outcomes.count(True) == 1
-        assert outcomes.count(False) == 5
+        assert outcomes.count(None) == 1
+        assert outcomes.count(ErrorCode.CONFLICT_IDEMPOTENCY) == 5
         assert [seq for seq, _ in live.read("test:race")] == [1, 2]
+
+    def test_existing_entry_without_seq_fails_closed(self, live):
+        """A malformed newest entry must never be treated as an empty stream."""
+        import redis as redis_lib
+
+        name = live._name("test:malformed")
+        live._client.xadd(name, {"data": "corrupt"})  # no 'seq' field
+        assert isinstance(live._client, redis_lib.Redis)
+        with pytest.raises(EventStoreError) as exc:
+            live.append("test:malformed", 1, b"x")
+        assert exc.value.code is ErrorCode.CONFLICT_IDEMPOTENCY
+
+    def test_real_scan_literal_prefix_and_tenant_canary(self, live):
+        live.append("test:t1:a", 1, b"x")
+        live.append("test:t1:b", 1, b"x")
+        live.append("test:t2:c", 1, b"x")
+        assert sorted(live.scan("test:t1")) == ["test:t1:a", "test:t1:b"]
+        # glob characters in the prefix are literal: no cross-tenant widening
+        assert live.scan("test:t1:*") == []
+        assert live.scan("test:t?") == []
+        for key in live.scan("test:"):
+            live.delete(key)
 
     def test_real_ttl_expiry_removes_the_key(self, live):
         import time
