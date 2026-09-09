@@ -64,10 +64,20 @@ class TestMemoryStore:
         store.append("r", 1, b"a")
         store.append("r", 2, b"b")
         monotonic["now"] = 115.0
-        with pytest.raises(EventStoreError) as exc:
-            store.read("r")  # whole key gone — no per-event holes
-        assert exc.value.code is ErrorCode.NOT_FOUND_RUN
+        # expired keys behave exactly like missing keys (Redis semantics)
+        assert store.read("r") == ()
         assert store.next_seq("r") == 0
+        assert store.scan("r") == []
+
+    def test_expired_key_can_be_recreated_at_seq_1(self):
+        monotonic = {"now": 100.0}
+        store = MemoryEventStore(default_ttl_s=10, monotonic=lambda: monotonic["now"])
+        store.append("r", 1, b"a")
+        store.append("r", 2, b"b")
+        monotonic["now"] = 115.0
+        store.append("r", 1, b"fresh")  # expired -> fresh stream allowed
+        assert [seq for seq, _ in store.read("r")] == [1]
+        assert store.next_seq("r") == 2
 
     def test_sweep_expired_removes_keys(self):
         monotonic = {"now": 100.0}
@@ -104,14 +114,23 @@ class TestMemoryStore:
         assert seqs == list(range(1, 51))  # exactly once each, contiguous
         assert conflicts  # the loser writer only ever saw conflicts
 
-    def test_scan_and_delete(self):
+    def test_scan_delete_loop_returns_empty(self):
         store = MemoryEventStore(default_ttl_s=None)
         store.append("run:r1", 1, b"x")
         store.append("run:r2", 1, b"x")
-        store.append("other:k", 1, b"x")
         assert sorted(store.scan("run:")) == ["run:r1", "run:r2"]
-        store.delete("run:r1")
-        assert store.scan("run:") == ["run:r2"]
+        for key in store.scan("run:"):
+            store.delete(key)
+        assert store.scan("run:") == []
+
+    def test_scan_excludes_expired_keys(self):
+        monotonic = {"now": 100.0}
+        store = MemoryEventStore(default_ttl_s=None, monotonic=lambda: monotonic["now"])
+        store.append("run:a", 1, b"x")
+        store._streams["run:a"] = (monotonic["now"] + 5, store._streams["run:a"][1])
+        store.append("run:b", 1, b"x")  # no expiry (ttl None)
+        monotonic["now"] = 200.0
+        assert store.scan("run:") == ["run:b"]
 
 
 class FakeRedis:
@@ -260,16 +279,18 @@ class TestRedisStore:
         with pytest.raises(EventStoreUnavailable):
             store.read("r")
 
-    def test_scan_never_uses_keys(self):
+    def test_scan_returns_logical_keys_and_delete_loop_closes(self):
         redis = FakeRedis()
         store = RedisStreamEventStore(redis, default_ttl_s=None)
         store.append("run:r1", 1, b"x")
         store.append("run:r2", 1, b"x")
         found = store.scan("run:")
-        assert sorted(found) == [
-            "gcmw:run-events:run:r1",
-            "gcmw:run-events:run:r2",
-        ]
+        # no namespace prefix — delete() accepts what scan() returns
+        assert sorted(found) == ["run:r1", "run:r2"]
+        for key in found:
+            store.delete(key)
+        assert store.scan("run:") == []
+        assert redis.streams == {}  # physically cleared
 
     def test_default_caps_are_reasonable(self):
         assert DEFAULT_MAX_EVENTS_PER_RUN == 10_000
@@ -310,3 +331,64 @@ class TestRealRedisIntegration:
         store.append("test:ttl", 1, b"x")
         assert 0 < store.ttl("test:ttl") <= 60
         store.delete("test:ttl")
+
+    def test_barrier_concurrent_same_seq_single_winner(self, live):
+        """N threads race to append seq=2 after seq=1 — exactly one wins."""
+        import threading
+
+        live.append("test:race", 1, b"seed")
+        barrier = threading.Barrier(6)
+        outcomes: list[bool] = []
+        lock = threading.Lock()
+
+        def racer():
+            barrier.wait()
+            try:
+                live.append("test:race", 2, b"winner")
+            except EventStoreError:
+                outcome = False
+            else:
+                outcome = True
+            with lock:
+                outcomes.append(outcome)
+
+        threads = [threading.Thread(target=racer) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert outcomes.count(True) == 1
+        assert outcomes.count(False) == 5
+        assert [seq for seq, _ in live.read("test:race")] == [1, 2]
+
+    def test_real_ttl_expiry_removes_the_key(self, live):
+        import time
+
+        store = RedisStreamEventStore.from_url(
+            os.environ["GCMW_REDIS_TEST_URL"], default_ttl_s=1
+        )
+        store.append("test:expiry", 1, b"x")
+        assert store.read("test:expiry") != ()
+        time.sleep(1.5)
+        assert store.read("test:expiry") == ()  # whole key actually expired
+        assert store.next_seq("test:expiry") == 0
+        assert "test:expiry" not in store.scan("test:")
+
+    def test_real_scan_delete_loop(self, live):
+        live.append("test:sd1", 1, b"x")
+        live.append("test:sd2", 1, b"x")
+        found = live.scan("test:sd")
+        assert sorted(found) == ["test:sd1", "test:sd2"]
+        for key in found:
+            live.delete(key)
+        assert live.scan("test:sd") == []
+
+    def test_hard_capacity_is_exact(self, live):
+        store = RedisStreamEventStore.from_url(
+            os.environ["GCMW_REDIS_TEST_URL"], max_len=3, default_ttl_s=None
+        )
+        for seq in range(1, 6):
+            store.append("test:cap", seq, b"x")
+        # exact MAXLEN '=' — never more than the promised hard cap
+        assert [seq for seq, _ in store.read("test:cap")] == [3, 4, 5]
+        store.delete("test:cap")
