@@ -1,27 +1,25 @@
-"""Knowledge store with candidate/production zoning (issue #56A — tenancy rework).
+"""Knowledge store with candidate/production zoning (issue #56A — tenancy & audit rework).
 
-Reviewer-driven tenancy contract (2026-09 round):
-- the storage key is ``(tenant_id, source_id)`` — the same ``source_id`` may
-  exist independently in different tenants (no global key collisions, no
-  cross-tenant supersede/version bleed);
+Reviewer-driven contract (2026-09 round):
+- storage key is ``(tenant_id, source_id)``; the same ``source_id`` may exist
+  independently in different tenants;
 - every operation REQUIRES a trusted :class:`~app.contracts.common.TenantContext`
-  as its first argument; raw ``tenant_id`` strings are never accepted from
-  callers, so a model-supplied parameter can never widen or redirect a query
-  (the #57 tool layer is re-based onto this contract after #68 merges);
-- ``add_candidate`` refuses an item whose ``tenant_id`` differs from the
-  trusted context (defense in depth: the context is the authority);
-- lookups are tenant-scoped: another tenant's ``source_id`` reads as absent.
-
-Existing governance semantics are unchanged:
-- every item enters as a candidate (draft/in_review);
-- only APPROVED + in-window items of the calling tenant are visible through
-  the production view (the only view #53 RAG is allowed to query);
-- approvals are versioned per tenant; re-approval supersedes the previous
-  approved version (kept in history); revoke removes an item from the
-  production view but keeps the audit record;
-- ``content_hash`` is derived from content (sha256); no raw fingerprints or
-  question text are stored;
-- the clock is injectable so validity-window expiry is testable.
+  (raw tenant/session strings are never accepted), so model-supplied payloads
+  cannot widen or redirect a query — real trust is injected by the upstream
+  authentication / ToolGateway boundary, this layer only consumes it;
+- candidates enter through :class:`~app.contracts.knowledge.CandidateInput` —
+  a content-only DTO. Lifecycle fields (review_status, reviewed_by/at,
+  valid_from/to, knowledge_version, superseded_by, created_at) are produced by
+  the store and can never be injected by upstream data;
+- approvals take a strict :class:`ApprovalDecision` (AwareDatetime enforced by
+  the contract) and new records are built through full ``model_validate`` so
+  validation is never bypassed by ``model_copy(update=...)``;
+- revocations take a :class:`RevocationDecision` (authenticated actor + reason
+  + optional evidence reference) and append an immutable
+  :class:`KnowledgeAuditEvent`; the revoked record KEEPS its version so the
+  audit chain stays traceable;
+- production view = approved + in-window + not superseded + complete approval
+  metadata, tenant-scoped (the only view #53 RAG may query).
 """
 
 from __future__ import annotations
@@ -31,7 +29,15 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from app.contracts.common import TenantContext
-from app.contracts.knowledge import KnowledgeItem, ReviewStatus
+from app.contracts.knowledge import (
+    ApprovalDecision,
+    AuditAction,
+    CandidateInput,
+    KnowledgeAuditEvent,
+    KnowledgeItem,
+    ReviewStatus,
+    RevocationDecision,
+)
 
 #: storage key — tenancy is part of the identity, never a filter
 Key = tuple[str, str]
@@ -51,6 +57,12 @@ def _tenant(context: TenantContext) -> str:
     return context.tenant_id
 
 
+def _payload(item: KnowledgeItem) -> dict:
+    """Contract payload for revalidation: computed fields (content_hash) are
+    derived, not input, so they must not be fed back into ``model_validate``."""
+    return item.model_dump(exclude={"content_hash"})
+
+
 def _key(context: TenantContext, source_id: str) -> Key:
     if not source_id or not source_id.strip():
         raise KnowledgeGovernanceError("source_id is required")
@@ -63,42 +75,87 @@ class KnowledgeStore:
         self._lock = threading.RLock()
         self._items: dict[Key, KnowledgeItem] = {}  # (tenant, source_id) -> latest
         self._history: dict[Key, list[KnowledgeItem]] = {}
+        self._audit: dict[Key, list[KnowledgeAuditEvent]] = {}
 
     def now(self) -> datetime:
         return self._clock()
 
+    # -- audit -----------------------------------------------------------------
+
+    def _append_audit(
+        self,
+        key: Key,
+        action: AuditAction,
+        actor: str,
+        *,
+        knowledge_version: str | None = None,
+        reason: str = "",
+        evidence_ref: str = "",
+    ) -> KnowledgeAuditEvent:
+        """Append one immutable audit event (tenant+source scoped, no content
+        body — identifiers, versions and the stated reason/evidence only)."""
+        event = KnowledgeAuditEvent(
+            at=self.now(),
+            tenant_id=key[0],
+            source_id=key[1],
+            action=action,
+            actor=actor or "system",
+            knowledge_version=knowledge_version,
+            reason=reason,
+            evidence_ref=evidence_ref,
+        )
+        self._audit.setdefault(key, []).append(event)
+        return event
+
+    def audit_trail(
+        self, context: TenantContext, source_id: str
+    ) -> list[KnowledgeAuditEvent]:
+        """Immutable audit history of one item, tenant-scoped."""
+        key = _key(context, source_id)
+        with self._lock:
+            if (
+                key not in self._audit
+                and key not in self._items
+                and key not in self._history
+            ):
+                # unknown to this tenant => absent (never another tenant's data)
+                raise KnowledgeGovernanceError(
+                    f"source {source_id!r} not found for this tenant"
+                )
+            return [e.model_copy(deep=True) for e in self._audit.get(key, [])]
+
     # -- candidate zone --------------------------------------------------------
 
     def add_candidate(
-        self, context: TenantContext, item: KnowledgeItem
+        self,
+        context: TenantContext,
+        candidate: CandidateInput,
+        *,
+        actor: str = "",
     ) -> KnowledgeItem:
-        """Enter the candidate zone under the trusted tenant.
-
-        Duplicate ``(tenant, source_id)`` is rejected until the previous item
-        is revoked; an item whose ``tenant_id`` contradicts the context is
-        refused outright.
-        """
-        key = _key(context, item.source_id)
+        """Enter the candidate zone. The DTO carries content only; tenant and
+        all lifecycle fields are produced here. Duplicate ``(tenant,
+        source_id)`` is rejected until the previous item is revoked."""
+        key = _key(context, candidate.source_id)
         with self._lock:
-            if item.tenant_id != key[0]:
-                raise KnowledgeGovernanceError(
-                    "item tenant_id does not match the trusted tenant context"
-                )
             if key in self._items:
                 raise KnowledgeGovernanceError(
-                    f"source {item.source_id!r} already exists for this tenant"
+                    f"source {candidate.source_id!r} already exists for this tenant"
                 )
-            if item.review_status not in (ReviewStatus.DRAFT, ReviewStatus.IN_REVIEW):
-                raise KnowledgeGovernanceError(
-                    "new items must start as draft/in_review candidates"
-                )
-            stored = item.model_copy(deep=True)
-            # internal state and the returned snapshot are separate copies:
-            # caller mutation can never corrupt store state (or vice versa)
-            self._items[key] = stored.model_copy(deep=True)
-            return stored
+            item = KnowledgeItem.model_validate(
+                {
+                    **candidate.model_dump(),
+                    "tenant_id": key[0],
+                    "review_status": ReviewStatus.DRAFT,
+                }
+            )
+            self._items[key] = item.model_copy(deep=True)
+            self._append_audit(key, AuditAction.CANDIDATE_ADDED, actor)
+            return item
 
-    def mark_in_review(self, context: TenantContext, source_id: str) -> KnowledgeItem:
+    def mark_in_review(
+        self, context: TenantContext, source_id: str, *, actor: str = ""
+    ) -> KnowledgeItem:
         key = _key(context, source_id)
         with self._lock:
             item = self._require(key)
@@ -108,10 +165,11 @@ class KnowledgeStore:
                 raise KnowledgeGovernanceError(
                     f"source {source_id!r} is APPROVED — revoke before re-review"
                 )
-            updated = item.model_copy(
-                deep=True, update={"review_status": ReviewStatus.IN_REVIEW}
+            updated = KnowledgeItem.model_validate(
+                {**_payload(item), "review_status": ReviewStatus.IN_REVIEW}
             )
             self._items[key] = updated.model_copy(deep=True)
+            self._append_audit(key, AuditAction.IN_REVIEW, actor)
             return updated
 
     def list_candidates(self, context: TenantContext) -> list[KnowledgeItem]:
@@ -130,18 +188,15 @@ class KnowledgeStore:
         self,
         context: TenantContext,
         source_id: str,
-        reviewer: str,
-        *,
-        valid_from: datetime | None = None,
-        valid_to: datetime | None = None,
+        decision: ApprovalDecision,
     ) -> KnowledgeItem:
-        """Clinical approval within the calling tenant. Produces the next
-        immutable knowledge_version; any previous approved version of the same
-        ``(tenant, source_id)`` is superseded (kept in history)."""
-        if not reviewer or not reviewer.strip():
-            raise KnowledgeGovernanceError("reviewer is required")
-        if valid_from is not None and valid_to is not None and valid_from >= valid_to:
-            raise KnowledgeGovernanceError("valid_from must precede valid_to")
+        """Clinical approval under an authenticated reviewer identity.
+
+        ``decision`` carries aware datetimes (naive/ill-ordered windows are
+        rejected by the contract BEFORE any state change) and the reviewer is
+        injected upstream, never taken from model-controlled payloads. The new
+        record is built through ``model_validate`` so every field is re-checked.
+        """
         key = _key(context, source_id)
         with self._lock:
             item = self._require(key)
@@ -155,32 +210,39 @@ class KnowledgeStore:
                 1 for h in history if h.review_status is ReviewStatus.APPROVED
             )
             version_no = approved_count + 1
+            version = f"{source_id}-v{version_no}"
             if prior.review_status is ReviewStatus.APPROVED:
-                # record which version superseded the moved entry
-                superseded = prior.model_copy(
-                    deep=True,
-                    update={"superseded_by": f"{source_id}-v{version_no}"},
+                superseded = KnowledgeItem.model_validate(
+                    {**_payload(prior), "superseded_by": version}
                 )
                 history[-1] = superseded
-            approved = item.model_copy(
-                deep=True,
-                update={
+            approved = KnowledgeItem.model_validate(
+                {
+                    **_payload(item),
                     "review_status": ReviewStatus.APPROVED,
-                    "reviewed_by": reviewer,
+                    "reviewed_by": decision.reviewer,
                     "reviewed_at": self.now(),
-                    "valid_from": valid_from,
-                    "valid_to": valid_to,
-                    "knowledge_version": f"{source_id}-v{version_no}",
-                },
+                    "valid_from": decision.valid_from,
+                    "valid_to": decision.valid_to,
+                    "knowledge_version": version,
+                    "superseded_by": None,
+                }
             )
             self._items[key] = approved.model_copy(deep=True)
+            self._append_audit(
+                key,
+                AuditAction.APPROVED,
+                decision.reviewer,
+                knowledge_version=version,
+                evidence_ref=decision.evidence_ref,
+            )
             return approved
 
     # -- production view ---------------------------------------------------------
 
     def production_items(self, context: TenantContext) -> list[KnowledgeItem]:
-        """APPROVED + in-window items of the calling tenant. This is the only
-        view #53 RAG may query."""
+        """APPROVED + in-window + not superseded + complete approval metadata,
+        for the calling tenant only. This is the only view #53 RAG may query."""
         tenant_id = _tenant(context)
         with self._lock:
             return [
@@ -204,27 +266,32 @@ class KnowledgeStore:
             return [item.model_copy(deep=True) for item in history]
 
     def revoke(
-        self, context: TenantContext, source_id: str, reason: str
+        self,
+        context: TenantContext,
+        source_id: str,
+        decision: RevocationDecision,
     ) -> KnowledgeItem:
-        """Remove the tenant's item from the production view immediately; it
-        stays as an auditable revoked record and the source_id can be
-        re-entered within the same tenant."""
-        if not reason or not reason.strip():
-            raise KnowledgeGovernanceError("revocation reason is required")
+        """Revoke under an authenticated actor: the item leaves the production
+        view immediately; the prior version and the revocation record (WITH its
+        knowledge_version) plus an immutable audit event preserve the chain."""
         key = _key(context, source_id)
         with self._lock:
             item = self._require(key)
-            revoked = item.model_copy(
-                deep=True,
-                update={
-                    "review_status": ReviewStatus.REVOKED,
-                    "knowledge_version": None,
-                },
+            revoked = KnowledgeItem.model_validate(
+                {**_payload(item), "review_status": ReviewStatus.REVOKED}
             )
             history = self._history.setdefault(key, [])
             history.append(item.model_copy(deep=True))
             self._items.pop(key, None)
             history.append(revoked.model_copy(deep=True))
+            self._append_audit(
+                key,
+                AuditAction.REVOKED,
+                decision.actor,
+                knowledge_version=item.knowledge_version,
+                reason=decision.reason,
+                evidence_ref=decision.evidence_ref,
+            )
             return revoked
 
     def _require(self, key: Key) -> KnowledgeItem:
