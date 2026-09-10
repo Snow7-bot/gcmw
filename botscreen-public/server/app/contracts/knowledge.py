@@ -153,21 +153,20 @@ class ApprovalDecision(BaseModel):
     """Strict, frozen approval input.
 
     - reviewer is a trimmed non-empty authenticated identity;
-    - ``at`` is the single validated UTC operation time used for BOTH the
-      record's ``reviewed_at`` and the audit event (no second clock read);
-    - aware UTC datetimes are contract-enforced, so a naive or non-UTC window
-      can never reach the store.
+    - NO operation timestamp is accepted here: audit time is produced by the
+      store's trusted server clock (``extra="forbid"`` rejects an ``at``
+      field), so a caller can neither backdate nor postdate an approval;
+    - the clinical validity window must be aware UTC (contract-enforced).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     reviewer: NonEmptyStr
-    at: AwareDatetime
     valid_from: AwareDatetime
     valid_to: AwareDatetime | None = None
     evidence_ref: str = Field("", max_length=256)
 
-    @field_validator("at", "valid_from", "valid_to")
+    @field_validator("valid_from", "valid_to")
     @classmethod
     def _utc_only(cls, value):
         return _require_utc(value)
@@ -180,20 +179,19 @@ class ApprovalDecision(BaseModel):
 
 
 class RevocationDecision(BaseModel):
-    """Strict, frozen revocation input: trimmed non-empty actor + reason,
-    optional evidence reference and the single UTC operation time."""
+    """Strict, frozen revocation input: trimmed non-empty actor + reason and
+    an optional evidence reference.
+
+    Like approvals, revocation carries NO timestamp — the revocation time is
+    produced by the store's trusted server clock, so audit time cannot be
+    backdated by the caller (``extra="forbid"`` rejects ``at``).
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     actor: NonEmptyStr
     reason: ReasonStr
-    at: AwareDatetime
     evidence_ref: str = Field("", max_length=256)
-
-    @field_validator("at")
-    @classmethod
-    def _utc_only(cls, value):
-        return _require_utc(value)
 
 
 class AuditAction(str, Enum):

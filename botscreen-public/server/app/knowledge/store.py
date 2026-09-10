@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.contracts.common import TenantContext
 from app.contracts.knowledge import (
@@ -81,6 +81,17 @@ class KnowledgeStore:
     def now(self) -> datetime:
         return self._clock()
 
+    def _now_utc(self) -> datetime:
+        """Trusted operation time: read the injected clock ONCE and require a
+        tz-aware UTC instant. A naive or non-UTC clock raises BEFORE any state,
+        history or audit write — audit time can never be caller-supplied."""
+        value = self._clock()
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise KnowledgeGovernanceError(
+                "server clock must return a timezone-aware UTC datetime"
+            )
+        return value
+
     # -- audit -----------------------------------------------------------------
 
     def _build_audit(
@@ -89,7 +100,7 @@ class KnowledgeStore:
         action: AuditAction,
         actor: str,
         *,
-        at: datetime | None = None,
+        at: datetime,
         knowledge_version: str | None = None,
         reason: str | None = None,
         evidence_ref: str = "",
@@ -97,7 +108,7 @@ class KnowledgeStore:
         """Construct and validate one audit event (no mutation). Actor is an
         explicit service identity — there is no implicit default."""
         return KnowledgeAuditEvent(
-            at=at or self.now(),
+            at=at,
             tenant_id=key[0],
             source_id=key[1],
             action=action,
@@ -141,14 +152,18 @@ class KnowledgeStore:
                 raise KnowledgeGovernanceError(
                     f"source {candidate.source_id!r} already exists for this tenant"
                 )
+            operation_at = self._now_utc()
             item = KnowledgeItem.model_validate(
                 {
                     **candidate.model_dump(),
                     "tenant_id": key[0],
                     "review_status": ReviewStatus.DRAFT,
+                    "created_at": operation_at,
                 }
             )
-            event = self._build_audit(key, AuditAction.CANDIDATE_ADDED, actor)
+            event = self._build_audit(
+                key, AuditAction.CANDIDATE_ADDED, actor, at=operation_at
+            )
             # -- atomic commit --
             self._items[key] = item.model_copy(deep=True)
             self._audit.setdefault(key, []).append(event)
@@ -166,10 +181,18 @@ class KnowledgeStore:
                 raise KnowledgeGovernanceError(
                     f"source {source_id!r} is APPROVED — revoke before re-review"
                 )
+            if item.review_status is ReviewStatus.IN_REVIEW:
+                # already in review: conflict, and never a duplicate audit event
+                raise KnowledgeGovernanceError(
+                    f"source {source_id!r} is already IN_REVIEW"
+                )
+            operation_at = self._now_utc()
             updated = KnowledgeItem.model_validate(
                 {**_payload(item), "review_status": ReviewStatus.IN_REVIEW}
             )
-            event = self._build_audit(key, AuditAction.IN_REVIEW, actor)
+            event = self._build_audit(
+                key, AuditAction.IN_REVIEW, actor, at=operation_at
+            )
             # -- atomic commit --
             self._items[key] = updated.model_copy(deep=True)
             self._audit.setdefault(key, []).append(event)
@@ -213,12 +236,13 @@ class KnowledgeStore:
                 1 for h in history if h.review_status is ReviewStatus.APPROVED
             )
             version = f"{source_id}-v{approved_count + 1}"
+            operation_at = self._now_utc()  # trusted: never caller-supplied
             approved = KnowledgeItem.model_validate(
                 {
                     **_payload(item),
                     "review_status": ReviewStatus.APPROVED,
                     "reviewed_by": decision.reviewer,
-                    "reviewed_at": decision.at,
+                    "reviewed_at": operation_at,
                     "valid_from": decision.valid_from,
                     "valid_to": decision.valid_to,
                     "knowledge_version": version,
@@ -229,7 +253,7 @@ class KnowledgeStore:
                 key,
                 AuditAction.APPROVED,
                 decision.reviewer,
-                at=decision.at,
+                at=operation_at,
                 knowledge_version=version,
                 evidence_ref=decision.evidence_ref,
             )
@@ -278,6 +302,7 @@ class KnowledgeStore:
         key = _key(context, source_id)
         with self._lock:
             item = self._require(key)
+            operation_at = self._now_utc()
             revoked = KnowledgeItem.model_validate(
                 {**_payload(item), "review_status": ReviewStatus.REVOKED}
             )
@@ -285,7 +310,7 @@ class KnowledgeStore:
                 key,
                 AuditAction.REVOKED,
                 decision.actor,
-                at=decision.at,
+                at=operation_at,
                 knowledge_version=item.knowledge_version,
                 reason=decision.reason,
                 evidence_ref=decision.evidence_ref,

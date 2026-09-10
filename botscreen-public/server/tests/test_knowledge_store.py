@@ -76,7 +76,6 @@ def _approval(
     now = store.now()
     return ApprovalDecision(
         reviewer=reviewer,
-        at=now,
         valid_from=now,
         valid_to=now + timedelta(minutes=minutes_valid),
         evidence_ref=evidence_ref,
@@ -89,9 +88,7 @@ def _revocation(
     reason: str = "临床复核发现过期",
     evidence_ref: str = "",
 ) -> RevocationDecision:
-    return RevocationDecision(
-        actor=actor, reason=reason, at=store.now(), evidence_ref=evidence_ref
-    )
+    return RevocationDecision(actor=actor, reason=reason, evidence_ref=evidence_ref)
 
 
 def _published(store, t1, source_id: str = "faq-1", actor: str = "owner-1"):
@@ -192,11 +189,11 @@ class TestWhitespaceIdentities:
     def test_approval_reviewer_must_be_trimmed_non_empty(self, store, reviewer):
         now = store.now()
         if reviewer.strip():
-            decision = ApprovalDecision(reviewer=reviewer, at=now, valid_from=now)
+            decision = ApprovalDecision(reviewer=reviewer, valid_from=now)
             assert decision.reviewer == "dr-li"  # trimmed by the contract
         else:
             with pytest.raises(ValidationError):
-                ApprovalDecision(reviewer=reviewer, at=now, valid_from=now)
+                ApprovalDecision(reviewer=reviewer, valid_from=now)
 
     @pytest.mark.parametrize(
         ("actor", "reason"),
@@ -206,14 +203,14 @@ class TestWhitespaceIdentities:
         self, store, actor, reason
     ):
         with pytest.raises(ValidationError):
-            RevocationDecision(actor=actor, reason=reason, at=store.now())
+            RevocationDecision(actor=actor, reason=reason)
 
     def test_whitespace_reviewer_cannot_reach_production(self, store, t1):
         store.add_candidate(t1, _candidate(), actor="owner-1")
         store.mark_in_review(t1, "faq-1", actor="owner-1")
         now = store.now()
         with pytest.raises(ValidationError):
-            ApprovalDecision(reviewer="   ", at=now, valid_from=now)
+            ApprovalDecision(reviewer="   ", valid_from=now)
         assert store.production_items(t1) == []
         assert store.get(t1, "faq-1").review_status is ReviewStatus.IN_REVIEW
 
@@ -357,6 +354,15 @@ class TestSingleTransitionPublish:
             AuditAction.APPROVED,
         ]
 
+    def test_repeated_mark_in_review_conflicts_without_duplicate_audit(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        trail_before = store.audit_trail(t1, "faq-1")
+        with pytest.raises(KnowledgeGovernanceError, match="already IN_REVIEW"):
+            store.mark_in_review(t1, "faq-1", actor="owner-1")
+        assert store.audit_trail(t1, "faq-1") == trail_before
+        assert len(trail_before) == 2  # candidate.added + one in_review
+
     def test_mark_in_review_on_approved_requires_revoke_first(self, store, t1):
         _published(store, t1)
         with pytest.raises(KnowledgeGovernanceError, match="revoke before re-review"):
@@ -365,30 +371,25 @@ class TestSingleTransitionPublish:
 
 
 class TestStrictApprovalContract:
-    def test_naive_datetime_rejected_by_contract(self):
+    def test_naive_validity_window_rejected_by_contract(self):
         with pytest.raises(ValidationError):
             ApprovalDecision.model_validate(
                 {
                     "reviewer": "dr-li",
-                    "at": datetime.fromisoformat("2026-01-01T00:00:00"),
                     "valid_from": datetime.fromisoformat("2026-01-01T00:00:00"),
                 }
             )
 
-    def test_non_utc_offset_rejected(self):
+    def test_non_utc_validity_window_rejected(self):
         plus8 = timezone(timedelta(hours=8))
-        now = datetime.now(plus8)
         with pytest.raises(ValidationError):
-            ApprovalDecision(reviewer="dr-li", at=now, valid_from=now)
-        with pytest.raises(ValidationError):
-            RevocationDecision(actor="dr-li", reason="x", at=now)
+            ApprovalDecision(reviewer="dr-li", valid_from=datetime.now(plus8))
 
     def test_ill_ordered_window_rejected(self, store):
         now = store.now()
         with pytest.raises(ValidationError):
             ApprovalDecision(
                 reviewer="dr-li",
-                at=now,
                 valid_from=now,
                 valid_to=now - timedelta(minutes=1),
             )
@@ -399,21 +400,11 @@ class TestStrictApprovalContract:
             ApprovalDecision.model_validate(
                 {
                     "reviewer": "dr-li",
-                    "at": datetime.fromisoformat("2026-01-01T00:00:00"),
                     "valid_from": datetime.fromisoformat("2026-01-01T00:00:00"),
                 }
             )
         assert store.production_items(t1) == []
         assert store._history == {}
-
-    def test_decision_and_audit_share_one_operation_time(self, store, t1):
-        store.add_candidate(t1, _candidate(), actor="owner-1")
-        store.mark_in_review(t1, "faq-1", actor="owner-1")
-        decision = _approval(store, evidence_ref="EV-7")
-        approved = store.approve(t1, "faq-1", decision)
-        event = store.audit_trail(t1, "faq-1")[-1]
-        assert approved.reviewed_at == decision.at == event.at
-        assert event.actor == "dr-li" and event.evidence_ref == "EV-7"
 
     def test_decisions_are_frozen(self, store):
         decision = _approval(store)
@@ -422,6 +413,103 @@ class TestStrictApprovalContract:
         revocation = _revocation(store)
         with pytest.raises(ValidationError):
             revocation.reason = "changed"
+
+
+class TestTrustedOperationTime:
+    """Audit time must come from the server clock — never from the caller."""
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"at": "2000-01-01T00:00:00+00:00"},
+            {"reviewed_at": "2000-01-01T00:00:00+00:00"},
+            {"operation_at": "2000-01-01T00:00:00+00:00"},
+        ],
+    )
+    def test_approval_decision_cannot_carry_a_timestamp(self, extra):
+        payload = {
+            "reviewer": "dr-li",
+            "valid_from": datetime.now(timezone.utc),
+            **extra,
+        }
+        with pytest.raises(ValidationError):
+            ApprovalDecision.model_validate(payload)
+
+    def test_revocation_decision_cannot_carry_a_timestamp(self):
+        with pytest.raises(ValidationError):
+            RevocationDecision.model_validate(
+                {
+                    "actor": "dr-li",
+                    "reason": "x",
+                    "at": "1999-01-01T00:00:00+00:00",
+                }
+            )
+
+    def test_cannot_backdate_or_postdate_approval(self, store, t1, clock):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        # the store clock is the single authority: move it, not the decision
+        clock.advance(days=2)
+        approved = store.approve(t1, "faq-1", _approval(store))
+        event = store.audit_trail(t1, "faq-1")[-1]
+        assert approved.reviewed_at == clock.value == event.at
+        assert approved.reviewed_at.year != 2000  # no caller-supplied backdate
+
+    def test_cannot_backdate_revocation(self, store, t1, clock):
+        _published(store, t1)
+        clock.advance(days=3)
+        store.revoke(t1, "faq-1", _revocation(store))
+        event = store.audit_trail(t1, "faq-1")[-1]
+        assert event.at == clock.value
+        assert event.at.year != 1999
+
+    def test_approval_record_and_audit_share_the_server_instant(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        approved = store.approve(t1, "faq-1", _approval(store, evidence_ref="EV-7"))
+        event = store.audit_trail(t1, "faq-1")[-1]
+        assert approved.reviewed_at == event.at
+        assert event.actor == "dr-li" and event.evidence_ref == "EV-7"
+
+    def test_candidate_created_at_equals_its_audit_time(self, store, t1):
+        item = store.add_candidate(t1, _candidate(), actor="owner-1")
+        event = store.audit_trail(t1, "faq-1")[0]
+        assert item.created_at == event.at
+
+    @pytest.mark.parametrize(
+        "bad_clock",
+        [
+            lambda: datetime.now(timezone.utc).replace(tzinfo=None),  # naive
+            lambda: datetime.now(timezone(timedelta(hours=8))),  # non-UTC
+        ],
+    )
+    def test_invalid_server_clock_fails_before_any_write(self, t1, bad_clock):
+        store = KnowledgeStore(clock=bad_clock)
+        with pytest.raises(KnowledgeGovernanceError):
+            store.add_candidate(t1, _candidate(), actor="owner-1")
+        assert store._items == {} and store._history == {} and store._audit == {}
+
+    def test_invalid_clock_blocks_approve_and_revoke_without_writes(self, clock, t1):
+        store = KnowledgeStore(clock=clock)
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        before = (
+            store.get(t1, "faq-1").model_dump(),
+            len(store.audit_trail(t1, "faq-1")),
+            store._history,
+        )
+        decision = _approval(store)  # built while the clock is still valid
+        store._clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+        with pytest.raises(KnowledgeGovernanceError):
+            store.approve(t1, "faq-1", decision)
+        assert store.get(t1, "faq-1").review_status is ReviewStatus.IN_REVIEW
+        assert store._history == {}
+        after = (
+            store.get(t1, "faq-1").model_dump(),
+            len(store.audit_trail(t1, "faq-1")),
+            store._history,
+        )
+        assert before == after
 
 
 class TestRevocationAudit:
