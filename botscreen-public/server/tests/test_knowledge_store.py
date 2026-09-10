@@ -489,6 +489,59 @@ class TestTrustedOperationTime:
             store.add_candidate(t1, _candidate(), actor="owner-1")
         assert store._items == {} and store._history == {} and store._audit == {}
 
+    def test_production_query_uses_one_trusted_clock_snapshot(self, clock, t1):
+        store = KnowledgeStore(clock=clock)
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        store.approve(t1, "faq-1", _approval(store))
+        store.add_candidate(t1, _candidate("faq-2"), actor="owner-1")
+        reads = {"count": 0}
+        real_clock = store._clock
+
+        def counting_clock():
+            reads["count"] += 1
+            return real_clock()
+
+        store._clock = counting_clock
+        assert [i.source_id for i in store.production_items(t1)] == ["faq-1"]
+        assert reads["count"] == 1  # one snapshot for the whole view
+
+    @pytest.mark.parametrize(
+        "bad_clock",
+        [
+            lambda: datetime.now(timezone.utc).replace(tzinfo=None),  # naive
+            lambda: datetime.now(timezone(timedelta(hours=8))),  # non-UTC
+        ],
+    )
+    def test_production_query_rejects_invalid_clock_structurally(self, bad_clock, t1):
+        store = KnowledgeStore(clock=bad_clock)
+        with pytest.raises(KnowledgeGovernanceError):
+            store.production_items(t1)  # structured, never a raw TypeError
+
+    def test_invalid_clock_blocks_revoke_without_writes(self, clock, t1):
+        store = KnowledgeStore(clock=clock)
+        _published(store, t1)
+        before = (
+            store.get(t1, "faq-1").model_dump(),
+            [i.model_dump() for i in store.history(t1, "faq-1")],
+            len(store.audit_trail(t1, "faq-1")),
+        )
+        decision = _revocation(store)
+        store._clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+        with pytest.raises(KnowledgeGovernanceError):
+            store.revoke(t1, "faq-1", decision)
+        assert store.get(t1, "faq-1").review_status is ReviewStatus.APPROVED
+        assert store._history == {}
+        after = (
+            store.get(t1, "faq-1").model_dump(),
+            [i.model_dump() for i in store.history(t1, "faq-1")],
+            len(store.audit_trail(t1, "faq-1")),
+        )
+        assert before == after
+        assert store._items[t1.tenant_id, "faq-1"].review_status is (
+            ReviewStatus.APPROVED
+        )  # still published, nothing revoked
+
     def test_invalid_clock_blocks_approve_and_revoke_without_writes(self, clock, t1):
         store = KnowledgeStore(clock=clock)
         store.add_candidate(t1, _candidate(), actor="owner-1")

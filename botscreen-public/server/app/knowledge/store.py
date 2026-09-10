@@ -220,8 +220,9 @@ class KnowledgeStore:
 
         Any other state (draft, already approved, revoked) conflicts, so
         replays and concurrent approvals can never mint extra versions. The
-        record and its audit event share ``decision.at`` (one UTC instant) and
-        are committed together.
+        record and its audit event share ONE ``operation_at`` produced by
+        ``_now_utc()`` inside the lock — the caller supplies no timestamp at
+        all — and both are committed together.
         """
         key = _key(context, source_id)
         with self._lock:
@@ -266,13 +267,20 @@ class KnowledgeStore:
 
     def production_items(self, context: TenantContext) -> list[KnowledgeItem]:
         """APPROVED + in-window + not superseded + complete approval metadata,
-        for the calling tenant only. This is the only view #53 RAG may query."""
+        for the calling tenant only. This is the only view #53 RAG may query.
+
+        The trusted clock is read ONCE inside the lock and that single snapshot
+        is applied to every record, so a naive/non-UTC clock fails with a
+        structured governance error (never a raw comparison TypeError) and all
+        rows are judged against the same instant.
+        """
         tenant_id = _tenant(context)
         with self._lock:
+            operation_at = self._now_utc()
             return [
                 item.model_copy(deep=True)
                 for (t, _), item in self._items.items()
-                if t == tenant_id and item.is_production_ready(self.now())
+                if t == tenant_id and item.is_production_ready(operation_at)
             ]
 
     def get(self, context: TenantContext, source_id: str) -> KnowledgeItem:
