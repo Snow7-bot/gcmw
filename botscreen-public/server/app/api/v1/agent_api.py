@@ -27,9 +27,18 @@ from datetime import datetime, timedelta, timezone
 from typing import ClassVar
 
 from fastapi import APIRouter, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 from app.api.v1.auth import DevicePrincipal, PrincipalDep
 from app.api.v1.errors import AppError
+from app.api.v1.sse_stream import (
+    DEFAULT_HEARTBEAT_MS,
+    MAX_HEARTBEAT_MS,
+    MIN_HEARTBEAT_MS,
+)
+from app.api.v1.sse_stream import (
+    stream_run_events as _stream_run_events,
+)
 from app.contracts.api import (
     CreateRunRequest,
     CreateSessionRequest,
@@ -447,6 +456,40 @@ async def get_run_events(
         "next_seq": page.next_seq,
         "events": [e.model_dump(mode="json") for e in page.events],
     }
+
+
+@router.get("/agent/runs/{run_id}/events/stream")
+async def stream_run_events(
+    request: Request,
+    run_id: str,
+    principal: DevicePrincipal = PrincipalDep,
+    after_seq: int = Query(0, ge=0),
+    heartbeat_ms: int = Query(
+        DEFAULT_HEARTBEAT_MS, ge=MIN_HEARTBEAT_MS, le=MAX_HEARTBEAT_MS
+    ),
+    cancel_on_disconnect: bool = Query(True),
+) -> StreamingResponse:
+    """text/event-stream upgrade: Last-Event-ID resume, heartbeat, terminal
+    uniqueness and disconnect-cancellation (single lifecycle authority)."""
+    # authorization/ownership is enforced BEFORE the response starts, so an
+    # unknown/foreign run yields the normal error envelope (404/403)
+    SERVICE.events(principal, run_id, after_seq)
+    return StreamingResponse(
+        _stream_run_events(
+            SERVICE,
+            principal,
+            run_id,
+            after_seq=after_seq,
+            last_event_id=request.headers.get("last-event-id"),
+            heartbeat_ms=heartbeat_ms,
+            cancel_on_disconnect=cancel_on_disconnect,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/health/live")
