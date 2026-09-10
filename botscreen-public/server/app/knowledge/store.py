@@ -1,23 +1,24 @@
-"""Knowledge store with candidate/production zoning (issue #56A — tenancy & audit rework).
+"""Knowledge store with candidate/production zoning (issue #56A — tenancy, audit & publish-integrity rework).
 
-Reviewer-driven contract (2026-09 round):
-- storage key is ``(tenant_id, source_id)``; the same ``source_id`` may exist
-  independently in different tenants;
-- every operation REQUIRES a trusted :class:`~app.contracts.common.TenantContext`
-  (raw tenant/session strings are never accepted), so model-supplied payloads
-  cannot widen or redirect a query — real trust is injected by the upstream
-  authentication / ToolGateway boundary, this layer only consumes it;
-- candidates enter through :class:`~app.contracts.knowledge.CandidateInput` —
-  a content-only DTO. Lifecycle fields (review_status, reviewed_by/at,
-  valid_from/to, knowledge_version, superseded_by, created_at) are produced by
-  the store and can never be injected by upstream data;
-- approvals take a strict :class:`ApprovalDecision` (AwareDatetime enforced by
-  the contract) and new records are built through full ``model_validate`` so
-  validation is never bypassed by ``model_copy(update=...)``;
-- revocations take a :class:`RevocationDecision` (authenticated actor + reason
-  + optional evidence reference) and append an immutable
-  :class:`KnowledgeAuditEvent`; the revoked record KEEPS its version so the
-  audit chain stays traceable;
+Reviewer-driven contract (2026-09 round 3):
+- storage key is ``(tenant_id, source_id)``; tenancy always comes from a
+  trusted :class:`~app.contracts.common.TenantContext` (raw tenant/session
+  strings are never accepted — real trust is injected upstream by the
+  authentication / ToolGateway boundary, this layer only consumes it);
+- candidates enter through the content-only :class:`CandidateInput` DTO;
+  lifecycle fields are produced here and can never be submitted;
+- every mutation is an ATOMIC COMMIT: records, history and the audit event are
+  fully constructed and validated FIRST, then the in-memory structures are
+  updated together — a rejected audit/actor can never leave a state change
+  behind;
+- publishing is single-transition: only ``IN_REVIEW -> APPROVED`` succeeds.
+  Repeated or concurrent approvals conflict (no v2..v10 from replays); a
+  republication must go revoke -> new candidate -> in_review -> approve;
+- approvals/revocations carry the authenticated actor and ONE validated UTC
+  operation time used for both the record and its audit event;
+- revocations keep the revoked record's ``knowledge_version`` and append an
+  immutable audit event (actor/action/tenant/source/version/time/reason or
+  evidence reference — never the content body);
 - production view = approved + in-window + not superseded + complete approval
   metadata, tenant-scoped (the only view #53 RAG may query).
 """
@@ -57,16 +58,16 @@ def _tenant(context: TenantContext) -> str:
     return context.tenant_id
 
 
-def _payload(item: KnowledgeItem) -> dict:
-    """Contract payload for revalidation: computed fields (content_hash) are
-    derived, not input, so they must not be fed back into ``model_validate``."""
-    return item.model_dump(exclude={"content_hash"})
-
-
 def _key(context: TenantContext, source_id: str) -> Key:
     if not source_id or not source_id.strip():
         raise KnowledgeGovernanceError("source_id is required")
     return (_tenant(context), source_id)
+
+
+def _payload(item: KnowledgeItem) -> dict:
+    """Contract payload for revalidation: computed fields (content_hash) are
+    derived, not input, so they must not be fed back into ``model_validate``."""
+    return item.model_dump(exclude={"content_hash"})
 
 
 class KnowledgeStore:
@@ -82,30 +83,29 @@ class KnowledgeStore:
 
     # -- audit -----------------------------------------------------------------
 
-    def _append_audit(
+    def _build_audit(
         self,
         key: Key,
         action: AuditAction,
         actor: str,
         *,
+        at: datetime | None = None,
         knowledge_version: str | None = None,
-        reason: str = "",
+        reason: str | None = None,
         evidence_ref: str = "",
     ) -> KnowledgeAuditEvent:
-        """Append one immutable audit event (tenant+source scoped, no content
-        body — identifiers, versions and the stated reason/evidence only)."""
-        event = KnowledgeAuditEvent(
-            at=self.now(),
+        """Construct and validate one audit event (no mutation). Actor is an
+        explicit service identity — there is no implicit default."""
+        return KnowledgeAuditEvent(
+            at=at or self.now(),
             tenant_id=key[0],
             source_id=key[1],
             action=action,
-            actor=actor or "system",
+            actor=actor,
             knowledge_version=knowledge_version,
             reason=reason,
             evidence_ref=evidence_ref,
         )
-        self._audit.setdefault(key, []).append(event)
-        return event
 
     def audit_trail(
         self, context: TenantContext, source_id: str
@@ -131,11 +131,10 @@ class KnowledgeStore:
         context: TenantContext,
         candidate: CandidateInput,
         *,
-        actor: str = "",
+        actor: str,
     ) -> KnowledgeItem:
-        """Enter the candidate zone. The DTO carries content only; tenant and
-        all lifecycle fields are produced here. Duplicate ``(tenant,
-        source_id)`` is rejected until the previous item is revoked."""
+        """Enter the candidate zone. Record + audit event are built first and
+        committed together; a rejected audit leaves the store untouched."""
         key = _key(context, candidate.source_id)
         with self._lock:
             if key in self._items:
@@ -149,12 +148,14 @@ class KnowledgeStore:
                     "review_status": ReviewStatus.DRAFT,
                 }
             )
+            event = self._build_audit(key, AuditAction.CANDIDATE_ADDED, actor)
+            # -- atomic commit --
             self._items[key] = item.model_copy(deep=True)
-            self._append_audit(key, AuditAction.CANDIDATE_ADDED, actor)
+            self._audit.setdefault(key, []).append(event)
             return item
 
     def mark_in_review(
-        self, context: TenantContext, source_id: str, *, actor: str = ""
+        self, context: TenantContext, source_id: str, *, actor: str
     ) -> KnowledgeItem:
         key = _key(context, source_id)
         with self._lock:
@@ -168,8 +169,10 @@ class KnowledgeStore:
             updated = KnowledgeItem.model_validate(
                 {**_payload(item), "review_status": ReviewStatus.IN_REVIEW}
             )
+            event = self._build_audit(key, AuditAction.IN_REVIEW, actor)
+            # -- atomic commit --
             self._items[key] = updated.model_copy(deep=True)
-            self._append_audit(key, AuditAction.IN_REVIEW, actor)
+            self._audit.setdefault(key, []).append(event)
             return updated
 
     def list_candidates(self, context: TenantContext) -> list[KnowledgeItem]:
@@ -190,52 +193,49 @@ class KnowledgeStore:
         source_id: str,
         decision: ApprovalDecision,
     ) -> KnowledgeItem:
-        """Clinical approval under an authenticated reviewer identity.
+        """Single-transition publish: ``IN_REVIEW -> APPROVED`` only.
 
-        ``decision`` carries aware datetimes (naive/ill-ordered windows are
-        rejected by the contract BEFORE any state change) and the reviewer is
-        injected upstream, never taken from model-controlled payloads. The new
-        record is built through ``model_validate`` so every field is re-checked.
+        Any other state (draft, already approved, revoked) conflicts, so
+        replays and concurrent approvals can never mint extra versions. The
+        record and its audit event share ``decision.at`` (one UTC instant) and
+        are committed together.
         """
         key = _key(context, source_id)
         with self._lock:
             item = self._require(key)
-            prior = self._items[key]
-            history = self._history.setdefault(key, [])
-            if prior.review_status is ReviewStatus.APPROVED:
-                # a re-approval supersedes the previous approved version, which
-                # is moved to history (ordered supersede semantics)
-                history.append(prior)
+            if item.review_status is not ReviewStatus.IN_REVIEW:
+                raise KnowledgeGovernanceError(
+                    f"source {source_id!r} is {item.review_status.value} — "
+                    "only IN_REVIEW items can be approved"
+                )
+            history = self._history.get(key, [])
             approved_count = sum(
                 1 for h in history if h.review_status is ReviewStatus.APPROVED
             )
-            version_no = approved_count + 1
-            version = f"{source_id}-v{version_no}"
-            if prior.review_status is ReviewStatus.APPROVED:
-                superseded = KnowledgeItem.model_validate(
-                    {**_payload(prior), "superseded_by": version}
-                )
-                history[-1] = superseded
+            version = f"{source_id}-v{approved_count + 1}"
             approved = KnowledgeItem.model_validate(
                 {
                     **_payload(item),
                     "review_status": ReviewStatus.APPROVED,
                     "reviewed_by": decision.reviewer,
-                    "reviewed_at": self.now(),
+                    "reviewed_at": decision.at,
                     "valid_from": decision.valid_from,
                     "valid_to": decision.valid_to,
                     "knowledge_version": version,
                     "superseded_by": None,
                 }
             )
-            self._items[key] = approved.model_copy(deep=True)
-            self._append_audit(
+            event = self._build_audit(
                 key,
                 AuditAction.APPROVED,
                 decision.reviewer,
+                at=decision.at,
                 knowledge_version=version,
                 evidence_ref=decision.evidence_ref,
             )
+            # -- atomic commit --
+            self._items[key] = approved.model_copy(deep=True)
+            self._audit.setdefault(key, []).append(event)
             return approved
 
     # -- production view ---------------------------------------------------------
@@ -271,27 +271,31 @@ class KnowledgeStore:
         source_id: str,
         decision: RevocationDecision,
     ) -> KnowledgeItem:
-        """Revoke under an authenticated actor: the item leaves the production
-        view immediately; the prior version and the revocation record (WITH its
-        knowledge_version) plus an immutable audit event preserve the chain."""
+        """Revoke under an authenticated actor: the item leaves production
+        immediately; the prior version and the revocation record (WITH its
+        ``knowledge_version``) plus an immutable audit event preserve the
+        chain. Record, history entries and audit event commit together."""
         key = _key(context, source_id)
         with self._lock:
             item = self._require(key)
             revoked = KnowledgeItem.model_validate(
                 {**_payload(item), "review_status": ReviewStatus.REVOKED}
             )
-            history = self._history.setdefault(key, [])
-            history.append(item.model_copy(deep=True))
-            self._items.pop(key, None)
-            history.append(revoked.model_copy(deep=True))
-            self._append_audit(
+            event = self._build_audit(
                 key,
                 AuditAction.REVOKED,
                 decision.actor,
+                at=decision.at,
                 knowledge_version=item.knowledge_version,
                 reason=decision.reason,
                 evidence_ref=decision.evidence_ref,
             )
+            # -- atomic commit --
+            history = self._history.setdefault(key, [])
+            history.append(item.model_copy(deep=True))
+            self._items.pop(key, None)
+            history.append(revoked.model_copy(deep=True))
+            self._audit.setdefault(key, []).append(event)
             return revoked
 
     def _require(self, key: Key) -> KnowledgeItem:

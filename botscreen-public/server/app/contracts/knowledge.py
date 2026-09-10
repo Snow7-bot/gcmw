@@ -8,17 +8,39 @@ never touch this store; content_hash is the sha256 of ``content``.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Annotated
 
 from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
+    StringConstraints,
     computed_field,
+    field_validator,
     model_validator,
 )
+
+#: shared identity/actor type — trimmed and non-empty, so whitespace-only
+#: reviewers/actors/reasons can never pass validation
+NonEmptyStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)
+]
+#: free-text reason (revocation etc.) — trimmed and non-empty
+ReasonStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)
+]
+
+
+def _require_utc(value: datetime | None) -> datetime | None:
+    """Lifecycle timestamps must be tz-aware UTC (single source of truth)."""
+    if value is None:
+        return None
+    if value.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must be UTC")
+    return value
 
 
 class KnowledgeSourceType(str, Enum):
@@ -58,7 +80,7 @@ class KnowledgeItem(BaseModel):
 
     # review & lifecycle
     review_status: ReviewStatus = ReviewStatus.DRAFT
-    reviewed_by: str | None = None
+    reviewed_by: NonEmptyStr | None = None
     reviewed_at: AwareDatetime | None = None
     valid_from: AwareDatetime | None = None
     valid_to: AwareDatetime | None = None
@@ -128,15 +150,27 @@ class CandidateInput(BaseModel):
 
 
 class ApprovalDecision(BaseModel):
-    """Strict approval input: aware datetimes are enforced by the contract, so
-    a naive/ill-formed window can never reach the store."""
+    """Strict, frozen approval input.
 
-    model_config = ConfigDict(extra="forbid")
+    - reviewer is a trimmed non-empty authenticated identity;
+    - ``at`` is the single validated UTC operation time used for BOTH the
+      record's ``reviewed_at`` and the audit event (no second clock read);
+    - aware UTC datetimes are contract-enforced, so a naive or non-UTC window
+      can never reach the store.
+    """
 
-    reviewer: str = Field(..., min_length=1, max_length=128)
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reviewer: NonEmptyStr
+    at: AwareDatetime
     valid_from: AwareDatetime
     valid_to: AwareDatetime | None = None
     evidence_ref: str = Field("", max_length=256)
+
+    @field_validator("at", "valid_from", "valid_to")
+    @classmethod
+    def _utc_only(cls, value):
+        return _require_utc(value)
 
     @model_validator(mode="after")
     def _window_ordered(self) -> ApprovalDecision:
@@ -146,14 +180,20 @@ class ApprovalDecision(BaseModel):
 
 
 class RevocationDecision(BaseModel):
-    """Strict revocation input: reason + optional evidence reference, always
-    paired with the authenticated actor injected by the caller layer."""
+    """Strict, frozen revocation input: trimmed non-empty actor + reason,
+    optional evidence reference and the single UTC operation time."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    actor: str = Field(..., min_length=1, max_length=128)
-    reason: str = Field(..., min_length=1, max_length=512)
+    actor: NonEmptyStr
+    reason: ReasonStr
+    at: AwareDatetime
     evidence_ref: str = Field("", max_length=256)
+
+    @field_validator("at")
+    @classmethod
+    def _utc_only(cls, value):
+        return _require_utc(value)
 
 
 class AuditAction(str, Enum):
@@ -164,19 +204,25 @@ class AuditAction(str, Enum):
 
 
 class KnowledgeAuditEvent(BaseModel):
-    """Immutable audit event (append-only, tenant-scoped).
+    """Frozen (truly immutable) audit event, append-only and tenant-scoped.
 
     Records actor/action/tenant/source/version/time plus the reason or
-    evidence reference — never the full content body.
+    evidence reference — never the full content body. ``actor`` is a trimmed
+    non-empty identity; ``reason`` carries the revocation reason when present.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     at: AwareDatetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     tenant_id: str = Field(..., min_length=1, max_length=64)
     source_id: str = Field(..., min_length=1, max_length=128)
     action: AuditAction
-    actor: str = Field(..., min_length=1, max_length=128)
+    actor: NonEmptyStr
     knowledge_version: str | None = None
-    reason: str = Field("", max_length=512)
+    reason: ReasonStr | None = None
     evidence_ref: str = Field("", max_length=256)
+
+    @field_validator("at")
+    @classmethod
+    def _utc_only(cls, value):
+        return _require_utc(value)

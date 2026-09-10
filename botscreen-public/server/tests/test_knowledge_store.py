@@ -1,17 +1,22 @@
-"""Tests for the tenancy + audit reworked KnowledgeStore (issue #56A).
+"""Tests for the tenancy + audit + publish-integrity KnowledgeStore (#56A).
 
 Coverage:
-- candidate DTO: lifecycle fields cannot be injected (forged governance fields
-  are rejected by the contract, not merely ignored);
-- production predicate: superseded / revoked / missing approval metadata
-  records never enter the production view;
-- strict approval: naive or ill-ordered validity windows fail BEFORE any state
-  change, and records are revalidated end-to-end (no model_copy bypass);
-- revocation: reason, authenticated actor, time and version are traceable in
-  an immutable audit trail; the revoked record keeps its version;
-- tenancy: same source_id across two tenants stays isolated for CRUD, version
+- candidate DTO: lifecycle fields cannot be injected; whitespace-only
+  identities/reasons are rejected by the shared trimmed-non-empty types;
+- production predicate: superseded / missing approval metadata records never
+  enter the production view;
+- strict approval: naive or non-UTC windows fail BEFORE any state change, and
+  records are revalidated end-to-end (no model_copy bypass);
+- single-transition publish: only IN_REVIEW -> APPROVED succeeds; repeated and
+  concurrent approvals conflict instead of minting v2..v10; republication goes
+  revoke -> new candidate -> in_review -> approve;
+- atomic commit: a failing audit (e.g. over-long actor) leaves items, history
+  and audit structures untouched for candidate add and in_review;
+- revocation: reason, authenticated actor, time and version are traceable in a
+  frozen audit trail; the revoked record keeps its version;
+- tenancy: same source_id across tenants stays isolated for CRUD, version
   history, production view AND audit trails;
-- trusted context: no API accepts raw tenant_id/session_id/reviewer strings.
+- trusted context: no API accepts raw tenant_id/session_id strings.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +30,7 @@ from app.contracts.knowledge import (
     ApprovalDecision,
     AuditAction,
     CandidateInput,
+    KnowledgeAuditEvent,
     KnowledgeItem,
     KnowledgeSourceType,
     ReviewStatus,
@@ -62,7 +68,7 @@ def _candidate(
 
 
 def _approval(
-    store,
+    store: KnowledgeStore,
     reviewer: str = "dr-li",
     minutes_valid: int = 60,
     evidence_ref: str = "",
@@ -70,10 +76,29 @@ def _approval(
     now = store.now()
     return ApprovalDecision(
         reviewer=reviewer,
+        at=now,
         valid_from=now,
         valid_to=now + timedelta(minutes=minutes_valid),
         evidence_ref=evidence_ref,
     )
+
+
+def _revocation(
+    store: KnowledgeStore,
+    actor: str = "dr-li",
+    reason: str = "临床复核发现过期",
+    evidence_ref: str = "",
+) -> RevocationDecision:
+    return RevocationDecision(
+        actor=actor, reason=reason, at=store.now(), evidence_ref=evidence_ref
+    )
+
+
+def _published(store, t1, source_id: str = "faq-1", actor: str = "owner-1"):
+    """candidate -> in_review -> approved (the only legal publish path)."""
+    store.add_candidate(t1, _candidate(source_id), actor=actor)
+    store.mark_in_review(t1, source_id, actor=actor)
+    return store.approve(t1, source_id, _approval(store))
 
 
 @pytest.fixture
@@ -98,7 +123,7 @@ def t2() -> TenantContext:
 
 class TestCandidateDto:
     def test_new_items_are_draft_candidates(self, store, t1):
-        item = store.add_candidate(t1, _candidate())
+        item = store.add_candidate(t1, _candidate(), actor="owner-1")
         assert item.review_status is ReviewStatus.DRAFT
         assert item.knowledge_version is None
         assert item.reviewed_by is None
@@ -132,9 +157,7 @@ class TestCandidateDto:
             CandidateInput.model_validate(payload)
 
     def test_forged_supersede_never_reaches_production(self, store, t1):
-        """The reviewer's reproduction: an injected superseded_by must not
-        survive into an approved record."""
-        store.add_candidate(t1, _candidate())
+        store.add_candidate(t1, _candidate(), actor="owner-1")
         forged = KnowledgeItem.model_validate(
             {
                 **store.get(t1, "faq-1").model_dump(exclude={"content_hash"}),
@@ -142,30 +165,99 @@ class TestCandidateDto:
                 "review_status": "approved",
                 "knowledge_version": "faq-1-v1",
                 "reviewed_by": "dr-li",
-                "reviewed_at": datetime.now(timezone.utc),
-                "valid_from": datetime.now(timezone.utc),
+                "reviewed_at": store.now(),
+                "valid_from": store.now(),
             }
         )
         assert forged.is_production_ready() is False  # superseded => excluded
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
         approved = store.approve(t1, "faq-1", _approval(store))
         assert approved.superseded_by is None
         assert [i.source_id for i in store.production_items(t1)] == ["faq-1"]
 
     def test_duplicate_source_rejected_within_tenant(self, store, t1):
-        store.add_candidate(t1, _candidate())
+        store.add_candidate(t1, _candidate(), actor="owner-1")
         with pytest.raises(KnowledgeGovernanceError):
-            store.add_candidate(t1, _candidate())
+            store.add_candidate(t1, _candidate(), actor="owner-1")
 
     def test_list_candidates_is_tenant_scoped(self, store, t1, t2):
-        store.add_candidate(t1, _candidate("faq-1"))
-        store.add_candidate(t2, _candidate("faq-2"))
+        store.add_candidate(t1, _candidate("faq-1"), actor="owner-1")
+        store.add_candidate(t2, _candidate("faq-2"), actor="owner-2")
         assert [i.source_id for i in store.list_candidates(t1)] == ["faq-1"]
         assert [i.source_id for i in store.list_candidates(t2)] == ["faq-2"]
 
 
+class TestWhitespaceIdentities:
+    @pytest.mark.parametrize("reviewer", ["   ", "\t", "\n", "  dr-li  "])
+    def test_approval_reviewer_must_be_trimmed_non_empty(self, store, reviewer):
+        now = store.now()
+        if reviewer.strip():
+            decision = ApprovalDecision(reviewer=reviewer, at=now, valid_from=now)
+            assert decision.reviewer == "dr-li"  # trimmed by the contract
+        else:
+            with pytest.raises(ValidationError):
+                ApprovalDecision(reviewer=reviewer, at=now, valid_from=now)
+
+    @pytest.mark.parametrize(
+        ("actor", "reason"),
+        [("   ", "过期"), ("dr-li", "   "), ("\t", "\n")],
+    )
+    def test_revocation_actor_and_reason_must_be_trimmed_non_empty(
+        self, store, actor, reason
+    ):
+        with pytest.raises(ValidationError):
+            RevocationDecision(actor=actor, reason=reason, at=store.now())
+
+    def test_whitespace_reviewer_cannot_reach_production(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        now = store.now()
+        with pytest.raises(ValidationError):
+            ApprovalDecision(reviewer="   ", at=now, valid_from=now)
+        assert store.production_items(t1) == []
+        assert store.get(t1, "faq-1").review_status is ReviewStatus.IN_REVIEW
+
+    def test_item_reviewed_by_rejects_whitespace(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        with pytest.raises(ValidationError):
+            KnowledgeItem.model_validate(
+                {
+                    **store.get(t1, "faq-1").model_dump(exclude={"content_hash"}),
+                    "review_status": "approved",
+                    "reviewed_by": "   ",
+                    "reviewed_at": store.now(),
+                    "knowledge_version": "faq-1-v1",
+                }
+            )
+
+    def test_audit_actor_rejects_whitespace(self, store, t1):
+        with pytest.raises(ValidationError):
+            store.add_candidate(t1, _candidate(), actor="   ")
+
+
+class TestAtomicCommit:
+    def test_candidate_add_failure_leaves_all_structures_untouched(self, store, t1):
+        with pytest.raises(ValidationError):
+            store.add_candidate(t1, _candidate(), actor="a" * 200)  # audit invalid
+        assert store._items == {}
+        assert store._history == {}
+        assert store._audit == {}
+        with pytest.raises(KnowledgeGovernanceError):
+            store.audit_trail(t1, "faq-1")
+
+    def test_mark_in_review_failure_leaves_all_structures_untouched(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        before = store.get(t1, "faq-1").review_status
+        with pytest.raises(ValidationError):
+            store.mark_in_review(t1, "faq-1", actor="a" * 200)
+        assert store.get(t1, "faq-1").review_status is before
+        assert len(store.audit_trail(t1, "faq-1")) == 1  # only candidate.added
+        assert store._history == {}
+
+
 class TestProductionPredicate:
-    def test_superseded_record_not_production_ready(self):
-        now = datetime.now(timezone.utc)
+    def test_superseded_record_not_production_ready(self, store):
+        now = store.now()
         item = KnowledgeItem.model_validate(
             {
                 "source_id": "faq-1",
@@ -184,11 +276,10 @@ class TestProductionPredicate:
         assert item.is_production_ready(now) is False
 
     @pytest.mark.parametrize(
-        "missing",
-        ["knowledge_version", "reviewed_by", "reviewed_at"],
+        "missing", ["knowledge_version", "reviewed_by", "reviewed_at"]
     )
-    def test_missing_approval_metadata_not_production_ready(self, missing):
-        now = datetime.now(timezone.utc)
+    def test_missing_approval_metadata_not_production_ready(self, store, missing):
+        now = store.now()
         payload = {
             "source_id": "faq-1",
             "tenant_id": "t1",
@@ -202,93 +293,141 @@ class TestProductionPredicate:
             "reviewed_at": now,
         }
         payload[missing] = None
-        item = KnowledgeItem.model_validate(payload)
-        assert item.is_production_ready(now) is False
-
-    def test_reapproval_leaves_only_newest_in_production(self, store, t1):
-        store.add_candidate(t1, _candidate())
-        store.approve(t1, "faq-1", _approval(store, "dr-li"))
-        store.approve(t1, "faq-1", _approval(store, "dr-wang"))
-        production = store.production_items(t1)
-        assert [i.knowledge_version for i in production] == ["faq-1-v2"]
-        superseded = next(
-            h for h in store.history(t1, "faq-1") if h.knowledge_version == "faq-1-v1"
-        )
-        assert superseded.superseded_by == "faq-1-v2"
-        assert superseded.is_production_ready() is False
-
-
-class TestStrictApproval:
-    def test_naive_datetime_rejected_by_contract(self):
-        with pytest.raises(ValidationError):
-            ApprovalDecision.model_validate(
-                {
-                    "reviewer": "dr-li",
-                    # naive: no tzinfo, parsed without the datetime() ctor
-                    "valid_from": datetime.fromisoformat("2026-01-01T00:00:00"),
-                }
-            )
-
-    def test_naive_window_never_mutates_store(self, store, t1):
-        store.add_candidate(t1, _candidate())
-        before_production = store.production_items(t1)
-        before_history = store.history(t1, "faq-1")
-        with pytest.raises(ValidationError):
-            ApprovalDecision.model_validate(
-                {
-                    "reviewer": "dr-li",
-                    "valid_from": datetime.fromisoformat("2026-01-01T00:00:00"),
-                }
-            )
-        assert store.production_items(t1) == before_production == []
-        assert store.history(t1, "faq-1") == before_history
-
-    def test_ill_ordered_window_rejected(self):
-        now = datetime.now(timezone.utc)
-        with pytest.raises(ValidationError):
-            ApprovalDecision.model_validate(
-                {
-                    "reviewer": "dr-li",
-                    "valid_from": now,
-                    "valid_to": now - timedelta(minutes=1),
-                }
-            )
-
-    def test_reviewer_required(self):
-        now = datetime.now(timezone.utc)
-        with pytest.raises(ValidationError):
-            ApprovalDecision.model_validate({"reviewer": "", "valid_from": now})
-
-    def test_approval_records_aware_metadata(self, store, t1):
-        store.add_candidate(t1, _candidate())
-        approved = store.approve(t1, "faq-1", _approval(store, evidence_ref="EV-7"))
-        assert approved.reviewed_by == "dr-li"
-        assert approved.reviewed_at.tzinfo is not None
-        assert approved.knowledge_version == "faq-1-v1"
-        trail = store.audit_trail(t1, "faq-1")
-        assert trail[-1].action is AuditAction.APPROVED
-        assert trail[-1].actor == "dr-li"
-        assert trail[-1].evidence_ref == "EV-7"
+        assert KnowledgeItem.model_validate(payload).is_production_ready(now) is False
 
     def test_expired_window_leaves_production(self, store, t1, clock):
-        store.add_candidate(t1, _candidate())
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
         store.approve(t1, "faq-1", _approval(store, minutes_valid=30))
         assert store.production_items(t1)
         clock.advance(hours=1)
         assert store.production_items(t1) == []
 
 
+class TestSingleTransitionPublish:
+    def test_draft_cannot_be_approved_directly(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        with pytest.raises(KnowledgeGovernanceError, match="only IN_REVIEW"):
+            store.approve(t1, "faq-1", _approval(store))
+        assert store.production_items(t1) == []
+
+    def test_second_approval_conflicts_no_extra_versions(self, store, t1):
+        _published(store, t1)
+        with pytest.raises(KnowledgeGovernanceError, match="only IN_REVIEW"):
+            store.approve(t1, "faq-1", _approval(store, reviewer="dr-wang"))
+        assert store.get(t1, "faq-1").knowledge_version == "faq-1-v1"
+        assert len(store.audit_trail(t1, "faq-1")) == 3  # added, in_review, approved
+
+    def test_concurrent_approvals_yield_exactly_one_published_version(self, store, t1):
+        store.add_candidate(t1, _candidate(content="并发批准基座"), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+
+        def fire(i):
+            try:
+                return ("ok", store.approve(t1, "faq-1", _approval(store, f"rev-{i}")))
+            except KnowledgeGovernanceError:
+                return ("conflict", None)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(fire, range(10)))
+        outcomes = [status for status, _ in results]
+        assert outcomes.count("ok") == 1
+        assert outcomes.count("conflict") == 9
+        assert store.get(t1, "faq-1").knowledge_version == "faq-1-v1"
+        assert [i.knowledge_version for i in store.production_items(t1)] == ["faq-1-v1"]
+        # candidate + in_review + exactly one approval event
+        assert len(store.audit_trail(t1, "faq-1")) == 3
+
+    def test_republication_requires_revoke_new_candidate_cycle(self, store, t1):
+        _published(store, t1)
+        store.revoke(t1, "faq-1", _revocation(store, reason="内容过期"))
+        store.add_candidate(t1, _candidate(content="修订后的内容"), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        approved = store.approve(t1, "faq-1", _approval(store, reviewer="dr-wang"))
+        assert approved.knowledge_version == "faq-1-v2"
+        assert [i.knowledge_version for i in store.production_items(t1)] == ["faq-1-v2"]
+        actions = [e.action for e in store.audit_trail(t1, "faq-1")]
+        assert actions == [
+            AuditAction.CANDIDATE_ADDED,
+            AuditAction.IN_REVIEW,
+            AuditAction.APPROVED,
+            AuditAction.REVOKED,
+            AuditAction.CANDIDATE_ADDED,
+            AuditAction.IN_REVIEW,
+            AuditAction.APPROVED,
+        ]
+
+    def test_mark_in_review_on_approved_requires_revoke_first(self, store, t1):
+        _published(store, t1)
+        with pytest.raises(KnowledgeGovernanceError, match="revoke before re-review"):
+            store.mark_in_review(t1, "faq-1", actor="owner-1")
+        assert store.production_items(t1)
+
+
+class TestStrictApprovalContract:
+    def test_naive_datetime_rejected_by_contract(self):
+        with pytest.raises(ValidationError):
+            ApprovalDecision.model_validate(
+                {
+                    "reviewer": "dr-li",
+                    "at": datetime.fromisoformat("2026-01-01T00:00:00"),
+                    "valid_from": datetime.fromisoformat("2026-01-01T00:00:00"),
+                }
+            )
+
+    def test_non_utc_offset_rejected(self):
+        plus8 = timezone(timedelta(hours=8))
+        now = datetime.now(plus8)
+        with pytest.raises(ValidationError):
+            ApprovalDecision(reviewer="dr-li", at=now, valid_from=now)
+        with pytest.raises(ValidationError):
+            RevocationDecision(actor="dr-li", reason="x", at=now)
+
+    def test_ill_ordered_window_rejected(self, store):
+        now = store.now()
+        with pytest.raises(ValidationError):
+            ApprovalDecision(
+                reviewer="dr-li",
+                at=now,
+                valid_from=now,
+                valid_to=now - timedelta(minutes=1),
+            )
+
+    def test_naive_window_never_mutates_store(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        with pytest.raises(ValidationError):
+            ApprovalDecision.model_validate(
+                {
+                    "reviewer": "dr-li",
+                    "at": datetime.fromisoformat("2026-01-01T00:00:00"),
+                    "valid_from": datetime.fromisoformat("2026-01-01T00:00:00"),
+                }
+            )
+        assert store.production_items(t1) == []
+        assert store._history == {}
+
+    def test_decision_and_audit_share_one_operation_time(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        decision = _approval(store, evidence_ref="EV-7")
+        approved = store.approve(t1, "faq-1", decision)
+        event = store.audit_trail(t1, "faq-1")[-1]
+        assert approved.reviewed_at == decision.at == event.at
+        assert event.actor == "dr-li" and event.evidence_ref == "EV-7"
+
+    def test_decisions_are_frozen(self, store):
+        decision = _approval(store)
+        with pytest.raises(ValidationError):
+            decision.reviewer = "attacker"
+        revocation = _revocation(store)
+        with pytest.raises(ValidationError):
+            revocation.reason = "changed"
+
+
 class TestRevocationAudit:
     def test_revoke_is_traceable_and_keeps_version(self, store, t1):
-        store.add_candidate(t1, _candidate(), actor="owner-1")
-        store.approve(t1, "faq-1", _approval(store))
-        revoked = store.revoke(
-            t1,
-            "faq-1",
-            RevocationDecision(
-                actor="dr-li", reason="临床复核发现过期", evidence_ref="EV-9"
-            ),
-        )
+        _published(store, t1, actor="owner-1")
+        revoked = store.revoke(t1, "faq-1", _revocation(store, evidence_ref="EV-9"))
         assert revoked.review_status is ReviewStatus.REVOKED
         assert revoked.knowledge_version == "faq-1-v1"  # version preserved
         assert store.production_items(t1) == []
@@ -298,74 +437,69 @@ class TestRevocationAudit:
         assert event.reason == "临床复核发现过期"
         assert event.evidence_ref == "EV-9"
         assert event.knowledge_version == "faq-1-v1"
-        assert event.tenant_id == "t1" and event.source_id == "faq-1"
+        assert (event.tenant_id, event.source_id) == ("t1", "faq-1")
         assert event.at.tzinfo is not None
 
-    def test_revoke_requires_actor_and_reason(self):
+    def test_audit_events_are_frozen(self, store, t1):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        event = store.audit_trail(t1, "faq-1")[0]
         with pytest.raises(ValidationError):
-            RevocationDecision.model_validate({"actor": "", "reason": "x"})
-        with pytest.raises(ValidationError):
-            RevocationDecision.model_validate({"actor": "dr-li", "reason": ""})
+            event.actor = "attacker"
+        assert isinstance(event, KnowledgeAuditEvent)
 
     def test_audit_trail_is_append_only_snapshot(self, store, t1):
-        store.add_candidate(t1, _candidate())
+        store.add_candidate(t1, _candidate(), actor="owner-1")
         trail = store.audit_trail(t1, "faq-1")
-        trail.clear()  # caller mutation must not touch stored history
+        trail.clear()
         assert len(store.audit_trail(t1, "faq-1")) == 1
 
-    def test_full_lifecycle_audit_sequence(self, store, t1):
-        store.add_candidate(t1, _candidate(), actor="owner-1")
-        store.mark_in_review(t1, "faq-1", actor="owner-1")
-        store.approve(t1, "faq-1", _approval(store))
-        store.revoke(t1, "faq-1", RevocationDecision(actor="dr-li", reason="过期"))
-        actions = [e.action for e in store.audit_trail(t1, "faq-1")]
-        assert actions == [
-            AuditAction.CANDIDATE_ADDED,
-            AuditAction.IN_REVIEW,
-            AuditAction.APPROVED,
-            AuditAction.REVOKED,
-        ]
+    def test_non_revocation_events_carry_no_reason(self, store, t1):
+        _published(store, t1)
+        assert all(e.reason is None for e in store.audit_trail(t1, "faq-1"))
 
 
 class TestTenantIsolationSameSourceId:
     def test_same_source_id_coexists_independently(self, store, t1, t2):
-        store.add_candidate(t1, _candidate())
-        store.add_candidate(t2, _candidate())
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.add_candidate(t2, _candidate(), actor="owner-2")
         assert store.get(t1, "faq-1").tenant_id == "t1"
         assert store.get(t2, "faq-1").tenant_id == "t2"
 
-    def test_approval_versions_do_not_bleed_across_tenants(self, store, t1, t2):
-        store.add_candidate(t1, _candidate())
-        store.add_candidate(t2, _candidate())
-        store.approve(t1, "faq-1", _approval(store, "dr-li"))
-        store.approve(t1, "faq-1", _approval(store, "dr-li"))
-        store.approve(t2, "faq-1", _approval(store, "dr-wang"))
-        assert store.get(t1, "faq-1").knowledge_version == "faq-1-v2"
-        assert store.get(t2, "faq-1").knowledge_version == "faq-1-v1"
+    def test_publishing_does_not_bleed_across_tenants(self, store, t1, t2):
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        store.add_candidate(t2, _candidate(), actor="owner-2")
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        store.approve(t1, "faq-1", _approval(store))
+        assert store.production_items(t1)
+        assert store.production_items(t2) == []  # t2 still a draft
+        assert store.get(t2, "faq-1").review_status is ReviewStatus.DRAFT
 
     def test_cross_tenant_reads_are_absent(self, store, t1, t2):
-        store.add_candidate(t1, _candidate())
+        store.add_candidate(t1, _candidate(), actor="owner-1")
         with pytest.raises(KnowledgeGovernanceError):
             store.get(t2, "faq-1")
         with pytest.raises(KnowledgeGovernanceError):
+            store.mark_in_review(t2, "faq-1", actor="owner-2")
+        with pytest.raises(KnowledgeGovernanceError):
             store.approve(t2, "faq-1", _approval(store))
         with pytest.raises(KnowledgeGovernanceError):
-            store.revoke(t2, "faq-1", RevocationDecision(actor="dr-li", reason="x"))
+            store.revoke(t2, "faq-1", _revocation(store))
         with pytest.raises(KnowledgeGovernanceError):
             store.audit_trail(t2, "faq-1")
 
     def test_audit_trails_are_tenant_isolated(self, store, t1, t2):
         store.add_candidate(t1, _candidate(), actor="owner-1")
-        store.approve(t1, "faq-1", _approval(store, "dr-li"))
+        store.mark_in_review(t1, "faq-1", actor="owner-1")
+        store.approve(t1, "faq-1", _approval(store))
         store.add_candidate(t2, _candidate(), actor="owner-2")
-        store.revoke(t2, "faq-1", RevocationDecision(actor="dr-wang", reason="t2 过期"))
+        store.revoke(t2, "faq-1", _revocation(store, actor="dr-wang", reason="t2 过期"))
         t1_trail = store.audit_trail(t1, "faq-1")
         t2_trail = store.audit_trail(t2, "faq-1")
-        assert [e.actor for e in t1_trail] == ["owner-1", "dr-li"]
+        assert [e.actor for e in t1_trail] == ["owner-1", "owner-1", "dr-li"]
         assert [e.actor for e in t2_trail] == ["owner-2", "dr-wang"]
         assert {e.tenant_id for e in t1_trail} == {"t1"}
         assert {e.tenant_id for e in t2_trail} == {"t2"}
-        assert store.production_items(t1) != [] and store.production_items(t2) == []
+        assert store.production_items(t1) and store.production_items(t2) == []
 
 
 class TestTrustedContextRequired:
@@ -377,13 +511,13 @@ class TestTrustedContextRequired:
         with pytest.raises(KnowledgeGovernanceError):
             store.audit_trail(None, "faq-1")
 
-    def test_api_never_accepts_raw_context_fields(self, store):
-        """Tenancy and reviewer identity can only arrive through the trusted
-        context object / authenticated decision contracts — never as raw
-        model-supplied parameters."""
+    def test_no_api_takes_raw_tenant_or_session_fields(self, store):
+        """Interface convention check: tenancy only arrives through the trusted
+        context object. NOTE: keyword-only parameters are a calling convention,
+        NOT a security boundary — the authoritative Tool-Schema exclusion of
+        tenant/session/reviewer fields is verified in #69."""
         import inspect
 
-        forbidden = {"tenant_id", "session_id"}
         for name in (
             "add_candidate",
             "mark_in_review",
@@ -396,57 +530,23 @@ class TestTrustedContextRequired:
             "audit_trail",
         ):
             signature = inspect.signature(getattr(store, name))
-            assert next(iter(signature.parameters)) == "context", (
-                f"{name} must take the trusted context first"
-            )
-            assert not (set(signature.parameters) & forbidden), (
-                f"{name} must not accept raw context fields"
-            )
-            # 'actor' may exist for audit, but only as keyword-only (injected
-            # by the authenticated caller layer, never positionally)
-            for param in signature.parameters.values():
-                if param.name == "actor":
-                    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+            assert next(iter(signature.parameters)) == "context"
+            assert not (set(signature.parameters) & {"tenant_id", "session_id"})
 
 
-class TestReviewGuardsAndIntegrity:
-    def test_mark_in_review_on_approved_item_requires_revoke_first(self, store, t1):
-        store.add_candidate(t1, _candidate())
-        store.approve(t1, "faq-1", _approval(store))
-        with pytest.raises(KnowledgeGovernanceError, match="revoke before re-review"):
-            store.mark_in_review(t1, "faq-1")
-        assert store.production_items(t1)
-
-    def test_concurrent_approvals_produce_contiguous_versions(self, store, t1):
-        store.add_candidate(t1, _candidate(content="并发批准基座"))
-
-        def fire(i):
-            return store.approve(t1, "faq-1", _approval(store, f"reviewer-{i}"))
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(fire, range(10)))
-        versions = {r.knowledge_version for r in results}
-        assert versions == {f"faq-1-v{i}" for i in range(1, 11)}
-        assert store.get(t1, "faq-1").knowledge_version == "faq-1-v10"
-        history = store.history(t1, "faq-1")
-        assert len([h for h in history if h.superseded_by]) == 9
-        assert len(store.audit_trail(t1, "faq-1")) == 11  # candidate + 10 approvals
-
+class TestIntegrity:
     def test_content_hash_is_derived_and_stable(self, store, t1):
         candidate = _candidate(content="固定内容")
-        store.add_candidate(t1, candidate)
-        assert (
-            store.get(t1, "faq-1").content_hash
-            == KnowledgeItem.model_validate(
-                {
-                    **candidate.model_dump(),
-                    "tenant_id": "t1",
-                    "review_status": "draft",
-                }
-            ).content_hash
-        )
+        store.add_candidate(t1, candidate, actor="owner-1")
+        expected = KnowledgeItem.model_validate(
+            {**candidate.model_dump(), "tenant_id": "t1", "review_status": "draft"}
+        ).content_hash
+        assert store.get(t1, "faq-1").content_hash == expected
 
     def test_snapshot_copies_do_not_alias_store_state(self, store, t1):
-        store.add_candidate(t1, _candidate())
-        store.get(t1, "faq-1").title = "被改标题"
+        store.add_candidate(t1, _candidate(), actor="owner-1")
+        # KnowledgeItem is not frozen, but stored state must be a deep copy
+        store.get(t1, "faq-1")
+        fetched = store.get(t1, "faq-1")
+        fetched.title = "被改标题"
         assert store.get(t1, "faq-1").title == "标题 faq-1"
