@@ -300,7 +300,7 @@ class RedisStreamEventStore:
         *,
         prefix: str = "gcmw:run-events:",
         max_len: int = DEFAULT_MAX_EVENTS_PER_RUN,
-        default_ttl_s: int = DEFAULT_RUN_TTL_S,
+        default_ttl_s: int | None = DEFAULT_RUN_TTL_S,
     ) -> None:
         _validate_store_options(max_len, default_ttl_s)
         self._client = client
@@ -329,7 +329,7 @@ class RedisStreamEventStore:
         *,
         prefix: str = "gcmw:run-events:",
         max_len: int = DEFAULT_MAX_EVENTS_PER_RUN,
-        default_ttl_s: int = DEFAULT_RUN_TTL_S,
+        default_ttl_s: int | None = DEFAULT_RUN_TTL_S,
         connect_timeout_s: float = 2.0,
     ) -> RedisStreamEventStore:
         """Build over ``redis.Redis.from_url`` — fails loudly when the client
