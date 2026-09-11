@@ -1,4 +1,15 @@
-"""Event storage for run SSE events (issue #36b, remediation round).
+"""DEPRECATED for run events — superseded by :mod:`app.storage.run_repository`.
+
+The single persistence authority for run state AND its events is
+``RunRepository`` (#65B-2 slice B2-A): state, sequence, terminal position and
+the event page are written/read atomically there. This module remains only for
+its own historical tests and must not be wired into new code paths (no new
+imports from ``app.api``/``app.orchestration``); it will be deleted once the
+repository is wired into the lifecycle service.
+
+--- original notes ---
+
+Event storage for run SSE events (issue #36b, remediation round).
 
 Reviewer-driven constraints (2026-09 round):
 - run-level TTL only — events are NEVER expired individually, so a stream can

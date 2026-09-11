@@ -57,6 +57,27 @@ _ALLOWED: dict[RunState, set[RunState]] = {
 }
 
 
+def is_terminal_state(state: RunState) -> bool:
+    """Public terminal check (shared by the repository and the API layer)."""
+    return state in TERMINAL_STATES
+
+
+def is_allowed_transition(source: RunState, target: RunState) -> bool:
+    """Single source of truth for legal run transitions (#10/#21 rules).
+
+    Terminal states are irreversible and a run never transitions to itself.
+    The repository MUST use this instead of re-declaring transition tables.
+    """
+    if is_terminal_state(source):
+        return False
+    return target in _ALLOWED.get(source, set())
+
+
+def transition_event_type(target: RunState) -> str:
+    """Which SSE event a transition to ``target`` produces."""
+    return "run.completed" if is_terminal_state(target) else "process.status"
+
+
 class RunStateMachine:
     """Tracks one run's state, event sequence, and immutable terminal states."""
 
