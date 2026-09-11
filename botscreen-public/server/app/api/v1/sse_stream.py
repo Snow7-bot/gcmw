@@ -44,6 +44,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from fastapi.responses import StreamingResponse
+
 from app.contracts.errors import ErrorCode, ErrorEnvelope
 from app.contracts.events import SSEEvent, SSEEventType
 from app.contracts.run import TERMINAL_STATES, RunState
@@ -52,6 +54,17 @@ DEFAULT_HEARTBEAT_MS = 15_000
 
 #: transport-level failure frame (never a protocol event, never persisted)
 STREAM_ERROR_EVENT = "stream.error"
+
+
+class SSEStreamingResponse(StreamingResponse):
+    """StreamingResponse pinned to the SSE media type.
+
+    Used both as the response of the public route and as its ``response_class``,
+    so the published OpenAPI contract advertises ``text/event-stream`` instead of
+    the JSON default a bare ``StreamingResponse`` would produce.
+    """
+
+    media_type = "text/event-stream"
 
 
 class StreamFault(str, Enum):
@@ -340,6 +353,7 @@ __all__ = [
     "DEFAULT_HEARTBEAT_MS",
     "STREAM_ERROR_EVENT",
     "SSEStreamError",
+    "SSEStreamingResponse",
     "SnapshotReader",
     "StreamFault",
     "StreamSnapshot",

@@ -7,7 +7,7 @@ import uuid
 
 from fastapi import Request
 
-from app.contracts.errors import ErrorCode
+from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 
 
 class AppError(RuntimeError):
@@ -39,3 +39,23 @@ def request_ids(request: Request) -> tuple[str, str]:
     request.state.request_id = request_id
     request.state.trace_id = trace_id
     return request_id, trace_id
+
+
+def error_responses(*codes: ErrorCode) -> dict[int, dict]:
+    """OpenAPI ``responses`` entries for the EXACT ErrorCodes a route returns.
+
+    The published contract must match the wire: every failure of the public API
+    is the same :class:`~app.contracts.errors.ErrorEnvelope` (stable code + the
+    registry message + request/trace ids), and the status comes from the same
+    registry the runtime uses — never a framework default.
+    """
+    grouped: dict[int, list[str]] = {}
+    for code in codes:
+        grouped.setdefault(http_status_for(code), []).append(code.value)
+    return {
+        status: {
+            "model": ErrorEnvelope,
+            "description": "统一错误信封（" + " / ".join(sorted(values)) + "）",
+        }
+        for status, values in sorted(grouped.items())
+    }

@@ -1,19 +1,28 @@
-"""Agent API router (issue #36 / #36c — B2-B wiring round).
+"""Agent API router (issue #36 / #36c — B2-B wiring round, review round 2).
 
 Architecture rules enforced here:
 - ``RunRepository`` (#65B-2 slice B2-A) is the ONLY authority for run state and
-  events: every transition is committed through its expected-state CAS and the
-  public SSE route consumes its atomic snapshots. No second event list, and no
-  second sequence number, may reappear in this layer;
-- the admission service keeps a LIFECYCLE MIRROR only (session TTL, idempotency,
-  one active run per session, payload hashes) and never invents a seq;
-- admission is atomic (asyncio lock, one per running loop): an idempotent replay
-  returns the original run, one active (non-terminal) run per session;
+  events. **Every state decision reads it** — the idempotent-replay answer, the
+  one-active-run-per-session admission check, status reads, cancels and stream
+  authorisation. No local mirror is consulted, so a run finished by another
+  component (ManagerAgent, another worker) immediately frees its session;
+- the admission service keeps lifecycle bookkeeping only (session TTL,
+  idempotency keys, payload hashes, the raw question snapshot) and never owns a
+  sequence number or a state;
+- admission is atomic per SESSION (one lock per session id): every invariant
+  here is session-scoped, so a slow storage call for one session can never
+  block another session's requests (no cross-tenant head-of-line blocking).
+  The service lives in the FastAPI app/lifespan scope, i.e. exactly one event
+  loop owns it; multi-process admission is explicitly NOT faked in memory (see
+  :mod:`app.runtime` — staging/production fail closed until a persistent
+  AdmissionStore exists);
 - sessions expire on an injectable clock; expiry removes session, runs,
-  idempotency entries, raw question snapshots AND the durable run records;
+  idempotency entries and the raw question snapshots;
 - tenant/device always derive from the DevicePrincipal (default deny); run
-  ownership is checked ONCE, before the stream response starts — an unknown or
-  foreign run never receives a single streamed byte;
+  ownership is checked once, before the stream response starts;
+- session deletion is resumable: the durable record goes first and memory drops
+  the run only after storage confirmed, so memory never claims a run storage no
+  longer has — a mid-way failure keeps the session so the client can retry;
 - this slice (B2-B) exposes the public SSE route only: no subscriber lease, no
   disconnect->cancel propagation and no reconnect grace (all B2-C).
 """
@@ -24,21 +33,21 @@ import asyncio
 import hashlib
 import json
 import uuid
-import weakref
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Header, Query, Request, status
+from fastapi.responses import JSONResponse
 
 from app.api.v1.auth import DevicePrincipal, PrincipalDep
-from app.api.v1.errors import AppError, request_ids
+from app.api.v1.errors import AppError, error_responses, request_ids
 from app.api.v1.sse_stream import (
     DEFAULT_HEARTBEAT_MS,
     SnapshotReader,
     SSEStreamError,
+    SSEStreamingResponse,
     StreamSnapshot,
     effective_after_seq,
     stream_engine,
@@ -54,6 +63,7 @@ from app.contracts.common import Channel
 from app.contracts.errors import ErrorCode
 from app.contracts.run import RunState
 from app.orchestration.state_machine import is_terminal_state
+from app.runtime import readiness_report
 from app.storage.run_repository import (
     MemoryRunRepository,
     RunIdentity,
@@ -76,6 +86,15 @@ SSE_RESPONSE_HEADERS = {
 
 #: bounded CAS retries for cancel: a run may move under us, but the loop ends
 MAX_CANCEL_ATTEMPTS = 3
+
+_READINESS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "not_ready"]},
+        "checks": {"type": "object"},
+        "problems": {"type": "array", "items": {"type": "string"}},
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -118,11 +137,11 @@ class RunSnapshot:
 
 @dataclass
 class RunRecord:
-    """Admission/lifecycle record: mirror state + the durable identity.
+    """Admission bookkeeping for one run — deliberately WITHOUT state.
 
-    ``state`` is a MIRROR of the repository's authoritative state, refreshed on
-    every read/transition; the repository's expected-state CAS is what actually
-    guarantees the two can never diverge silently.
+    State lives in the ``RunRepository`` only; keeping a mirror here is what
+    allowed a stale ``ACCEPTED`` to reject a new question after the durable run
+    had already finished.
     """
 
     run_id: str
@@ -130,18 +149,17 @@ class RunRecord:
     identity: RunIdentity
     snapshot: RunSnapshot
     payload_hash: str
-    state: RunState = RunState.ACCEPTED
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
-# RunAdmissionService: admission + lifecycle only (no storage authority).
+# RunAdmissionService: admission + lifecycle only (no state authority).
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class RunStatusSnapshot:
-    """Immutable status DTO produced under the admission lock."""
+    """Immutable status DTO: the state always comes from the repository."""
 
     run_id: str
     session_id: str
@@ -161,10 +179,10 @@ class RunAdmissionService:
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.repository = repository or MemoryRunRepository()
-        # one admission lock per running loop: the service is a process-wide
-        # singleton while an asyncio.Lock belongs to the loop that contends on
-        # it (tests legitimately drive the same service from several loops)
-        self._locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        # ONE lock per session. Idempotency keys and the single-active-run rule
+        # are both session-scoped, so per-session locking is sufficient for
+        # correctness while keeping unrelated sessions independent.
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self.sessions: dict[str, SessionRecord] = {}
         self.runs: dict[str, RunRecord] = {}
         # (session_id, idempotency_key) -> (run_id, payload_hash)
@@ -173,12 +191,17 @@ class RunAdmissionService:
     def now(self) -> datetime:
         return self._clock()
 
-    def _admission_lock(self) -> asyncio.Lock:
-        loop = asyncio.get_running_loop()
-        lock = self._locks.get(loop)
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        """Session-scoped admission lock.
+
+        Lookup-and-create contains no await, so it is atomic on the single
+        event loop that owns this service (the service is created per
+        application run by the lifespan, never shared across loops).
+        """
+        lock = self._session_locks.get(session_id)
         if lock is None:
             lock = asyncio.Lock()
-            self._locks[loop] = lock
+            self._session_locks[session_id] = lock
         return lock
 
     # -- expiry ---------------------------------------------------------------
@@ -191,12 +214,17 @@ class RunAdmissionService:
             del self.runs[run_id]
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
+        # session ids are never reused, so an idle lock can be dropped safely: a
+        # coroutine still waiting on it re-checks and finds the session gone
+        lock = self._session_locks.get(session_id)
+        if lock is not None and not lock.locked():
+            del self._session_locks[session_id]
 
     def _session_expired(self, session: SessionRecord) -> bool:
         return self.now() >= session.expires_at
 
     def _expire_if_needed(self, session_id: str) -> None:
-        """Called under the admission lock. Expired sessions vanish entirely —
+        """Called under the session lock. Expired sessions vanish entirely —
         session, runs, idempotency and the raw text snapshots included."""
         session = self.sessions.get(session_id)
         if session is not None and self._session_expired(session):
@@ -212,9 +240,9 @@ class RunAdmissionService:
     ) -> SessionResponse:
         """Create a session record.
 
-        Deliberately synchronous: it is a single dict insertion with no
-        check-then-act window, so no admission lock (and no await) is needed;
-        the run lifecycle — which does span awaits — is locked.
+        Deliberately synchronous: it is a single dict insertion of a fresh uuid
+        with no check-then-act window, so no admission lock (and no await) is
+        needed; the run lifecycle — which does span awaits — is locked.
         """
         record = SessionRecord(
             session_id=uuid.uuid4().hex,
@@ -236,7 +264,7 @@ class RunAdmissionService:
         )
 
     async def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
-        async with self._admission_lock():
+        async with self._lock_for(session_id):
             session = self.sessions.get(session_id)
             if session is None:
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
@@ -245,11 +273,27 @@ class RunAdmissionService:
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
             if not self._owns(session, principal):
                 raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
-            # durable records go FIRST: a storage failure must not leave the
-            # session purged in memory while its events are still readable
-            for record in [r for r in self.runs.values() if r.session_id == session_id]:
-                await self._delete_durable(record)
+            await self._delete_runs_of(session_id)
             self._purge_session(session_id)
+
+    async def _delete_runs_of(self, session_id: str) -> None:
+        """Resumable teardown: durable delete first, memory drop only after.
+
+        Memory therefore never claims a run that storage no longer has, and a
+        mid-way failure stops immediately (nothing past the failure point is
+        touched) while keeping the session, so the client can simply retry: the
+        runs already deleted are gone, and the retry resumes at the first run
+        that is still durable.
+        """
+        for record in [r for r in self.runs.values() if r.session_id == session_id]:
+            try:
+                await self.repository.delete(record.identity)
+            except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.NOT_FOUND:
+                    pass  # already gone (TTL or a previous attempt): idempotent
+                else:
+                    raise AppError(exc.code) from exc
+            self._forget_run(record.run_id)
 
     @staticmethod
     def _owns(session: SessionRecord, principal: DevicePrincipal) -> bool:
@@ -258,24 +302,34 @@ class RunAdmissionService:
             and session.device_id == principal.device_id
         )
 
-    # -- durable plumbing --------------------------------------------------------
+    def _forget_run(self, run_id: str) -> None:
+        """Drop a run this process can no longer reach durably."""
+        self.runs.pop(run_id, None)
+        for key in [k for k, v in list(self.idempotency.items()) if v[0] == run_id]:
+            del self.idempotency[key]
 
-    async def _delete_durable(self, record: RunRecord) -> None:
+    # -- durable state reads -----------------------------------------------------
+
+    async def _read_durable_state(self, record: RunRecord) -> RunState:
+        """Authoritative state; a vanished run is reported as NOT_FOUND."""
         try:
-            await self.repository.delete(record.identity)
+            return await self.repository.state(record.identity)
+        except RunRepositoryError as exc:
+            raise AppError(exc.code) from exc
+
+    async def _durable_state_or_none(self, record: RunRecord) -> RunState | None:
+        """Like :meth:`_read_durable_state`, but ``None`` means "gone durably".
+
+        Only the NOT_FOUND fault is absorbed; an unavailable or inconsistent
+        repository keeps raising, so a storage outage can never be mistaken for
+        an absent run.
+        """
+        try:
+            return await self.repository.state(record.identity)
         except RunRepositoryError as exc:
             if exc.fault is RunRepositoryFault.NOT_FOUND:
-                return  # already gone (TTL/expiry): delete is idempotent
+                return None
             raise AppError(exc.code) from exc
-
-    async def _durable_state(self, record: RunRecord) -> RunState:
-        """Read the authoritative state and refresh the mirror."""
-        try:
-            state = await self.repository.state(record.identity)
-        except RunRepositoryError as exc:
-            raise AppError(exc.code) from exc
-        record.state = state
-        return state
 
     # -- runs -------------------------------------------------------------------
 
@@ -292,16 +346,24 @@ class RunAdmissionService:
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _snapshot(self, run: RunRecord) -> RunStatusSnapshot:
+    @staticmethod
+    def _snapshot(run: RunRecord, state: RunState) -> RunStatusSnapshot:
         return RunStatusSnapshot(
             run_id=run.run_id,
             session_id=run.session_id,
-            state=run.state,
+            state=state,
             created_at=run.created_at,
         )
 
+    def _session_of(self, run_id: str) -> str:
+        """Session that owns this run (raises NOT_FOUND before any lock)."""
+        record = self.runs.get(run_id)
+        if record is None:
+            raise AppError(ErrorCode.NOT_FOUND_RUN)
+        return record.session_id
+
     def _owned_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
-        """Owned-run lookup; must be called under the admission lock."""
+        """Owned-run lookup; must be called under the session lock."""
         record = self.runs.get(run_id)
         if record is None:
             raise AppError(ErrorCode.NOT_FOUND_RUN)
@@ -324,7 +386,7 @@ class RunAdmissionService:
         request_id: str,
         trace_id: str,
     ) -> RunStatusSnapshot:
-        async with self._admission_lock():
+        async with self._lock_for(req.session_id):
             self._expire_if_needed(req.session_id)
             session = self.sessions.get(req.session_id)
             if session is None:
@@ -339,15 +401,27 @@ class RunAdmissionService:
                 run_id, stored_hash = existing
                 record = self.runs.get(run_id)
                 if record is not None:
-                    if stored_hash == payload_hash:
-                        return self._snapshot(record)  # idempotent replay
-                    raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+                    if stored_hash != payload_hash:
+                        raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+                    # the replay answers with the DURABLE state: a run that has
+                    # since finished reports finished, not the state it had when
+                    # the key was first stored
+                    state = await self._durable_state_or_none(record)
+                    if state is not None:
+                        return self._snapshot(record, state)
+                    # the old run is gone durably (TTL): forget it and create
+                    self._forget_run(run_id)
 
-            # one active (non-terminal) run per session
-            for run in self.runs.values():
-                if run.session_id == session.session_id and not is_terminal_state(
-                    run.state
-                ):
+            # one active (non-terminal) run per session, decided by the
+            # repository — never by a local mirror
+            for record in list(self.runs.values()):
+                if record.session_id != session.session_id:
+                    continue
+                state = await self._durable_state_or_none(record)
+                if state is None:
+                    self._forget_run(record.run_id)
+                    continue
+                if not is_terminal_state(state):
                     raise AppError(ErrorCode.CONFLICT_ACTIVE_RUN)
 
             run_id = uuid.uuid4().hex
@@ -382,28 +456,27 @@ class RunAdmissionService:
             )
             self.runs[run_id] = record
             self.idempotency[key] = (run_id, payload_hash)
-            return self._snapshot(record)
+            return self._snapshot(record, RunState.ACCEPTED)
 
     async def get_run(
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
-        async with self._admission_lock():
+        async with self._lock_for(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
-            await self._durable_state(record)
-            return self._snapshot(record)
+            return self._snapshot(record, await self._read_durable_state(record))
 
     async def cancel_run(
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
-        async with self._admission_lock():
+        async with self._lock_for(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
             for _ in range(MAX_CANCEL_ATTEMPTS):
-                state = await self._durable_state(record)
+                state = await self._read_durable_state(record)
                 if is_terminal_state(state):
-                    return self._snapshot(record)  # cancel is idempotent
+                    return self._snapshot(record, state)  # cancel is idempotent
                 try:
-                    # expected-state CAS: a concurrent transition can never be
-                    # silently overwritten by a cancel
+                    # expected-state CAS: a concurrent transition (another
+                    # worker, a future agent) can never be overwritten silently
                     await self.repository.commit_transition(
                         record.identity,
                         expected_state=state,
@@ -413,8 +486,7 @@ class RunAdmissionService:
                     if exc.fault is RunRepositoryFault.CAS_CONFLICT:
                         continue  # the run moved: re-read and retry, bounded
                     raise AppError(exc.code) from exc
-                record.state = RunState.CANCELLED
-                return self._snapshot(record)
+                return self._snapshot(record, RunState.CANCELLED)
             raise AppError(ErrorCode.CONFLICT_ACTIVE_RUN)
 
     # -- streaming ---------------------------------------------------------------
@@ -428,9 +500,9 @@ class RunAdmissionService:
         foreign or unknown run is answered with a JSON error envelope and never
         with a half-open stream.
         """
-        async with self._admission_lock():
+        async with self._lock_for(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
-            state = await self._durable_state(record)
+            state = await self._read_durable_state(record)
             return record.identity, state
 
     def reader(self, identity: RunIdentity) -> SnapshotReader:
@@ -442,12 +514,20 @@ class RunAdmissionService:
         return wait_page
 
 
-SERVICE = RunAdmissionService()
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+async def get_service(request: Request) -> RunAdmissionService:
+    """The lifespan-scoped service (one per application run)."""
+    service = getattr(request.app.state, "agent_service", None)
+    if service is None:  # pragma: no cover - the server always runs the lifespan
+        raise AppError(ErrorCode.UNAVAILABLE_MAINTENANCE)
+    return service
+
+
+ServiceDep = Depends(get_service)
 
 
 def _snapshot_response(snap: RunStatusSnapshot) -> RunStatusResponse:
@@ -482,59 +562,160 @@ async def _stream_with_errors(
 
 
 @router.post(
-    "/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED
+    "/sessions",
+    response_model=SessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=error_responses(
+        ErrorCode.VALIDATION_INVALID_INPUT,
+        ErrorCode.AUTH_MISSING_CREDENTIALS,
+        ErrorCode.AUTH_INVALID_CREDENTIALS,
+        ErrorCode.AUTH_DEVICE_NOT_REGISTERED,
+        ErrorCode.INTERNAL_UNKNOWN,
+    ),
 )
 async def create_session(
     req: CreateSessionRequest,
     principal: DevicePrincipal = PrincipalDep,
+    service: RunAdmissionService = ServiceDep,
 ) -> SessionResponse:
-    return SERVICE.create_session(principal, req)
+    return service.create_session(principal, req)
 
 
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=error_responses(
+        ErrorCode.AUTH_MISSING_CREDENTIALS,
+        ErrorCode.AUTH_INVALID_CREDENTIALS,
+        ErrorCode.AUTHZ_FORBIDDEN,
+        ErrorCode.NOT_FOUND_SESSION,
+        ErrorCode.UNAVAILABLE_OVERLOADED,
+        ErrorCode.INTERNAL_UNKNOWN,
+    ),
+)
 async def delete_session(
     session_id: str,
     principal: DevicePrincipal = PrincipalDep,
+    service: RunAdmissionService = ServiceDep,
 ) -> None:
-    await SERVICE.delete_session(principal, session_id)
+    await service.delete_session(principal, session_id)
 
 
-@router.post("/agent/runs", response_model=RunStatusResponse)
+@router.post(
+    "/agent/runs",
+    response_model=RunStatusResponse,
+    responses=error_responses(
+        ErrorCode.VALIDATION_INVALID_INPUT,
+        ErrorCode.AUTH_MISSING_CREDENTIALS,
+        ErrorCode.AUTH_INVALID_CREDENTIALS,
+        ErrorCode.AUTHZ_FORBIDDEN,
+        ErrorCode.NOT_FOUND_SESSION,
+        ErrorCode.CONFLICT_ACTIVE_RUN,
+        ErrorCode.CONFLICT_IDEMPOTENCY,
+        ErrorCode.UNAVAILABLE_OVERLOADED,
+        ErrorCode.INTERNAL_UNKNOWN,
+    ),
+)
 async def create_run(
     req: CreateRunRequest,
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
+    service: RunAdmissionService = ServiceDep,
 ) -> RunStatusResponse:
     request_id, trace_id = request_ids(request)
-    snap = await SERVICE.create_run(
+    snap = await service.create_run(
         principal, req, request_id=request_id, trace_id=trace_id
     )
     return _snapshot_response(snap)
 
 
-@router.get("/agent/runs/{run_id}", response_model=RunStatusResponse)
+@router.get(
+    "/agent/runs/{run_id}",
+    response_model=RunStatusResponse,
+    responses=error_responses(
+        ErrorCode.AUTH_MISSING_CREDENTIALS,
+        ErrorCode.AUTH_INVALID_CREDENTIALS,
+        ErrorCode.AUTHZ_FORBIDDEN,
+        ErrorCode.NOT_FOUND_RUN,
+        ErrorCode.UNAVAILABLE_OVERLOADED,
+        ErrorCode.INTERNAL_UNKNOWN,
+    ),
+)
 async def get_run(
     run_id: str,
     principal: DevicePrincipal = PrincipalDep,
+    service: RunAdmissionService = ServiceDep,
 ) -> RunStatusResponse:
-    return _snapshot_response(await SERVICE.get_run(principal, run_id))
+    return _snapshot_response(await service.get_run(principal, run_id))
 
 
-@router.delete("/agent/runs/{run_id}", response_model=RunStatusResponse)
+@router.delete(
+    "/agent/runs/{run_id}",
+    response_model=RunStatusResponse,
+    responses=error_responses(
+        ErrorCode.AUTH_MISSING_CREDENTIALS,
+        ErrorCode.AUTH_INVALID_CREDENTIALS,
+        ErrorCode.AUTHZ_FORBIDDEN,
+        ErrorCode.NOT_FOUND_RUN,
+        ErrorCode.CONFLICT_ACTIVE_RUN,
+        ErrorCode.UNAVAILABLE_OVERLOADED,
+        ErrorCode.INTERNAL_UNKNOWN,
+    ),
+)
 async def cancel_run(
     run_id: str,
     principal: DevicePrincipal = PrincipalDep,
+    service: RunAdmissionService = ServiceDep,
 ) -> RunStatusResponse:
-    return _snapshot_response(await SERVICE.cancel_run(principal, run_id))
+    return _snapshot_response(await service.cancel_run(principal, run_id))
 
 
-@router.get("/agent/runs/{run_id}/events")
+@router.get(
+    "/agent/runs/{run_id}/events",
+    # No ``response_class`` on purpose: FastAPI would stamp that class's media
+    # type onto EVERY documented response, advertising the pre-stream JSON error
+    # envelopes as text/event-stream. The endpoint returns an
+    # ``SSEStreamingResponse`` instance (which fixes the wire media type) and
+    # ``app.main`` normalises the documented media types to what each response
+    # really uses.
+    responses={
+        200: {
+            "description": (
+                "SSE 事件流。`id` = run 事件序号（可直接回填 Last-Event-ID 续传），"
+                "`event` = 协议事件类型，`data` = 完整 SSEEvent（protocol_version/seq/"
+                "tenant_id/device_id/session_id/run_id/layer/event/data/timestamp）。"
+                "空闲时发送注释帧 `: keep-alive`（无 id、不占序号）；"
+                "响应开始后的故障以**单帧** `stream.error` 结束（无 id，载荷为统一错误信封）。"
+            ),
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+        **error_responses(
+            ErrorCode.VALIDATION_INVALID_INPUT,
+            ErrorCode.AUTH_MISSING_CREDENTIALS,
+            ErrorCode.AUTH_INVALID_CREDENTIALS,
+            ErrorCode.AUTHZ_FORBIDDEN,
+            ErrorCode.NOT_FOUND_RUN,
+            ErrorCode.UNAVAILABLE_OVERLOADED,
+            ErrorCode.INTERNAL_UNKNOWN,
+        ),
+    },
+)
 async def stream_run_events(
     run_id: str,
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
-    after_seq: int = Query(0, ge=0),
-) -> StreamingResponse:
+    after_seq: int = Query(
+        0,
+        ge=0,
+        description="只发送 seq 大于该值的事件（与 Last-Event-ID 取较大者）",
+    ),
+    last_event_id: str | None = Header(
+        default=None,
+        alias="Last-Event-ID",
+        description="断线续传游标：客户端最后收到的 SSE `id`；非法值忽略并回落 after_seq",
+    ),
+    service: RunAdmissionService = ServiceDep,
+) -> SSEStreamingResponse:
     """Public SSE route: one atomic read stream per authenticated run.
 
     Order matters: authentication (``PrincipalDep``, default deny) and the
@@ -542,17 +723,16 @@ async def stream_run_events(
     failures are plain JSON envelopes. Resume state comes from ``Last-Event-ID``
     and/or ``after_seq`` (max wins); the heartbeat window is a server constant.
     """
-    identity, _state = await SERVICE.authorize_stream(principal, run_id)
-    cursor = effective_after_seq(after_seq, request.headers.get("last-event-id"))
+    identity, _state = await service.authorize_stream(principal, run_id)
+    cursor = effective_after_seq(after_seq, last_event_id)
     request_id, trace_id = request_ids(request)
     engine = stream_engine(
-        wait_page=SERVICE.reader(identity),
+        wait_page=service.reader(identity),
         after_seq=cursor,
         heartbeat_s=SSE_HEARTBEAT_S,
     )
-    return StreamingResponse(
+    return SSEStreamingResponse(
         _stream_with_errors(engine, request_id=request_id, trace_id=trace_id),
-        media_type="text/event-stream",
         headers=dict(SSE_RESPONSE_HEADERS),
     )
 
@@ -562,7 +742,45 @@ async def live() -> dict:
     return {"status": "alive"}
 
 
-@router.get("/health/ready")
-async def ready() -> dict:
-    # component status only — never expose session/run counts publicly
-    return {"status": "ready", "checks": {"core": "ok"}}
+@router.get(
+    "/health/ready",
+    responses={
+        200: {
+            "description": "本环境所需组件全部就绪",
+            "content": {"application/json": {"schema": _READINESS_SCHEMA}},
+        },
+        503: {
+            "description": (
+                "未就绪：持久化 RunRepository 或持久化 AdmissionStore 缺失"
+                "（staging/production 会因此在启动阶段失败封闭）"
+            ),
+            "content": {"application/json": {"schema": _READINESS_SCHEMA}},
+        },
+    },
+)
+async def ready(request: Request) -> JSONResponse:
+    """Readiness is computed from the ACTUAL backends in use.
+
+    Component status only — never session/run counts. An application that is
+    not ready answers 503 instead of a cheerful 200, so an in-memory
+    deployment cannot be mistaken for a production-ready one.
+    """
+    report = getattr(request.app.state, "readiness", None)
+    if report is None:
+        service = getattr(request.app.state, "agent_service", None)
+        settings = getattr(request.app.state, "settings", None)
+        if service is not None and settings is not None:
+            report = readiness_report(settings, service.repository)
+    if report is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "checks": {},
+                "problems": ["application service is not running"],
+            },
+        )
+    return JSONResponse(
+        status_code=200 if report.ready else 503,
+        content=report.as_dict(),
+    )

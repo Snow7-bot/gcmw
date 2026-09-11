@@ -1,0 +1,155 @@
+"""The published contract must match the wire (#65B-2 B2-B review round).
+
+The public SSE route used to advertise ``application/json`` for a 200 and only
+a 422 for failures, while the server actually answers ``text/event-stream`` and
+a unified ``ErrorEnvelope`` at 400/401/403/404. Both halves are asserted here:
+the schema document, and the statuses the running app really returns.
+"""
+
+from __future__ import annotations
+
+import pytest
+from api_harness import (
+    OTHER_DEVICE,
+    PRINCIPAL,
+    Harness,
+    new_run,
+    new_session,
+    running_app,
+)
+
+from app.api.v1.auth import get_device_principal
+from app.config import Settings
+from app.main import create_app
+
+EVENTS_PATH = "/api/v1/agent/runs/{run_id}/events"
+
+#: statuses the public SSE route documents (and must actually return)
+EVENTS_ERROR_STATUSES = {"400", "401", "403", "404", "500", "503"}
+ENVELOPE_FIELDS = {
+    "code",
+    "message",
+    "request_id",
+    "trace_id",
+    "retryable",
+    "retry_after_ms",
+}
+
+
+@pytest.fixture(scope="module")
+def schema() -> dict:
+    return create_app(settings=Settings(environment="test")).openapi()
+
+
+@pytest.fixture
+def harness() -> Harness:
+    with running_app() as h:
+        yield h
+
+
+def _operation(schema: dict, path: str, method: str = "get") -> dict:
+    return schema["paths"][path][method]
+
+
+class TestDocumentedContract:
+    def test_events_200_is_text_event_stream(self, schema):
+        responses = _operation(schema, EVENTS_PATH)["responses"]
+        assert list(responses["200"]["content"]) == ["text/event-stream"]
+
+    def test_events_route_documents_its_resume_inputs(self, schema):
+        params = {
+            (p["name"], p["in"]) for p in _operation(schema, EVENTS_PATH)["parameters"]
+        }
+        assert ("after_seq", "query") in params
+        assert ("Last-Event-ID", "header") in params
+        header = next(
+            p
+            for p in _operation(schema, EVENTS_PATH)["parameters"]
+            if p["name"] == "Last-Event-ID"
+        )
+        assert header["required"] is False
+
+    def test_events_route_documents_the_real_error_statuses(self, schema):
+        responses = _operation(schema, EVENTS_PATH)["responses"]
+        assert set(responses) - {"200"} == EVENTS_ERROR_STATUSES
+        for status, response in responses.items():
+            content = response["content"]
+            if status == "200":
+                # exactly one media type: the spurious JSON default must be gone
+                assert set(content) == {"text/event-stream"}
+                continue
+            # pre-stream failures are JSON envelopes, never SSE frames
+            assert set(content) == {"application/json"}
+            ref = content["application/json"]["schema"]["$ref"]
+            assert ref.endswith("/ErrorEnvelope")
+
+    def test_non_streaming_routes_document_json_only(self, schema):
+        for path, path_item in schema["paths"].items():
+            for method, operation in path_item.items():
+                if path == EVENTS_PATH:
+                    continue
+                for status, response in operation.get("responses", {}).items():
+                    content = response.get("content") or {}
+                    assert "text/event-stream" not in content, (method, path, status)
+
+    def test_no_route_documents_422(self, schema):
+        """Validation failures are answered with 400 by the error boundary."""
+        for path_item in schema["paths"].values():
+            for operation in path_item.values():
+                assert "422" not in operation.get("responses", {})
+
+    def test_error_envelope_shape_is_published(self, schema):
+        published = schema["components"]["schemas"]["ErrorEnvelope"]["properties"]
+        assert set(published) == ENVELOPE_FIELDS
+
+    def test_write_routes_document_their_conflicts_and_absences(self, schema):
+        create = _operation(schema, "/api/v1/agent/runs", "post")["responses"]
+        assert {"400", "401", "403", "404", "409", "500", "503"} <= set(create)
+        cancel = _operation(schema, "/api/v1/agent/runs/{run_id}", "delete")[
+            "responses"
+        ]
+        assert {"403", "404", "409", "503"} <= set(cancel)
+
+    def test_readiness_documents_503(self, schema):
+        responses = _operation(schema, "/api/v1/health/ready")["responses"]
+        assert set(responses) == {"200", "503"}
+
+
+class TestWireParity:
+    """Every documented status for the SSE route is actually reachable."""
+
+    def test_200_is_a_stream(self, harness):
+        run = new_run(harness, new_session(harness)["session_id"])
+        harness.client.delete(f"/api/v1/agent/runs/{run['run_id']}")
+        res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
+        assert res.status_code == 200
+        assert res.headers["content-type"].startswith("text/event-stream")
+
+    def test_400_for_an_invalid_cursor(self, harness):
+        run = new_run(harness, new_session(harness)["session_id"])
+        res = harness.client.get(
+            f"/api/v1/agent/runs/{run['run_id']}/events?after_seq=-1"
+        )
+        assert res.status_code == 400
+        assert res.json()["code"] == "E_VALIDATION_INVALID_INPUT"
+
+    def test_401_without_credentials(self):
+        with running_app(overrides=False) as h:
+            res = h.client.get("/api/v1/agent/runs/whatever/events")
+        assert res.status_code == 401
+        assert res.json()["code"] == "E_AUTH_MISSING_CREDENTIALS"
+
+    def test_403_for_a_foreign_device(self, harness):
+        run = new_run(harness, new_session(harness)["session_id"])
+        harness.app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
+        try:
+            res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
+        finally:
+            harness.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+        assert res.status_code == 403
+        assert res.json()["code"] == "E_AUTHZ_FORBIDDEN"
+
+    def test_404_for_an_unknown_run(self, harness):
+        res = harness.client.get("/api/v1/agent/runs/ghost/events")
+        assert res.status_code == 404
+        assert res.json()["code"] == "E_NOT_FOUND_RUN"

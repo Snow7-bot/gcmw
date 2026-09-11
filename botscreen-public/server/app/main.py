@@ -5,22 +5,37 @@
   safe message only (no raw exceptions, provider text, paths or stacks);
 - request/trace ids are minted per request and echoed in headers and error
   envelopes;
-- validation errors map to ``E_VALIDATION_INVALID_INPUT``;
-- anything uncaught maps to ``E_INTERNAL_UNKNOWN``.
+- validation errors map to ``E_VALIDATION_INVALID_INPUT`` (HTTP 400 — the API
+  never answers 422, and the published contract says so);
+- anything uncaught maps to ``E_INTERNAL_UNKNOWN``;
+- configuration comes from :class:`~app.config.Settings` (``GCMW_ENV`` and
+  friends) and the run service lives in the **lifespan scope**: one service per
+  application run, i.e. exactly one event loop owns its asyncio primitives;
+- startup FAILS CLOSED in staging/production while the run repository or the
+  session/idempotency admission store is in-memory (see :mod:`app.runtime`).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
 from app.agents.registry import RegistryError
-from app.api.v1.agent_api import AppError
+from app.api.v1.agent_api import AppError, RunAdmissionService
 from app.api.v1.agent_api import router as agent_router
 from app.api.v1.errors import request_ids
+from app.config import Settings
 from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 from app.providers.model_gateway import ModelGatewayError
+from app.runtime import build_run_repository, readiness_report
+
+APP_TITLE = "gcmw agent api"
+APP_VERSION = "0.1.0"
 
 
 def _envelope_response(
@@ -36,8 +51,69 @@ def _envelope_response(
     )
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="gcmw agent api", version="0.1.0")
+def _normalize_stream_media_types(responses: dict) -> None:
+    """Keep exactly the media type each documented response really uses.
+
+    FastAPI appends the route's ``response_class`` media type to EVERY response
+    it documents. On the public SSE route that would advertise the pre-stream
+    JSON error envelopes (400/401/403/404/500/503) as ``text/event-stream`` —
+    exactly the kind of contract lie this API must not publish. A successful
+    streaming response is SSE; every other response of that operation is the
+    JSON ErrorEnvelope.
+    """
+    streaming = any(
+        "text/event-stream" in response.get("content", {})
+        for response in responses.values()
+    )
+    if not streaming:
+        return
+    for status, response in responses.items():
+        content = response.get("content")
+        if not content:
+            continue
+        keep = "text/event-stream" if status.startswith("2") else "application/json"
+        for media_type in list(content):
+            if media_type != keep:
+                del content[media_type]
+
+
+def create_app(
+    settings: Settings | None = None,
+    repository_factory: Callable[[Settings], object] | None = None,
+) -> FastAPI:
+    """Compose the application.
+
+    ``settings`` defaults to the environment (``GCMW_ENV`` …); the repository
+    factory is the single composition seam (tests inject a repository, the
+    runtime picks the backend for the environment).
+    """
+    settings = settings or Settings.from_env()
+    factory = repository_factory or build_run_repository
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # the service is built ONCE per application run: a single event loop
+        # owns its asyncio locks, and no module-level singleton can be shared
+        # between loops (or between workers) by accident
+        service = RunAdmissionService(repository=factory(settings))
+        report = readiness_report(settings, service.repository)
+        if not report.ready:
+            raise RuntimeError(
+                f"refusing to start in environment {settings.environment!r}: "
+                + "; ".join(report.problems)
+            )
+        app.state.agent_service = service
+        app.state.readiness = report
+        try:
+            yield
+        finally:
+            app.state.agent_service = None
+            app.state.readiness = None
+
+    app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
+    app.state.settings = settings
+    app.state.agent_service = None
+    app.state.readiness = None
 
     @app.middleware("http")
     async def ids_middleware(request: Request, call_next):
@@ -74,6 +150,32 @@ def create_app() -> FastAPI:
         return _envelope_response(request, ErrorCode.INTERNAL_UNKNOWN)
 
     app.include_router(agent_router)
+
+    # -- published contract ----------------------------------------------------
+
+    def openapi() -> dict:
+        """Serve a contract that matches the wire, not the framework defaults.
+
+        FastAPI advertises 422 for validated parameters, but this application
+        maps EVERY validation failure onto a 400 ``ErrorEnvelope``; the entry is
+        therefore removed so the published contract cannot disagree with the
+        response a client actually receives.
+        """
+        if app.openapi_schema is None:
+            schema = get_openapi(
+                title=APP_TITLE, version=APP_VERSION, routes=app.routes
+            )
+            for path_item in schema.get("paths", {}).values():
+                for operation in path_item.values():
+                    if not isinstance(operation, dict):
+                        continue
+                    responses = operation.get("responses", {})
+                    responses.pop("422", None)
+                    _normalize_stream_media_types(responses)
+            app.openapi_schema = schema
+        return app.openapi_schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
     return app
 
 

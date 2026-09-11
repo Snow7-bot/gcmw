@@ -105,7 +105,9 @@ class Settings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     app_name: str = "gcmw-agent"
-    environment: Literal["development", "staging", "production"] = "development"
+    # "test" behaves exactly like development: the in-memory repository and
+    # admission store are legitimate there, while staging/production fail closed.
+    environment: Literal["development", "test", "staging", "production"] = "development"
     debug: bool = False
     active_provider: Literal["mock", "cloud", "local"] = "mock"
 
