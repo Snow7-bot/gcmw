@@ -225,16 +225,57 @@ def _validate_event(event: SSEEvent, cursor: int, snapshot: StreamSnapshot) -> N
         )
 
 
-def _validate_terminal_event(event: SSEEvent, snapshot: StreamSnapshot) -> None:
-    """A terminal event must be the LAST retained event, exactly."""
-    if event.event is not SSEEventType.RUN_COMPLETED:
-        return
-    if snapshot.terminal_seq is None or event.seq != snapshot.terminal_seq:
-        raise SSEStreamError(
-            StreamFault.SNAPSHOT_INCONSISTENT,
-            f"terminal event at seq {event.seq} but terminal_seq is "
-            f"{snapshot.terminal_seq}",
-        )
+def _prepare_page(snapshot: StreamSnapshot, cursor: int) -> tuple[list[SSEEvent], int]:
+    """Validate the WHOLE page before a single frame is emitted.
+
+    Runs with a temporary cursor so that no partial output can escape when the
+    page is invalid: continuity/order, terminal binding and "nothing after the
+    terminal" are all checked here. Returns the deduplicated new events plus
+    the final cursor.
+    """
+    new_events: list[SSEEvent] = []
+    temp = cursor
+    terminal_closed = False
+    for event in snapshot.events:
+        _validate_event(event, temp, snapshot)
+        # the seq declared as terminal_seq must actually BE the terminal event
+        if (
+            snapshot.terminal_seq is not None
+            and event.seq == snapshot.terminal_seq
+            and event.event is not SSEEventType.RUN_COMPLETED
+        ):
+            raise SSEStreamError(
+                StreamFault.MISSING_TERMINAL_EVENT,
+                f"terminal_seq {snapshot.terminal_seq} holds "
+                f"{event.event.value}, not run.completed",
+            )
+        # a terminal event is only legal as the last retained event of a
+        # terminal run
+        if event.event is SSEEventType.RUN_COMPLETED and (
+            snapshot.state not in TERMINAL_STATES
+            or event.seq != snapshot.terminal_seq
+            or event.seq != snapshot.latest_seq
+        ):
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                f"run.completed at seq {event.seq} is not the terminal "
+                f"position (terminal_seq={snapshot.terminal_seq}, "
+                f"latest_seq={snapshot.latest_seq}, "
+                f"state={snapshot.state.value})",
+            )
+        if event.seq == temp:
+            continue  # overlapping duplicate of the last accepted seq
+        if terminal_closed:
+            # a NEW event after the terminal frame must never be emitted
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                f"new event at seq {event.seq} after the terminal event",
+            )
+        new_events.append(event)
+        temp = event.seq
+        if event.event is SSEEventType.RUN_COMPLETED:
+            terminal_closed = True
+    return new_events, temp
 
 
 async def _stream(
@@ -247,12 +288,10 @@ async def _stream(
             # validated idle timeout: exactly one keep-alive, cursor unchanged
             yield keep_alive()
             continue
-        for event in snapshot.events:
-            _validate_event(event, cursor, snapshot)
-            if event.seq == cursor:
-                continue
-            _validate_terminal_event(event, snapshot)
-            cursor = event.seq
+        # PHASE 1 — full page validation (nothing is emitted if it fails)
+        new_events, cursor = _prepare_page(snapshot, cursor)
+        # PHASE 2 — emit the validated frames
+        for event in new_events:
             yield frame(event)
             if event.event is SSEEventType.RUN_COMPLETED:
                 return

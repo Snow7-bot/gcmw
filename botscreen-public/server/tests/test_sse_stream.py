@@ -346,6 +346,54 @@ class TestNoProgressAndZeroSemantics:
         assert exc.value.fault is StreamFault.SNAPSHOT_INCONSISTENT
 
 
+class TestPagePreValidation:
+    """Nothing is emitted until the WHOLE page validates (two-phase stream)."""
+
+    @mark.asyncio
+    async def test_terminal_seq_holding_non_terminal_event_fails(self):
+        # terminal_seq=2 but seq 2 is a process.status -> no terminal frame ever
+        page = [ACCEPTED, _event(2, SSEEventType.PROCESS_STATUS)]
+        reader = FakeReader(
+            [snap(page, state=RunState.COMPLETED, latest=2, terminal=2)]
+        )
+        stream = stream_engine(wait_page=reader)
+        with pytest.raises(SSEStreamError) as exc:
+            await anext(stream)  # FIRST anext: no frame escapes
+        assert exc.value.fault is StreamFault.MISSING_TERMINAL_EVENT
+
+    @mark.asyncio
+    async def test_gap_page_fails_before_first_frame(self):
+        reader = FakeReader([snap([ACCEPTED, _event(3)], oldest=1, latest=3)])
+        stream = stream_engine(wait_page=reader)
+        with pytest.raises(SSEStreamError) as exc:
+            await anext(stream)  # id:1 must NOT be emitted before the fault
+        assert exc.value.fault is StreamFault.REPLAY_GAP
+
+    @mark.asyncio
+    async def test_same_seq_event_after_terminal_fails(self):
+        # a non-terminal event repeating the terminal seq after run.completed
+        page = [
+            ACCEPTED,
+            COMPLETED,
+            _event(2, SSEEventType.PROCESS_STATUS),  # same seq, non-terminal
+        ]
+        reader = FakeReader(
+            [snap(page, state=RunState.COMPLETED, latest=2, terminal=2)]
+        )
+        stream = stream_engine(wait_page=reader)
+        with pytest.raises(SSEStreamError) as exc:
+            await anext(stream)
+        assert exc.value.fault is StreamFault.MISSING_TERMINAL_EVENT
+
+    @mark.asyncio
+    async def test_legal_terminal_page_still_emits_both_frames(self):
+        reader = FakeReader(
+            [snap([ACCEPTED, COMPLETED], state=RunState.COMPLETED, latest=2)]
+        )
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert [f.split("\n", 1)[0] for f in frames] == ["id: 1", "id: 2"]
+
+
 class TestHeartbeatTiming:
     @mark.asyncio
     async def test_events_arriving_immediately_never_heartbeat(self):
