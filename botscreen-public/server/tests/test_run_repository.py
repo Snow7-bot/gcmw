@@ -11,15 +11,18 @@ and Memory/Redis window parity.
 """
 
 import asyncio
+import inspect
+import json as _json
 import os
 import time
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 from pytest import mark
 
 from app.api.v1.sse_stream import StreamFault, stream_engine
-from app.contracts.events import SSEEventType
+from app.contracts.events import SSEEvent, SSEEventType
 from app.contracts.run import RunState
 from app.orchestration.state_machine import is_allowed_transition
 from app.storage.run_repository import (
@@ -391,7 +394,7 @@ class TestEngineIntegration:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         frames = [
             f
@@ -524,7 +527,6 @@ class FakeRedis:
             "device_id": device,
             "session_id": session,
             "latest_seq": "1",
-            "answer_sealed": "0",
         }
         self.streams.setdefault(stream_key, []).append(("1-0", {"event": event_json}))
         self.maxlen[stream_key] = int(maxlen)
@@ -558,8 +560,29 @@ class FakeRedis:
             return -7
         if int(fields["latest_seq"]) != expected_seq:
             return -6
-        if args[10] == "1" and fields.get("answer_sealed") != "1":
-            return -9  # STREAMING -> COMPLETED requires answer.completed
+        if args[10] == "1":
+            entries = self.streams[stream_key]
+            if not entries:
+                return -9
+            if entries[-1][0] != f"{expected_seq}-0":  # physical id must match
+                return -9
+            try:
+                newest = _json.loads(entries[-1][1]["event"])
+            except Exception:  # noqa: BLE001
+                return -9
+            origins = set(args[13].split(","))
+            if (
+                newest.get("event") != "answer.completed"
+                or str(newest.get("seq")) != str(expected_seq)
+                or newest.get("tenant_id") != args[0]
+                or newest.get("device_id") != args[1]
+                or newest.get("session_id") != args[2]
+                or newest.get("run_id") != args[11]
+                or newest.get("layer") != "answer"
+                or newest.get("protocol_version") != args[12]
+                or (newest.get("data") or {}).get("content_origin") not in origins
+            ):
+                return -9  # no real answer.completed proves the seal
         seq = expected_seq + 1
         self.streams[stream_key].append((f"{seq}-0", {"event": args[6]}))
         fields["state"] = args[5]
@@ -577,8 +600,28 @@ class FakeRedis:
         if guard is not None:
             return guard
         fields = self.hashes[state_key]
-        if fields.get("answer_sealed") == "1":
-            return -8
+        entries = self.streams[stream_key]
+        if entries:
+            latest = int(fields["latest_seq"])
+            if entries[-1][0] != f"{latest}-0":
+                return -10  # physical id does not match the business seq
+            payload = entries[-1][1].get("event")
+            if payload is None:
+                return -10
+            try:
+                newest = _json.loads(payload)
+            except Exception:  # noqa: BLE001
+                return -10  # corrupt tail: fail closed, never append
+            if (
+                str(newest.get("seq")) != str(latest)
+                or newest.get("tenant_id") != args[0]
+                or newest.get("device_id") != args[1]
+                or newest.get("session_id") != args[2]
+                or newest.get("run_id") != args[10]
+            ):
+                return -10
+            if newest.get("event") == "answer.completed":
+                return -8  # the answer is sealed: no further answer events
         if fields["state"] not in set(args[7].split(",")):
             return -8
         expected_seq = int(args[3])
@@ -587,8 +630,6 @@ class FakeRedis:
         seq = expected_seq + 1
         self.streams[stream_key].append((f"{seq}-0", {"event": args[4]}))
         fields["latest_seq"] = str(seq)
-        if args[8] == "1":
-            fields["answer_sealed"] = "1"
         self.maxlen[stream_key] = int(args[6])
         self._trim(stream_key)
         self._event_of(stream_key).set()
@@ -614,8 +655,6 @@ class FakeRedis:
         return 1
 
     def _twin_snapshot(self, keys, args):
-        import json as _json
-
         state_key, stream_key = keys
         tenant, device, session, start, limit = args[:5]
         if state_key not in self.hashes:
@@ -639,6 +678,7 @@ class FakeRedis:
                 raise RuntimeError("MALFORMED_ENTRY")
         oldest = entries[0][0] if entries else ""
         newest = entries[-1][0] if entries else ""
+        newest_payload = entries[-1][1]["event"] if entries else ""
         terminal = fields.get("terminal_seq", "")
         terminal_id = ""
         terminal_payload = ""
@@ -668,7 +708,7 @@ class FakeRedis:
             fields["session_id"],
             oldest,
             newest,
-            fields.get("answer_sealed", "0"),
+            newest_payload,
             terminal_id,
             terminal_payload,
         ]
@@ -721,6 +761,29 @@ class FakeRedis:
         for name in names:
             self.hashes.pop(name, None)
             self.streams.pop(name, None)
+
+
+class TamperingClient:
+    """Wraps a redis client and mutates the store right before one script runs.
+
+    Simulates the reviewer's TOCTOU probe: the Python pre-read already
+    happened, so only the atomic Lua gate can catch the tampering.
+    """
+
+    def __init__(self, inner, tamper=None) -> None:
+        self._inner = inner
+        self._tamper = tamper
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        if self._tamper is not None:
+            callback, self._tamper = self._tamper, None
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        return await self._inner.eval(script, numkeys, *keys_and_args)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 def _redis_repo(redis=None, **kwargs):
@@ -1077,7 +1140,7 @@ class TestRedisRepository:
                 T1,
                 expected_state=STREAMING,
                 next_state=COMPLETED,
-                data={"status": "completed"},
+                data={},
             )
         assert exc.value.fault is RunRepositoryFault.INVARIANT
         after = await repo.snapshot(T1, 0, 0.01)
@@ -1097,7 +1160,7 @@ class TestRedisRepository:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         snapshot = await repo.snapshot(T1, 0, 0.01)
         assert snapshot.terminal_seq == seq == snapshot.latest_seq
@@ -1154,7 +1217,7 @@ class TestRedisRepository:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         state_key, stream_key = repo.keys(T1)
         terminal_seq = redis.hashes[state_key]["terminal_seq"]
@@ -1189,7 +1252,7 @@ class TestRedisRepository:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         state_key, stream_key = repo.keys(T1)
         terminal_seq = int(redis.hashes[state_key]["terminal_seq"])
@@ -1246,7 +1309,7 @@ class TestRedisRepository:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         state_key, stream_key = repo.keys(T1)
         terminal_seq = int(redis.hashes[state_key]["terminal_seq"])
@@ -1281,12 +1344,263 @@ class TestRedisRepository:
                 T1,
                 expected_state=STREAMING,
                 next_state=COMPLETED,
-                data={"status": "completed"},
+                data={},
             )
         assert exc.value.fault is RunRepositoryFault.INVARIANT
         after = await repo.snapshot(T1, 0, 0.01)
         assert after.state is STREAMING
         assert [e.seq for e in after.events] == [e.seq for e in before.events]
+
+    @mark.asyncio
+    async def test_state_event_fields_are_derived_not_supplied(self):
+        repo = MemoryRunRepository()
+        await _to_streaming(repo)
+        # caller-supplied authoritative fields are refused
+        for payload in ({"status": "completed"}, {"stage": "completed"}):
+            with pytest.raises(RunRepositoryError) as exc:
+                await repo.commit_transition(
+                    T1, expected_state=STREAMING, next_state=FAILED, data=payload
+                )
+            assert exc.value.fault is RunRepositoryFault.INVARIANT
+        # derived status always matches the committed state
+        await repo.commit_transition(T1, expected_state=STREAMING, next_state=FAILED)
+        snapshot = await repo.snapshot(T1, 0, 0.01)
+        assert snapshot.state is FAILED
+        assert snapshot.events[-1].event is SSEEventType.RUN_COMPLETED
+        assert snapshot.events[-1].data["status"] == "failed"
+
+    @mark.asyncio
+    async def test_process_status_stage_is_derived(self):
+        repo = MemoryRunRepository()
+        await repo.create(T1)
+        await repo.commit_transition(
+            T1, expected_state=ACCEPTED, next_state=GUARDING, data={"message": "ok"}
+        )
+        snapshot = await repo.snapshot(T1, 0, 0.01)
+        assert snapshot.events[-1].data == {"stage": "guarding", "message": "ok"}
+
+    @mark.asyncio
+    async def test_answer_completed_requires_content_origin(self):
+        repo = MemoryRunRepository()
+        await _to_streaming(repo)
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.append_event(
+                T1, event_type=SSEEventType.ANSWER_COMPLETED, data={"citations": []}
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert "content_origin" in str(exc.value)
+
+    @mark.asyncio
+    async def test_nested_forbidden_keys_are_rejected_without_echo(self):
+        marker = "marker_should_not_appear"
+        cases = [
+            {"sources": [{"chain_of_thought": marker}]},
+            {
+                "citations": [{"system_prompt": marker}],
+                "content_origin": "ai_generated",
+            },
+            {"actions": [{"tool_arguments": marker}], "content_origin": "ai_generated"},
+        ]
+        with pytest.raises(RunRepositoryError) as exc:
+            build_event(T1, 3, SSEEventType.ANSWER_COMPLETED, cases[1])
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert marker not in str(exc.value)  # never echo the offending value
+        with pytest.raises(RunRepositoryError):
+            build_event(T1, 4, SSEEventType.EVIDENCE_FOUND, cases[0])
+
+    @mark.asyncio
+    async def test_forged_answer_seal_bit_is_not_enough(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await _to_streaming(repo)
+        state_key, _ = repo.keys(T1)
+        redis.hashes[state_key]["answer_sealed"] = "1"  # fake the cached bit
+        before = await repo.snapshot(T1, 0, 0.01)
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.commit_transition(
+                T1, expected_state=STREAMING, next_state=COMPLETED
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        after = await repo.snapshot(T1, 0, 0.01)
+        assert after.state is STREAMING  # zero writes
+        assert [e.seq for e in after.events] == [e.seq for e in before.events]
+
+    @mark.asyncio
+    async def test_terminal_payload_seq_tampering_is_invariant(self):
+        import json as _json2
+
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await _to_streaming(repo)
+        await repo.append_event(
+            T1,
+            event_type=SSEEventType.ANSWER_COMPLETED,
+            data={"citations": [], "content_origin": "ai_generated"},
+        )
+        await repo.commit_transition(T1, expected_state=STREAMING, next_state=COMPLETED)
+        state_key, stream_key = repo.keys(T1)
+        terminal_seq = redis.hashes[state_key]["terminal_seq"]
+        redis.streams[stream_key] = [
+            (
+                entry_id,
+                {
+                    "event": _json2.dumps(
+                        {
+                            **_json2.loads(payload["event"]),
+                            "seq": 999,  # payload seq no longer matches its position
+                        }
+                    )
+                }
+                if entry_id.split("-")[0] == terminal_seq
+                else payload,
+            )
+            for entry_id, payload in redis.streams[stream_key]
+        ]
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, int(terminal_seq), 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+
+    @mark.asyncio
+    async def test_answer_completed_without_origin_rejected_at_contract(self):
+        import json as _json2
+
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await _to_streaming(repo)
+        await repo.append_event(
+            T1,
+            event_type=SSEEventType.ANSWER_COMPLETED,
+            data={"citations": [], "content_origin": "ai_generated"},
+        )
+        state_key, stream_key = repo.keys(T1)
+        entry_id, payload = redis.streams[stream_key][-1]
+        forged = _json2.loads(payload["event"])
+        forged["data"] = {"citations": []}  # provenance marker removed
+        redis.streams[stream_key][-1] = (entry_id, {"event": _json2.dumps(forged)})
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert state_key not in ("", None)
+
+    @mark.asyncio
+    async def test_tuple_nested_sensitive_key_rejected(self):
+        with pytest.raises(ValidationError) as exc:
+            SSEEvent(
+                seq=2,
+                tenant_id="t1",
+                device_id="d1",
+                session_id="s1",
+                run_id="r1",
+                layer="answer",
+                event=SSEEventType.ANSWER_COMPLETED,
+                data={
+                    "content_origin": "ai_generated",
+                    "sources": ({"chain_of_thought": "HIDDEN-TUPLE-VALUE"},),
+                },
+            )
+        assert "chain_of_thought" in str(exc.value)
+        assert "HIDDEN-TUPLE-VALUE" not in str(exc.value)  # value never echoed
+
+    @mark.asyncio
+    async def test_error_messages_never_echo_payload_values(self):
+        marker = "marker_placeholder_value"
+        with pytest.raises(RunRepositoryError) as exc:
+            build_event(
+                T1,
+                3,
+                SSEEventType.ANSWER_COMPLETED,
+                {
+                    "content_origin": "ai_generated",
+                    "sources": [{"chain_of_thought": marker}],
+                },
+            )
+        assert marker not in str(exc.value)
+        with pytest.raises(ValidationError) as vexc:
+            SSEEvent.model_validate(
+                {
+                    "seq": 1,
+                    "tenant_id": "t1",
+                    "device_id": "d1",
+                    "session_id": "s1",
+                    "run_id": "r1",
+                    "layer": "process",
+                    "event": "run.accepted",
+                    # 'bogus' is the offending KEY; the marker rides as a VALUE
+                    "data": {"status": "accepted", "message": marker, "bogus": "x"},
+                }
+            )
+        assert "bogus" in str(vexc.value)
+        assert marker not in str(vexc.value)  # values are never echoed
+
+    @mark.asyncio
+    async def test_tocfe_tampering_run_id_between_read_and_commit(self):
+        redis = FakeRedis()
+        await _to_streaming(repo := _redis_repo(redis))
+        await repo.append_event(
+            T1,
+            event_type=SSEEventType.ANSWER_COMPLETED,
+            data={"citations": [], "content_origin": "ai_generated"},
+        )
+        state_key, stream_key = repo.keys(T1)
+
+        def tamper():
+            entry_id, payload = redis.streams[stream_key][-1]
+            forged = _json.loads(payload["event"])
+            forged["run_id"] = "other-run"  # tamper after the Python pre-read
+            redis.streams[stream_key][-1] = (entry_id, {"event": _json.dumps(forged)})
+
+        repo = _redis_repo(TamperingClient(redis, tamper))
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.commit_transition(
+                T1, expected_state=STREAMING, next_state=COMPLETED
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert redis.hashes[state_key]["state"] == "STREAMING"  # zero writes
+
+    @mark.asyncio
+    async def test_tocfe_tampering_physical_id_between_read_and_commit(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await _to_streaming(repo)
+        await repo.append_event(
+            T1,
+            event_type=SSEEventType.ANSWER_COMPLETED,
+            data={"citations": [], "content_origin": "ai_generated"},
+        )
+        state_key, stream_key = repo.keys(T1)
+
+        def tamper():
+            entry_id, payload = redis.streams[stream_key][-1]
+            seq = entry_id.split("-")[0]
+            redis.streams[stream_key][-1] = (f"{seq}-999", payload)  # bad physical id
+
+        repo = _redis_repo(TamperingClient(redis, tamper))
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.commit_transition(
+                T1, expected_state=STREAMING, next_state=COMPLETED
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert redis.hashes[state_key]["state"] == "STREAMING"  # zero writes
+
+    @mark.asyncio
+    async def test_tocfe_corrupt_tail_between_read_and_append(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await _to_streaming(repo)
+        _state_key, stream_key = repo.keys(T1)
+        before = len(redis.streams[stream_key])
+
+        def tamper():
+            entry_id, _payload = redis.streams[stream_key][-1]
+            redis.streams[stream_key][-1] = (entry_id, {"event": "{broken"})
+
+        repo = _redis_repo(TamperingClient(redis, tamper))
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.append_event(
+                T1, event_type=SSEEventType.ANSWER_DELTA, data={"delta": "x"}
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert len(redis.streams[stream_key]) == before  # zero writes
 
     @mark.asyncio
     async def test_snapshot_limit_is_validated(self):
@@ -1470,7 +1784,7 @@ class TestRealRedis:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         snapshot = await repo.snapshot(T1, 0, 0.01)
         assert snapshot.state is COMPLETED
@@ -1487,7 +1801,7 @@ class TestRealRedis:
                 R2,
                 expected_state=STREAMING,
                 next_state=COMPLETED,
-                data={"status": "completed"},
+                data={},
             )
         assert exc.value.fault is RunRepositoryFault.INVARIANT
         assert await repo.state(R2) is STREAMING  # zero writes
@@ -1518,7 +1832,7 @@ class TestRealRedis:
             T1,
             expected_state=STREAMING,
             next_state=COMPLETED,
-            data={"status": "completed"},
+            data={},
         )
         state_key, stream_key = repo.keys(T1)
         terminal_seq = int(
@@ -1532,6 +1846,49 @@ class TestRealRedis:
             if seq == terminal_seq:
                 forged = _json.loads(payload)
                 forged["tenant_id"] = "t2"  # forge the hidden terminal identity
+                payload = _json.dumps(forged)
+            await repo._client.xadd(
+                stream_key, {"event": payload}, id=entry_id.decode()
+            )
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, terminal_seq, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+
+    @mark.asyncio
+    async def test_forged_answer_seal_bit_is_not_enough(self, repo):
+        await _to_streaming(repo)
+        state_key, _ = repo.keys(T1)
+        await repo._client.hset(state_key, "answer_sealed", "1")  # fake cached bit
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.commit_transition(
+                T1, expected_state=STREAMING, next_state=COMPLETED
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert await repo.state(T1) is STREAMING  # zero writes
+
+    @mark.asyncio
+    async def test_terminal_payload_seq_tampering_is_invariant(self, repo):
+        import json as _json
+
+        await _to_streaming(repo)
+        await repo.append_event(
+            T1,
+            event_type=SSEEventType.ANSWER_COMPLETED,
+            data={"citations": [], "content_origin": "ai_generated"},
+        )
+        await repo.commit_transition(T1, expected_state=STREAMING, next_state=COMPLETED)
+        state_key, stream_key = repo.keys(T1)
+        terminal_seq = int(
+            (await repo._client.hget(state_key, "terminal_seq")).decode()
+        )
+        entries = await repo._client.xrange(stream_key)
+        await repo._client.delete(stream_key)
+        for entry_id, fields in entries:
+            payload = fields[b"event"].decode()
+            seq = int(entry_id.decode().split("-")[0])
+            if seq == terminal_seq:
+                forged = _json.loads(payload)
+                forged["seq"] = 999  # payload seq no longer matches its position
                 payload = _json.dumps(forged)
             await repo._client.xadd(
                 stream_key, {"event": payload}, id=entry_id.decode()

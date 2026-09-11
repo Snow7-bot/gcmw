@@ -56,10 +56,12 @@ from app.api.v1.sse_stream import StreamSnapshot
 from app.contracts.errors import ErrorCode
 from app.contracts.events import (
     EVENT_DATA_ALLOWED_KEYS,
-    FORBIDDEN_DATA_KEYS,
+    SSE_PROTOCOL_VERSION,
+    ContentOrigin,
     EventLayer,
     SSEEvent,
     SSEEventType,
+    contains_forbidden_key,
 )
 from app.contracts.run import RunState
 from app.orchestration.state_machine import (
@@ -70,7 +72,6 @@ from app.orchestration.state_machine import (
 
 DEFAULT_MAX_EVENTS_PER_RUN = 10_000
 DEFAULT_RUN_TTL_S = 1800  # V2.3 session idle window
-DEFAULT_BLOCK_MS = 15_000
 DEFAULT_SNAPSHOT_LIMIT = 500
 DEFAULT_OP_TIMEOUT_S = 5.0
 DEFAULT_BLOCK_GRACE_S = 5.0  # network grace added to a blocking read budget
@@ -86,6 +87,7 @@ _CODE_SEQ_MOVED = -6  # retry with a fresh snapshot
 _CODE_STATE_MISMATCH = -7  # CAS conflict
 _CODE_STATE_NOT_ALLOWED = -8  # event/state whitelist or answer already sealed
 _CODE_ANSWER_REQUIRED = -9  # STREAMING -> COMPLETED without answer.completed
+_CODE_CORRUPT_TAIL = -10  # newest stream entry is malformed / misidentified
 
 #: state-preserving events and the states they may be written in.
 #: ``heartbeat`` is intentionally absent: B-1 defines it as a comment frame
@@ -225,6 +227,52 @@ def _layer_for(event_type: SSEEventType) -> EventLayer:
     return EventLayer.PROCESS
 
 
+#: authoritative terminal status derived from the target state (never supplied)
+_TERMINAL_STATUS: dict[RunState, str] = {
+    RunState.COMPLETED: "completed",
+    RunState.DEGRADED: "degraded",
+    RunState.HANDOFF: "handoff",
+    RunState.FAILED: "failed",
+    RunState.CANCELLED: "cancelled",
+}
+
+
+def state_event_data(
+    next_state: RunState, data: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Authoritative state-event payload derived from ``next_state``.
+
+    The caller may only contribute non-authoritative fields (``message`` for a
+    process status, ``result`` for a terminal event). ``stage`` / ``status``
+    are produced here, so a caller can never claim a status that contradicts
+    the state that was actually committed.
+    """
+    payload = json.loads(json.dumps(data or {}))
+    for key in ("stage", "status"):
+        if key in payload:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"{key!r} is derived from the target state and must not be supplied",
+            )
+    if is_terminal_state(next_state):
+        payload["status"] = _TERMINAL_STATUS[next_state]
+        permitted = {"result"}
+    else:
+        payload["stage"] = next_state.value.lower()
+        permitted = {"message"}
+    extra = (
+        set(payload)
+        - permitted
+        - ({"status"} if is_terminal_state(next_state) else {"stage"})
+    )
+    if extra:
+        raise RunRepositoryError(
+            RunRepositoryFault.INVARIANT,
+            f"unsupported state-event fields: {sorted(extra)}",
+        )
+    return payload
+
+
 def build_event(
     identity: RunIdentity,
     seq: int,
@@ -235,11 +283,13 @@ def build_event(
 ) -> SSEEvent:
     """Construct + validate the event BEFORE any write (whitelist enforced)."""
     payload = json.loads(json.dumps(data or {}))  # detach from caller objects
-    for key in payload:
-        if key in FORBIDDEN_DATA_KEYS:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT, f"forbidden data key {key!r}"
-            )
+    forbidden = contains_forbidden_key(payload)
+    if forbidden is not None:
+        # key NAME only: the offending value is never echoed
+        raise RunRepositoryError(
+            RunRepositoryFault.INVARIANT,
+            f"forbidden data key {forbidden!r} (checked recursively)",
+        )
     allowed = EVENT_DATA_ALLOWED_KEYS.get(event_type, frozenset())
     unknown = set(payload) - set(allowed)
     if unknown:
@@ -247,6 +297,14 @@ def build_event(
             RunRepositoryFault.INVARIANT,
             f"data keys {sorted(unknown)} not allowed for {event_type.value}",
         )
+    if event_type is SSEEventType.ANSWER_COMPLETED:
+        origin = payload.get("content_origin")
+        valid_origins = {member.value for member in ContentOrigin}
+        if origin not in valid_origins:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                "answer.completed requires a valid content_origin",
+            )
     kwargs: dict[str, Any] = {
         "seq": seq,
         "tenant_id": identity.tenant_id,
@@ -321,7 +379,6 @@ class _Record:
     state: RunState
     events: list[SSEEvent] = field(default_factory=list)
     terminal_seq: int | None = None
-    answer_sealed: bool = False
     expires_at: float | None = None
     waiters: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -399,14 +456,20 @@ class MemoryRunRepository:
                     RunRepositoryFault.ILLEGAL_TRANSITION,
                     f"illegal transition {expected_state.value} -> {next_state.value}",
                 )
-            if next_state is RunState.COMPLETED and not record.answer_sealed:
+            if next_state is RunState.COMPLETED and not self._answer_sealed(record):
                 raise RunRepositoryError(
                     RunRepositoryFault.INVARIANT,
                     "STREAMING -> COMPLETED requires a prior answer.completed",
                 )
             event_type = SSEEventType(transition_event_type(next_state))
             seq = record.latest_seq + 1
-            event = build_event(record.identity, seq, event_type, data)
+            # authoritative stage/status come from the target state
+            event = build_event(
+                record.identity,
+                seq,
+                event_type,
+                state_event_data(next_state, data),
+            )
             record.events.append(event.model_copy(deep=True))
             record.state = next_state
             if is_terminal_state(next_state):
@@ -432,13 +495,11 @@ class MemoryRunRepository:
                     f"run {identity.run_id!r} is terminal",
                 )
             _require_stateless_support(
-                event_type, record.state, answer_sealed=record.answer_sealed
+                event_type, record.state, answer_sealed=self._answer_sealed(record)
             )
             seq = record.latest_seq + 1
             event = build_event(record.identity, seq, event_type, data)
             record.events.append(event.model_copy(deep=True))
-            if event_type in SEALING_EVENT_TYPES:
-                record.answer_sealed = True
             self._trim(record)
             self._refresh_ttl(record)
             record.waiters.set()
@@ -455,92 +516,6 @@ class MemoryRunRepository:
             self._records.pop(self._key(identity), None)
 
     # -- engine read interface --------------------------------------------------
-
-    def _parse_event(self, stream_id: str, payload: str) -> SSEEvent:
-        """Malformed payloads become a structured invariant, never a raw error."""
-        try:
-            return SSEEvent.model_validate(json.loads(payload))
-        except Exception as exc:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"malformed event payload at {stream_id!r}: {exc}",
-            ) from exc
-
-    def _validate_event_identity(
-        self,
-        event: SSEEvent,
-        identity: RunIdentity,
-        *,
-        device_id: str,
-        session_id: str,
-    ) -> None:
-        if (
-            event.tenant_id != identity.tenant_id
-            or event.device_id != device_id
-            or event.session_id != session_id
-            or event.run_id != identity.run_id
-        ):
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"event {event.seq} identity does not match the run record",
-            )
-
-    def _validate_terminal(
-        self,
-        *,
-        identity: RunIdentity,
-        state: RunState,
-        latest: int,
-        terminal: int | None,
-        terminal_id: str,
-        terminal_payload: str,
-        device_id: str,
-        session_id: str,
-    ) -> None:
-        """Terminal state, terminal_seq and the terminal EVENT must agree, and
-        the terminal event's identity is checked even when the resume cursor
-        keeps it out of the returned page."""
-        if terminal is None:
-            if is_terminal_state(state):
-                raise RunRepositoryError(
-                    RunRepositoryFault.INVARIANT,
-                    f"terminal state {state.value} without terminal_seq",
-                )
-            if terminal_id or terminal_payload:
-                raise RunRepositoryError(
-                    RunRepositoryFault.INVARIANT,
-                    "terminal event present without terminal_seq",
-                )
-            return
-        if not is_terminal_state(state):
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"non-terminal state {state.value} carries terminal_seq {terminal}",
-            )
-        if terminal != latest:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"terminal_seq {terminal} != latest_seq {latest}",
-            )
-        if not terminal_id or not terminal_payload:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"terminal_seq {terminal} has no terminal event",
-            )
-        if self._strict_id_seq(terminal_id) != terminal:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"terminal id {terminal_id!r} != terminal_seq {terminal}",
-            )
-        event = self._parse_event(terminal_id, terminal_payload)
-        if event.event is not SSEEventType.RUN_COMPLETED:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"terminal_seq {terminal} holds {event.event.value}",
-            )
-        self._validate_event_identity(
-            event, identity, device_id=device_id, session_id=session_id
-        )
 
     async def snapshot(
         self, identity: RunIdentity, cursor: int, timeout_s: float
@@ -595,6 +570,14 @@ class MemoryRunRepository:
         if record is not None and self._expired(record):
             del self._records[key]
 
+    @staticmethod
+    def _answer_sealed(record: _Record) -> bool:
+        """Seal is proven by the REAL newest event — never a cached boolean."""
+        if not record.events:
+            return False
+        newest = record.events[-1]
+        return newest.event is SSEEventType.ANSWER_COMPLETED
+
     def _trim(self, record: _Record) -> None:
         while len(record.events) > self._max_events:
             record.events.pop(0)
@@ -636,7 +619,7 @@ if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
 end
 redis.call('HSET', KEYS[1],
   'state', 'ACCEPTED', 'tenant_id', ARGV[1], 'device_id', ARGV[2],
-  'session_id', ARGV[3], 'latest_seq', '1', 'answer_sealed', '0')
+  'session_id', ARGV[3], 'latest_seq', '1')
 redis.call('XADD', KEYS[2], 'MAXLEN', '=', ARGV[5], '1-0', 'event', ARGV[6])
 if tonumber(ARGV[4]) > 0 then
   redis.call('EXPIRE', KEYS[1], ARGV[4])
@@ -653,8 +636,34 @@ if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -4 end
 if redis.call('EXISTS', KEYS[2]) == 0 then return -5 end
 if redis.call('HGET', KEYS[1], 'terminal_seq') then return -3 end
 if redis.call('HGET', KEYS[1], 'state') ~= ARGV[4] then return -7 end
-if ARGV[11] == '1' and redis.call('HGET', KEYS[1], 'answer_sealed') ~= '1' then
-  return -9
+if ARGV[11] == '1' then
+  -- the seal must be proven by the REAL newest event, not a cached bit, and
+  -- only inside this atomic window (no TOCTOU gap)
+  local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+  if not last[1] then return -9 end
+  if last[1][1] ~= ARGV[5] .. '-0' then return -9 end
+  local fields = last[1][2]
+  local payload = nil
+  for i = 1, #fields - 1, 2 do
+    if fields[i] == 'event' then payload = fields[i + 1] end
+  end
+  if payload == nil then return -9 end
+  local ok, decoded = pcall(cjson.decode, payload)
+  if not ok or type(decoded) ~= 'table' then return -9 end
+  if decoded['event'] ~= 'answer.completed' then return -9 end
+  if tostring(decoded['seq']) ~= ARGV[5] then return -9 end
+  if decoded['tenant_id'] ~= ARGV[1] or decoded['device_id'] ~= ARGV[2]
+     or decoded['session_id'] ~= ARGV[3] or decoded['run_id'] ~= ARGV[12] then
+    return -9
+  end
+  if decoded['layer'] ~= 'answer' then return -9 end
+  if decoded['protocol_version'] ~= ARGV[13] then return -9 end
+  local origin = decoded['data'] and decoded['data']['content_origin'] or ''
+  local origin_ok = false
+  for token in string.gmatch(ARGV[14], '[^,]+') do
+    if token == origin then origin_ok = true end
+  end
+  if not origin_ok then return -9 end
 end
 local latest = tonumber(redis.call('HGET', KEYS[1], 'latest_seq') or '0')
 if latest ~= tonumber(ARGV[5]) then return -6 end
@@ -679,7 +688,26 @@ if redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2] then return -4 end
 if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -4 end
 if redis.call('EXISTS', KEYS[2]) == 0 then return -5 end
 if redis.call('HGET', KEYS[1], 'terminal_seq') then return -3 end
-if redis.call('HGET', KEYS[1], 'answer_sealed') == '1' then return -8 end
+local latest = tonumber(redis.call('HGET', KEYS[1], 'latest_seq') or '0')
+local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+if last[1] then
+  -- the tail must be intact and self-consistent, otherwise fail closed
+  if last[1][1] ~= tostring(latest) .. '-0' then return -10 end
+  local fields = last[1][2]
+  local payload = nil
+  for i = 1, #fields - 1, 2 do
+    if fields[i] == 'event' then payload = fields[i + 1] end
+  end
+  if payload == nil then return -10 end
+  local ok, decoded = pcall(cjson.decode, payload)
+  if not ok or type(decoded) ~= 'table' then return -10 end
+  if tostring(decoded['seq']) ~= tostring(latest) then return -10 end
+  if decoded['tenant_id'] ~= ARGV[1] or decoded['device_id'] ~= ARGV[2]
+     or decoded['session_id'] ~= ARGV[3] or decoded['run_id'] ~= ARGV[11] then
+    return -10
+  end
+  if decoded['event'] == 'answer.completed' then return -8 end
+end
 local state = redis.call('HGET', KEYS[1], 'state')
 local allowed = false
 for token in string.gmatch(ARGV[8], '[^,]+') do
@@ -692,9 +720,6 @@ local seq = latest + 1
 redis.call('XADD', KEYS[2], 'MAXLEN', '=', ARGV[7], tostring(seq) .. '-0',
   'event', ARGV[5])
 redis.call('HSET', KEYS[1], 'latest_seq', tostring(seq))
-if ARGV[9] == '1' then
-  redis.call('HSET', KEYS[1], 'answer_sealed', '1')
-end
 if tonumber(ARGV[10]) > 0 then
   redis.call('EXPIRE', KEYS[1], ARGV[10])
   redis.call('EXPIRE', KEYS[2], ARGV[10])
@@ -734,13 +759,20 @@ local latest = redis.call('HGET', KEYS[1], 'latest_seq') or '0'
 local terminal = redis.call('HGET', KEYS[1], 'terminal_seq') or ''
 local device = redis.call('HGET', KEYS[1], 'device_id') or ''
 local session = redis.call('HGET', KEYS[1], 'session_id') or ''
-local sealed = redis.call('HGET', KEYS[1], 'answer_sealed') or '0'
 local oldest = ''
 local first = redis.call('XRANGE', KEYS[2], '-', '+', 'COUNT', 1)
 if first[1] then oldest = first[1][1] end
 local newest = ''
+local newest_payload = ''
 local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
-if last[1] then newest = last[1][1] end
+if last[1] then
+  newest = last[1][1]
+  local last_fields = last[1][2]
+  for i = 1, #last_fields - 1, 2 do
+    if last_fields[i] == 'event' then newest_payload = last_fields[i + 1] end
+  end
+  if newest_payload == '' then return redis.error_reply('MALFORMED_ENTRY') end
+end
 -- the terminal event itself is returned (id + payload) so the caller can
 -- validate its identity even when a resume cursor hides it from the page
 local terminal_id = ''
@@ -766,8 +798,8 @@ if terminal ~= '' then
     return redis.error_reply('MALFORMED_TERMINAL')
   end
 end
-local out = {state, latest, terminal, device, session, oldest, newest, sealed,
-             terminal_id, terminal_payload}
+local out = {state, latest, terminal, device, session, oldest, newest,
+             newest_payload, terminal_id, terminal_payload}
 local entries = redis.call('XRANGE', KEYS[2], ARGV[4], '+', 'COUNT', ARGV[5])
 for i = 1, #entries do
   local fields = entries[i][2]
@@ -987,7 +1019,7 @@ class RedisRunRepository:
                 ),
                 seq,
                 SSEEventType(transition_event_type(next_state)),
-                data,
+                state_event_data(next_state, data),
             )
             terminal = "1" if is_terminal_state(next_state) else "0"
             code = await self._eval_code(
@@ -1005,6 +1037,9 @@ class RedisRunRepository:
                     str(self._max_events),
                     str(self._ttl_s or 0),
                     "1" if require_answer else "0",
+                    identity.run_id,
+                    SSE_PROTOCOL_VERSION,
+                    ",".join(sorted(o.value for o in ContentOrigin)),
                 ),
                 what="commit",
             )
@@ -1076,6 +1111,7 @@ class RedisRunRepository:
                     ",".join(sorted(s.value for s in allowed)),
                     sealing,
                     str(self._ttl_s or 0),
+                    identity.run_id,
                 ),
                 what="append",
             )
@@ -1137,6 +1173,11 @@ class RedisRunRepository:
                 RunRepositoryFault.INVARIANT,
                 "orphan key pair: state and stream disagree",
             )
+        if code == _CODE_CORRUPT_TAIL:
+            return RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                "stream tail is corrupt or misidentified",
+            )
         if code == _CODE_ANSWER_REQUIRED:
             return RunRepositoryError(
                 RunRepositoryFault.INVARIANT,
@@ -1184,7 +1225,7 @@ class RedisRunRepository:
             device_id, session_id = values[3], values[4]
             oldest_id = values[5]
             newest_id = values[6]
-            answer_sealed = values[7] == "1"
+            newest_payload = values[7]
             terminal_id, terminal_payload = values[8], values[9]
         except (ValueError, IndexError, KeyError) as exc:
             raise RunRepositoryError(
@@ -1205,6 +1246,18 @@ class RedisRunRepository:
                 RunRepositoryFault.INVARIANT,
                 f"stream newest id {newest_id!r} != hash latest_seq {latest}",
             )
+        answer_sealed = False
+        if newest_payload:
+            newest_event = self._parse_event(newest_id or "<newest>", newest_payload)
+            if newest_event.seq != latest:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"newest event seq {newest_event.seq} != latest_seq {latest}",
+                )
+            self._validate_event_identity(
+                newest_event, identity, device_id=device_id, session_id=session_id
+            )
+            answer_sealed = newest_event.event is SSEEventType.ANSWER_COMPLETED
         self._validate_terminal(
             identity=identity,
             state=state,
@@ -1335,6 +1388,12 @@ class RedisRunRepository:
                 RunRepositoryFault.INVARIANT,
                 f"terminal_seq {terminal} holds {event.event.value}",
             )
+        if event.seq != terminal:
+            # the payload's own seq must agree with its position
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"terminal payload seq {event.seq} != terminal_seq {terminal}",
+            )
         self._validate_event_identity(
             event, identity, device_id=device_id, session_id=session_id
         )
@@ -1384,7 +1443,6 @@ class RedisRunRepository:
 
 __all__ = [
     "DEFAULT_BLOCK_GRACE_S",
-    "DEFAULT_BLOCK_MS",
     "DEFAULT_MAX_EVENTS_PER_RUN",
     "DEFAULT_OP_TIMEOUT_S",
     "DEFAULT_RUN_TTL_S",

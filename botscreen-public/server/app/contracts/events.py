@@ -110,6 +110,28 @@ FORBIDDEN_DATA_KEYS: frozenset[str] = frozenset(
 )
 
 
+def contains_forbidden_key(node: Any) -> str | None:
+    """Recursively detect a sensitive key at ANY depth.
+
+    ``chain_of_thought`` smuggled inside ``sources``/``citations``/``actions``
+    must be rejected exactly like a top-level one — the check is a deep scan
+    and only ever returns the key NAME (values are never echoed).
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in FORBIDDEN_DATA_KEYS:
+                return str(key)
+            found = contains_forbidden_key(value)
+            if found is not None:
+                return found
+    elif isinstance(node, (list, tuple, set, frozenset)):
+        for item in node:
+            found = contains_forbidden_key(item)
+            if found is not None:
+                return found
+    return None
+
+
 def is_terminal_event(event: SSEEventType) -> bool:
     """True when the event type terminates a run stream."""
     return event in TERMINAL_EVENTS
@@ -121,7 +143,8 @@ def allowed_layers(event: SSEEventType) -> frozenset[EventLayer]:
 
 
 class SSEEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # hide_input_in_errors: validation text must never embed payload values
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     protocol_version: str = SSE_PROTOCOL_VERSION
     seq: int = Field(..., ge=1)
@@ -157,9 +180,11 @@ class SSEEvent(BaseModel):
         allowed = EVENT_DATA_ALLOWED_KEYS.get(self.event)
         if allowed is None:
             raise ValueError(f"event {self.event.value!r} has no data allowlist")
+        # one deep scan (key NAME only — values are never echoed)
+        forbidden = contains_forbidden_key(self.data)
+        if forbidden is not None:
+            raise ValueError(f"forbidden data key {forbidden!r} in SSE event")
         for key in self.data:
-            if key in FORBIDDEN_DATA_KEYS:
-                raise ValueError(f"forbidden data key {key!r} in SSE event")
             if key not in allowed:
                 raise ValueError(
                     f"data key {key!r} is not allowed for event {self.event.value!r}"
@@ -169,13 +194,12 @@ class SSEEvent(BaseModel):
             delta = self.data.get("delta")
             if not isinstance(delta, str) or not delta.strip():
                 raise ValueError("answer.delta requires a non-empty string delta")
-        if (
-            self.event is SSEEventType.ANSWER_COMPLETED
-            and "content_origin" in self.data
-        ):
-            origin = self.data["content_origin"]
+        if self.event is SSEEventType.ANSWER_COMPLETED:
+            # UNCONDITIONAL: an answer without a provenance marker can never be
+            # persisted, replayed or rendered — no "optional" path exists.
+            origin = self.data.get("content_origin")
             if origin not in {o.value for o in ContentOrigin}:
-                raise ValueError(f"invalid content_origin {origin!r}")
+                raise ValueError("answer.completed requires a valid content_origin")
         return self
 
 
