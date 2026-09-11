@@ -1045,9 +1045,14 @@ class TestRealRedis:
 
         results = await asyncio.gather(transition(), append())
         successes = [r for r in results if r]
-        assert len(successes) == len(set(successes)) == 1
+        assert len(successes) == len(set(successes))  # never a duplicate seq
         snapshot = await repo.snapshot(T1, 0, 0.01)
-        assert [e.seq for e in snapshot.events] == [1, 2]
+        stored = [e.seq for e in snapshot.events]
+        assert stored == list(range(1, len(stored) + 1))  # contiguous, no gaps
+        assert (
+            sum(1 for e in snapshot.events if e.event is SSEEventType.PROCESS_STATUS)
+            == 1
+        )
 
     @mark.asyncio
     async def test_wrong_device_session_refused(self, repo):
@@ -1108,8 +1113,9 @@ class TestRealRedis:
         )
         snapshot = await repo.snapshot(T1, 0, 0.01)
         assert snapshot.state is COMPLETED
-        assert snapshot.terminal_seq == snapshot.latest_seq == 7
-        assert [e.seq for e in snapshot.events] == [1, 2, 3, 4, 5, 6, 7]
+        # create(1) + 5 transitions(2..6) + delta(7) + terminal(8)
+        assert snapshot.terminal_seq == snapshot.latest_seq == 8
+        assert [e.seq for e in snapshot.events] == list(range(1, 9))
         assert snapshot.oldest_available_seq == 1
 
     @mark.asyncio
