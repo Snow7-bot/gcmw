@@ -1,76 +1,87 @@
-"""Internal SSE stream engine (issue #65B — slice B-1, no public route).
+"""Internal SSE stream engine (issue #65B — slice B-1, engine only).
 
-Reviewer-narrowed scope for this slice: the engine and its protocol only. The
-public ``/events/stream`` route, connection leases, reconnect grace windows,
-atomic RunRepository persistence and async Redis waiting are all #65B-2.
+Reviewer-narrowed scope (round 2): this slice defines the ASYNC SNAPSHOT READ
+INTERFACE and the stream algorithm, plus a fake implementation in tests. It
+ships no Redis wiring and no public HTTP route — those are #65B-2.
 
-Engine contract:
-- frames are standard SSE ``id: <seq>`` / ``event:`` / ``data:`` records; the
-  frame id is the run's event sequence number, which is what a client sends
-  back as ``Last-Event-ID``;
-- **sequence continuity is validated, never silently skipped**: a missing seq
-  (gap, e.g. ``[1, 3]``), an out-of-order seq, or a stale cursor pointing
-  before the still-available window fails loudly with a structured error
-  instead of quietly jumping ahead;
-- **event waiting and heartbeat timing are separate**: the engine polls at
-  ``poll_s`` so new events ship within the poll SLA (much faster than the
-  heartbeat), and a keep-alive comment frame is emitted only after the
-  connection has been idle for a full ``heartbeat_s`` — never immediately;
-- **the engine never mutates run state**: it holds no cancellation policy, so
-  internal read failures (storage down, code bugs) can never cancel a run that
-  should keep going or degrade. Cancellation belongs to the explicit
-  lifecycle/lease layer in #65B-2;
-- terminal detection trusts the event TYPE (``is_terminal_event``) and the
-  authoritative run state (shared ``TERMINAL_STATES``) — never ``data.status``
-  carried by an arbitrary event;
-- clock and waiter are injected, so tests are deterministic and never depend on
-  real sleeps.
+Read interface (the only way the engine learns about a run):
+
+    await wait_page(cursor, timeout_s) -> StreamSnapshot(
+        events,               # ordered events with seq > cursor
+        state,                # authoritative run state
+        oldest_available_seq, # first seq still retained (0 when empty)
+        latest_seq,           # newest seq the store holds (0 when empty)
+        timed_out,            # no event arrived within timeout_s
+    )
+
+A blocking async read replaces polling entirely: there is no fixed poll
+interval, no injected clock and no idle-window counter. Heartbeats are emitted
+ONLY when the read times out with no events; an event that arrives immediately
+never triggers a keep-alive.
+
+Stream rules:
+- frames carry ``id: <seq>``; the client resumes with ``Last-Event-ID``;
+- **only a terminal EVENT (``run.completed``) ends page emission** — an
+  authoritative terminal state never truncates a page mid-way;
+- while ``cursor < latest_seq`` the engine keeps reading (pagination-safe,
+  even with page size 1);
+- only after the page is drained AND ``cursor`` has reached ``latest_seq`` may
+  the stream close on the authoritative terminal state;
+- a terminal state whose expected terminal event is missing from the retained
+  window is reported explicitly (storage invariant fault), never silently
+  accepted;
+- continuity uses the window bounds: cursor before the retained window →
+  ``stale_cursor``; a missing seq inside the window → ``replay_gap``; an
+  older seq after the cursor → ``out_of_order``; an exact re-read of the last
+  emitted seq is the only tolerated overlap;
+- the engine holds NO cancellation policy and never mutates run state, so an
+  internal read failure can never cancel a run.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
 
 from app.contracts.errors import ErrorCode
-from app.contracts.events import SSEEvent, is_terminal_event
+from app.contracts.events import SSEEvent, SSEEventType
 from app.contracts.run import TERMINAL_STATES, RunState
 
-DEFAULT_POLL_MS = 50
 DEFAULT_HEARTBEAT_MS = 15_000
+
+
+class StreamFault(str, Enum):
+    """Protocol/storage faults, each independently reportable."""
+
+    REPLAY_GAP = "replay_gap"
+    OUT_OF_ORDER = "out_of_order"
+    STALE_CURSOR = "stale_cursor"
+    MISSING_TERMINAL_EVENT = "missing_terminal_event"
 
 
 class SSEStreamError(RuntimeError):
     """Structured streaming fault (mapped by the #36 boundary)."""
 
-    def __init__(self, fault: StreamFault | None, message: str = "") -> None:
-        super().__init__(message or (fault.value if fault else "stream error"))
+    def __init__(self, fault: StreamFault, message: str = "") -> None:
+        super().__init__(message or fault.value)
         self.fault = fault
         self.code = ErrorCode.INTERNAL_UNKNOWN
 
 
-class StreamFault(str, Enum):
-    """Protocol-level faults, distinct from transport/state errors."""
+@dataclass(frozen=True)
+class StreamSnapshot:
+    """One atomic read result: events plus the store's window bounds."""
 
-    REPLAY_GAP = "replay_gap"
-    OUT_OF_ORDER = "out_of_order"
-    STALE_CURSOR = "stale_cursor"
-
-
-class EventPageProtocol(Protocol):
-    """What the engine needs from a run-event reader (injected)."""
-
-    events: tuple[SSEEvent, ...]
+    events: tuple[SSEEvent, ...] = ()
+    state: RunState = RunState.ACCEPTED
+    oldest_available_seq: int = 0
+    latest_seq: int = 0
+    timed_out: bool = False
 
 
-PageReader = Callable[[int], Any]
-StateReader = Callable[[], RunState]
-Waiter = Callable[[float], Awaitable[None]]
-Clock = Callable[[], float]
+SnapshotReader = Callable[[int, float], Awaitable[StreamSnapshot]]
 
 
 def frame(event: SSEEvent) -> str:
@@ -80,7 +91,7 @@ def frame(event: SSEEvent) -> str:
 
 
 def keep_alive() -> str:
-    """SSE comment frame: no ``id``, so it can never perturb seq authority."""
+    """SSE comment frame: no ``id``, so it never perturbs seq authority."""
     return ": keep-alive\n\n"
 
 
@@ -101,103 +112,81 @@ def effective_after_seq(after_seq: int, last_event_id: str | None) -> int:
     return cursor
 
 
-def is_terminal(event: SSEEvent, state: RunState | None = None) -> bool:
-    """Terminal only by event TYPE or authoritative run state.
-
-    ``data.status`` of a non-terminal event is explicitly NOT trusted: a
-    ``run.accepted`` carrying ``status=completed`` must not close the stream.
-    """
-    if is_terminal_event(event.event):
-        return True
-    return state in TERMINAL_STATES
-
-
-@dataclass(frozen=True)
-class StreamMetrics:
-    """Deterministic counters for tests and observability hooks."""
-
-    frames: int = 0
-    heartbeats: int = 0
-    polls: int = 0
-
-
-def _validate(next_seq: int, cursor: int) -> None:
-    """Enforce strict continuity; identical re-reads are the only tolerance."""
-    if next_seq == cursor:
-        return
-    if next_seq < cursor:
+def _validate(event: SSEEvent, cursor: int, snapshot: StreamSnapshot) -> None:
+    """Strict continuity, classified from the store's window bounds."""
+    if event.seq == cursor:
+        return  # exact re-read of the last emitted seq: tolerated overlap
+    if event.seq < cursor:
         raise SSEStreamError(
             StreamFault.OUT_OF_ORDER,
-            f"out_of_order: seq {next_seq} < cursor {cursor}",
+            f"out_of_order: seq {event.seq} < cursor {cursor}",
         )
-    if next_seq != cursor + 1:
-        fault = StreamFault.STALE_CURSOR if cursor == 0 else StreamFault.REPLAY_GAP
+    if event.seq != cursor + 1:
+        first_expected = cursor + 1
+        if snapshot.oldest_available_seq > first_expected:
+            raise SSEStreamError(
+                StreamFault.STALE_CURSOR,
+                f"stale_cursor: cursor {cursor} precedes retained window "
+                f"(oldest {snapshot.oldest_available_seq})",
+            )
         raise SSEStreamError(
-            fault,
-            f"{fault.value}: expected seq {cursor + 1}, got {next_seq}",
+            StreamFault.REPLAY_GAP,
+            f"replay_gap: expected seq {first_expected}, got {event.seq}",
         )
 
 
 async def stream_engine(
     *,
-    read_page: PageReader,
-    read_state: StateReader,
+    wait_page: SnapshotReader,
     after_seq: int = 0,
-    poll_s: float = DEFAULT_POLL_MS / 1000,
     heartbeat_s: float = DEFAULT_HEARTBEAT_MS / 1000,
-    clock: Clock | None = None,
-    waiter: Waiter | None = None,
-    max_idle_windows: int | None = None,
 ) -> AsyncIterator[str]:
-    """Yield SSE frames for one run until terminal (or the optional idle cap).
+    """Yield SSE frames for one run until its terminal event is delivered.
 
-    ``read_page(cursor)`` returns a page whose ``events`` are ordered by seq.
-    Missing, re-ordered or stale sequences raise :class:`SSEStreamError`;
-    reader/transport failures propagate unchanged — the engine adds NO
-    cancellation side-effects of its own. ``max_idle_windows`` bounds idle
-    polling for tests and orderly shutdown.
+    ``wait_page`` blocks (async) until events are available or ``heartbeat_s``
+    elapses; the engine never polls, never cancels runs and never writes state.
     """
-    _clock = clock or (lambda: asyncio.get_running_loop().time())
-    _wait = waiter or asyncio.sleep
     cursor = max(after_seq, 0)
-    last_write = _clock()
-    idle_windows = 0
-
     while True:
-        page = read_page(cursor)
-        for event in page.events:
-            _validate(event.seq, cursor)
-            if event.seq == cursor:
-                continue  # idempotent overlap: exact re-read, nothing to send
-            cursor = event.seq
-            last_write = _clock()
-            idle_windows = 0
-            yield frame(event)
-            if is_terminal(event, read_state()):
-                return
-        state = read_state()
-        if state in TERMINAL_STATES and not page.events:
-            return
-        # wait for events first; a keep-alive only after a FULL idle window
-        await _wait(poll_s)
-        idle_windows += 1
-        if _clock() - last_write >= heartbeat_s:
-            last_write = _clock()
+        snapshot = await wait_page(cursor, heartbeat_s)
+        if snapshot.timed_out and not snapshot.events:
+            # idle for a full heartbeat window: one keep-alive, keep waiting
             yield keep_alive()
-        if max_idle_windows is not None and idle_windows >= max_idle_windows:
+            continue
+        drained = False
+        for event in snapshot.events:
+            _validate(event, cursor, snapshot)
+            if event.seq == cursor:
+                continue
+            drained = True
+            cursor = event.seq
+            yield frame(event)
+            if event.event is SSEEventType.RUN_COMPLETED:
+                return  # terminal EVENT only — never truncated by state
+        if cursor < snapshot.latest_seq:
+            continue  # pagination: keep reading until we reach latest_seq
+        if snapshot.state in TERMINAL_STATES:
+            if drained and not _saw_terminal(snapshot):
+                raise SSEStreamError(
+                    StreamFault.MISSING_TERMINAL_EVENT,
+                    f"storage invariant: state {snapshot.state.value} at "
+                    f"latest seq {snapshot.latest_seq} without a terminal event",
+                )
             return
+
+
+def _saw_terminal(snapshot: StreamSnapshot) -> bool:
+    return any(e.event is SSEEventType.RUN_COMPLETED for e in snapshot.events)
 
 
 __all__ = [
     "DEFAULT_HEARTBEAT_MS",
-    "DEFAULT_POLL_MS",
-    "EventPageProtocol",
     "SSEStreamError",
+    "SnapshotReader",
     "StreamFault",
-    "StreamMetrics",
+    "StreamSnapshot",
     "effective_after_seq",
     "frame",
-    "is_terminal",
     "keep_alive",
     "stream_engine",
 ]

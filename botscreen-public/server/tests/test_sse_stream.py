@@ -1,39 +1,34 @@
 """Tests for the internal SSE stream engine (issue #65B — slice B-1).
 
-Coverage (reviewer's regression list for this slice):
-- internal read failures propagate WITHOUT touching run state (the engine has
-  no cancellation policy at all);
-- a new event published 50ms later is delivered within the poll SLA, not after
-  the heartbeat;
-- no keep-alive is emitted before a full idle heartbeat window has elapsed;
-- `[1, 3]` gaps, out-of-order seqs and stale cursors fail explicitly;
-- terminal detection trusts event TYPE / authoritative run state — never
-  `data.status` of an arbitrary event;
-- two subscribers are independent (closing one cannot affect the other);
-- reconnect resumes after the cursor without resending a terminal frame;
-- the public HTTP route does not exist yet (#65B-2 owns it), and the heartbeat
-  cadence is engine configuration, not a client knob;
-- a real ASGI disconnect smoke test through a test-only app.
+The engine consumes an injected ASYNC SNAPSHOT reader, so these tests use a
+scripted fake — no Redis, no polling timers, no real sleeps. Acceptance list
+from the review round:
 
-The engine takes an injected clock and waiter, so no test depends on real
-sleeps.
+- terminal replay ``[accepted, completed]`` delivers BOTH frames (an
+  authoritative terminal state must never truncate a page);
+- page size 1 still reaches the terminal frame (pagination-safe);
+- ``after_seq=5`` with ``oldest_available_seq=9`` is ``stale_cursor``;
+- a missing seq INSIDE the window is ``replay_gap``;
+- out-of-order seqs are ``out_of_order``;
+- events arriving immediately produce NO heartbeat;
+- a wait timeout with no events produces exactly one heartbeat;
+- a terminal state without its terminal event raises the storage-invariant
+  fault;
+- the engine never mutates run state (no cancellation policy).
+
+Real network-disconnect verification belongs to the public route in #65B-2 and
+is deliberately NOT claimed here.
 """
 
-import asyncio
-from dataclasses import dataclass
-
 import pytest
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-from fastapi.testclient import TestClient
 from pytest import mark
 
 from app.api.v1.sse_stream import (
     SSEStreamError,
     StreamFault,
+    StreamSnapshot,
     effective_after_seq,
     frame,
-    is_terminal,
     keep_alive,
     stream_engine,
 )
@@ -41,17 +36,10 @@ from app.contracts.events import SSEEvent, SSEEventType
 from app.contracts.run import RunState
 from app.main import app as real_app
 
-POLL_S = 0.05
 HEARTBEAT_S = 1.0
 
 
-@dataclass
-class Page:
-    events: tuple[SSEEvent, ...] = ()
-
-
 def _event(seq: int, event=SSEEventType.PROCESS_STATUS, **data) -> SSEEvent:
-    # each event type only allows its own data keys (contract-enforced)
     defaults = {
         SSEEventType.RUN_ACCEPTED: {"status": "accepted", "message": "问题已接收"},
         SSEEventType.PROCESS_STATUS: {"stage": "guarding", "message": "处理中"},
@@ -71,49 +59,43 @@ def _event(seq: int, event=SSEEventType.PROCESS_STATUS, **data) -> SSEEvent:
     )
 
 
-class Harness:
-    """Deterministic engine harness: fake clock, waiter and page reader."""
+ACCEPTED = _event(1, SSEEventType.RUN_ACCEPTED)
+COMPLETED = _event(2, SSEEventType.RUN_COMPLETED)
 
-    def __init__(self) -> None:
-        self.now = 0.0
-        self.events: list[SSEEvent] = []
-        self.state = RunState.ACCEPTED
-        self.read_error: Exception | None = None
-        self.reads = 0
-        self.waits: list[float] = []
-        self.state_reads = 0
-        self.cancelled = 0  # any state mutation would show up here
 
-    # -- injection points -----------------------------------------------------
+class FakeReader:
+    """Scripted snapshot reader: each call returns the next snapshot."""
 
-    def clock(self) -> float:
-        return self.now
+    def __init__(self, snapshots) -> None:
+        self._snapshots = list(snapshots)
+        self.calls: list[tuple[int, float]] = []
 
-    async def waiter(self, seconds: float) -> None:
-        self.waits.append(seconds)
-        self.now += seconds  # time advances only when the engine waits
+    async def __call__(self, cursor: int, timeout_s: float) -> StreamSnapshot:
+        self.calls.append((cursor, timeout_s))
+        if not self._snapshots:
+            return StreamSnapshot(
+                state=RunState.ACCEPTED, latest_seq=cursor, timed_out=True
+            )
+        return self._snapshots.pop(0)
 
-    def read_page(self, cursor: int) -> Page:
-        self.reads += 1
-        if self.read_error is not None:
-            raise self.read_error
-        return Page(events=tuple(e for e in self.events if e.seq > cursor))
 
-    def read_state(self) -> RunState:
-        self.state_reads += 1
-        return self.state
-
-    def engine(self, **overrides):
-        params = {
-            "read_page": self.read_page,
-            "read_state": self.read_state,
-            "poll_s": POLL_S,
-            "heartbeat_s": HEARTBEAT_S,
-            "clock": self.clock,
-            "waiter": self.waiter,
-        }
-        params.update(overrides)
-        return stream_engine(**params)
+def _snapshot(
+    events=(),
+    state=RunState.ACCEPTED,
+    oldest=None,
+    latest=None,
+    timed_out=False,
+) -> StreamSnapshot:
+    seqs = [e.seq for e in events]
+    return StreamSnapshot(
+        events=tuple(events),
+        state=state,
+        oldest_available_seq=oldest
+        if oldest is not None
+        else (min(seqs) if seqs else 0),
+        latest_seq=latest if latest is not None else (max(seqs) if seqs else 0),
+        timed_out=timed_out,
+    )
 
 
 class TestCursorCombination:
@@ -127,187 +109,172 @@ class TestCursorCombination:
         assert effective_after_seq(4, "-2") == 4
 
     def test_frame_and_keep_alive_shapes(self):
-        text = frame(_event(2))
-        assert text.startswith("id: 2\nevent: process.status\ndata: {")
+        text = frame(COMPLETED)
+        assert text.startswith("id: 2\nevent: run.completed\ndata: {")
         assert text.endswith("\n\n")
         assert keep_alive() == ": keep-alive\n\n"
         assert "id:" not in keep_alive()
 
 
+class TestTerminalReplay:
+    @mark.asyncio
+    async def test_full_terminal_replay_delivers_both_frames(self):
+        reader = FakeReader(
+            [_snapshot([ACCEPTED, COMPLETED], state=RunState.COMPLETED)]
+        )
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert [f.split("\n", 1)[0] for f in frames] == ["id: 1", "id: 2"]
+
+    @mark.asyncio
+    async def test_page_size_one_still_reaches_terminal(self):
+        reader = FakeReader(
+            [
+                _snapshot([ACCEPTED], latest=2),
+                _snapshot([COMPLETED], state=RunState.COMPLETED, latest=2),
+            ]
+        )
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert [f.split("\n", 1)[0] for f in frames] == ["id: 1", "id: 2"]
+        assert reader.calls[0][0] == 0 and reader.calls[1][0] == 1
+
+    @mark.asyncio
+    async def test_state_close_only_after_latest_seq_reached(self):
+        # terminal state but latest_seq ahead of the page: keep reading
+        reader = FakeReader(
+            [
+                _snapshot([ACCEPTED], state=RunState.COMPLETED, latest=2),
+                _snapshot([COMPLETED], state=RunState.COMPLETED),
+            ]
+        )
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert [f.split("\n", 1)[0] for f in frames] == ["id: 1", "id: 2"]
+
+    @mark.asyncio
+    async def test_terminal_state_without_terminal_event_reports_invariant(self):
+        reader = FakeReader([_snapshot([ACCEPTED], state=RunState.COMPLETED)])
+        with pytest.raises(SSEStreamError) as exc:
+            async for _ in stream_engine(wait_page=reader):
+                pass
+        assert exc.value.fault is StreamFault.MISSING_TERMINAL_EVENT
+
+    @mark.asyncio
+    async def test_completed_event_ends_stream_even_before_latest_seq(self):
+        reader = FakeReader([_snapshot([ACCEPTED, COMPLETED], latest=5)])
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert frames[-1].startswith("id: 2")
+
+
 class TestSequenceContinuity:
     @mark.asyncio
-    async def test_gap_fails_explicitly(self):
-        h = Harness()
-        h.events = [_event(1), _event(3)]
+    async def test_stale_cursor_when_window_trimmed(self):
+        # after_seq=5, oldest retained = 9 -> the cursor fell out of the window
+        reader = FakeReader([_snapshot([_event(9)], oldest=9, latest=9)])
         with pytest.raises(SSEStreamError) as exc:
-            async for _ in h.engine():
+            async for _ in stream_engine(wait_page=reader, after_seq=5):
+                pass
+        assert exc.value.fault is StreamFault.STALE_CURSOR
+
+    @mark.asyncio
+    async def test_replay_gap_inside_the_window(self):
+        reader = FakeReader(
+            [_snapshot([_event(1, SSEEventType.RUN_ACCEPTED), _event(3)], oldest=1)]
+        )
+        with pytest.raises(SSEStreamError) as exc:
+            async for _ in stream_engine(wait_page=reader):
                 pass
         assert exc.value.fault is StreamFault.REPLAY_GAP
 
     @mark.asyncio
-    async def test_leading_non_contiguous_seq_is_a_gap_fault(self):
-        h = Harness()
-        h.events = [_event(2), _event(1)]  # page starts at 2 with cursor 0
+    async def test_out_of_order_after_cursor(self):
+        # non-terminal page so the ordering fault is reached (a terminal event
+        # legitimately ends the page and the stream)
+        page = [
+            ACCEPTED,
+            _event(2, SSEEventType.PROCESS_STATUS),
+            ACCEPTED,  # seq 1 reappears after cursor advanced to 2
+        ]
+        reader = FakeReader([_snapshot(page, oldest=1, latest=2)])
         with pytest.raises(SSEStreamError) as exc:
-            async for _ in h.engine():
-                pass
-        assert exc.value.fault is StreamFault.STALE_CURSOR
-
-    @mark.asyncio
-    async def test_out_of_order_fails_explicitly(self):
-        h = Harness()
-        h.events = [_event(1), _event(2), _event(1)]  # 1 after cursor == 2
-        with pytest.raises(SSEStreamError) as exc:
-            async for _ in h.engine():
+            async for _ in stream_engine(wait_page=reader):
                 pass
         assert exc.value.fault is StreamFault.OUT_OF_ORDER
 
     @mark.asyncio
-    async def test_stale_cursor_fails_explicitly(self):
-        h = Harness()
-        h.events = [_event(9)]  # window start trimmed far past the cursor
-        with pytest.raises(SSEStreamError) as exc:
-            async for _ in h.engine(after_seq=0):
-                pass
-        assert exc.value.fault is StreamFault.STALE_CURSOR
-
-    @mark.asyncio
     async def test_exact_reread_of_last_seq_is_tolerated(self):
-        h = Harness()
-        h.events = [_event(1)]
-        stream = h.engine()
-        assert (await anext(stream)).startswith("id: 1")
-        # re-reading seq 1 (cursor == 1) must not raise, and must not resend
-        h.state = RunState.CANCELLED
-        with pytest.raises(StopAsyncIteration):
-            await anext(stream)
-
-    @mark.asyncio
-    async def test_reconnect_resumes_after_cursor_without_duplicates(self):
-        h = Harness()
-        h.events = [
-            _event(1, SSEEventType.RUN_ACCEPTED),
-            _event(2, SSEEventType.RUN_COMPLETED),
-        ]
-        h.state = RunState.COMPLETED
-        frames = [f async for f in h.engine(after_seq=1)]
-        assert [f.split("\n", 1)[0] for f in frames] == ["id: 2"]
-
-
-class TestTiming:
-    @mark.asyncio
-    async def test_new_event_ships_within_poll_not_heartbeat(self):
-        h = Harness()
-        h.events = [_event(1, SSEEventType.RUN_ACCEPTED)]
-        stream = h.engine()
-        assert (await anext(stream)).startswith("id: 1")
-        # 50ms later the backend publishes the next event
-        h.now += 0.05
-        h.events.append(_event(2))
-        nxt = await asyncio.wait_for(anext(stream), timeout=1)
-        assert nxt.startswith("id: 2")
-        assert h.waits == [POLL_S]  # delivered after ONE poll, not a heartbeat
-
-    @mark.asyncio
-    async def test_no_heartbeat_before_a_full_idle_window(self):
-        h = Harness()
-        # idle for exactly one poll window (50ms) << heartbeat (1s): no frame
-        frames = [f async for f in h.engine(max_idle_windows=1)]
-        assert frames == []
-        assert h.now == pytest.approx(POLL_S)
-        assert h.waits == [POLL_S]  # waited for events, emitted no keep-alive
-
-    @mark.asyncio
-    async def test_heartbeat_only_after_idle_period(self):
-        h = Harness()
-        h.state = RunState.ACCEPTED
-        stream = h.engine(max_idle_windows=25)
-        frames = []
-        async for chunk in stream:
-            frames.append(chunk)
-        # 25 idle windows × 50ms = 1.25s ≥ 1s heartbeat → exactly one keep-alive
-        assert sum(1 for f in frames if f == keep_alive()) == 1
-        assert h.now >= HEARTBEAT_S
-
-    @mark.asyncio
-    async def test_heartbeat_cadence_is_engine_configuration(self):
-        h = Harness()
-        stream = h.engine(heartbeat_s=0.2, max_idle_windows=8)
-        frames = [f async for f in stream]
-        assert sum(1 for f in frames if f == keep_alive()) >= 1
-
-
-class TestTerminalSemantics:
-    @mark.asyncio
-    async def test_data_status_does_not_close_the_stream(self):
-        h = Harness()
-        # a NON-terminal event carrying status=completed must not end the run
-        h.events = [_event(1, SSEEventType.RUN_ACCEPTED, status="completed")]
-        stream = h.engine(max_idle_windows=2)
-        frames = [f async for f in stream]
-        # one data frame, no keep-alive yet (heartbeat window not reached) and
-        # crucially the stream did NOT close on the status field
-        assert len(frames) == 1
-        assert frames[0].startswith("id: 1")
-        assert h.now == pytest.approx(2 * POLL_S)  # engine kept polling
-
-    @mark.asyncio
-    async def test_terminal_event_type_closes_once(self):
-        h = Harness()
-        h.events = [_event(1, SSEEventType.RUN_COMPLETED, status="completed")]
-        frames = [f async for f in h.engine()]
-        assert frames == [frame(h.events[0])]
-
-    @mark.asyncio
-    async def test_authoritative_state_closes_an_empty_tail(self):
-        h = Harness()
-        h.state = RunState.FAILED
-        frames = [f async for f in h.engine()]
-        assert frames == []
-        assert h.reads == 1
-
-    @mark.asyncio
-    async def test_is_terminal_helper_ignores_data_status(self):
-        assert (
-            is_terminal(_event(1, SSEEventType.RUN_ACCEPTED, status="completed"))
-            is False
+        reader = FakeReader(
+            [
+                _snapshot([ACCEPTED], latest=1),
+                _snapshot([ACCEPTED, COMPLETED], state=RunState.COMPLETED, latest=2),
+            ]
         )
-        assert is_terminal(_event(1, SSEEventType.RUN_COMPLETED)) is True
-        assert is_terminal(_event(1), RunState.CANCELLED) is True
-        assert is_terminal(_event(1), RunState.ACCEPTED) is False
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert [f.split("\n", 1)[0] for f in frames] == ["id: 1", "id: 2"]
 
-
-class TestNoCancellationSideEffects:
     @mark.asyncio
-    async def test_reader_failure_propagates_without_state_change(self):
-        h = Harness()
-        h.read_error = RuntimeError("storage unavailable")
+    async def test_resume_after_terminal_does_not_resend(self):
+        # cursor already at latest_seq and the run is terminal: close silently
+        reader = FakeReader([_snapshot(state=RunState.COMPLETED, latest=2)])
+        frames = [f async for f in stream_engine(wait_page=reader, after_seq=2)]
+        assert frames == []  # nothing re-sent, no duplicate terminal frame
+
+
+class TestHeartbeatTiming:
+    @mark.asyncio
+    async def test_events_arriving_immediately_never_heartbeat(self):
+        reader = FakeReader(
+            [
+                _snapshot([ACCEPTED], latest=1),
+                _snapshot([COMPLETED], state=RunState.COMPLETED, latest=2),
+            ]
+        )
+        frames = [f async for f in stream_engine(wait_page=reader)]
+        assert all(f != keep_alive() for f in frames)
+        assert len(frames) == 2
+
+    @mark.asyncio
+    async def test_one_heartbeat_per_idle_timeout_then_events(self):
+        reader = FakeReader(
+            [
+                _snapshot(timed_out=True),
+                _snapshot(timed_out=True),
+                _snapshot([ACCEPTED, COMPLETED], state=RunState.COMPLETED),
+            ]
+        )
+        frames = [
+            f async for f in stream_engine(wait_page=reader, heartbeat_s=HEARTBEAT_S)
+        ]
+        assert frames == [keep_alive(), keep_alive(), frame(ACCEPTED), frame(COMPLETED)]
+        assert [c[1] for c in reader.calls] == [HEARTBEAT_S] * 3  # one timeout knob
+        assert [c[0] for c in reader.calls] == [0, 0, 0]  # cursor unchanged while idle
+
+
+class TestNoSideEffects:
+    @mark.asyncio
+    async def test_reader_failure_propagates_untouched(self):
+        class Broken:
+            async def __call__(self, cursor, timeout_s):
+                raise RuntimeError("storage unavailable")
+
         with pytest.raises(RuntimeError):
-            async for _ in h.engine():
+            async for _ in stream_engine(wait_page=Broken()):
                 pass
-        assert h.state is RunState.ACCEPTED  # never cancelled by the engine
-        assert h.cancelled == 0
 
     @mark.asyncio
     async def test_two_subscribers_are_independent(self):
-        h = Harness()
-        h.events = [_event(1, SSEEventType.RUN_ACCEPTED)]
-        first = h.engine(max_idle_windows=1)
-        second = h.engine(max_idle_windows=1)
-        assert (await anext(first)).startswith("id: 1")
-        await first.aclose()  # one subscriber goes away
-        assert (await anext(second)).startswith("id: 1")  # other unaffected
-        assert h.state is RunState.ACCEPTED
-        await second.aclose()
+        def reader():
+            return FakeReader(
+                [
+                    _snapshot([ACCEPTED], latest=2),
+                    _snapshot([COMPLETED], state=RunState.COMPLETED, latest=2),
+                ]
+            )
 
-    @mark.asyncio
-    async def test_closing_the_engine_never_mutates_state(self):
-        h = Harness()
-        h.events = [_event(1, SSEEventType.RUN_ACCEPTED)]
-        stream = h.engine()
-        await anext(stream)
-        await stream.aclose()
-        assert h.state is RunState.ACCEPTED
+        first = stream_engine(wait_page=reader())
+        second = stream_engine(wait_page=reader())
+        assert (await anext(first)).startswith("id: 1")
+        await first.aclose()
+        assert (await anext(second)).startswith("id: 1")
+        await second.aclose()
 
 
 class TestPublicSurface:
@@ -316,38 +283,10 @@ class TestPublicSurface:
         paths = set(real_app.openapi().get("paths", {}))
         assert not any("events/stream" in path for path in paths)
 
-    def test_engine_heartbeat_is_not_a_request_parameter(self):
+    def test_wait_page_timeout_is_engine_configuration(self):
         import inspect
 
         params = inspect.signature(stream_engine).parameters
-        # heartbeat/poll come from configuration, never from a client payload
         assert params["heartbeat_s"].kind is inspect.Parameter.KEYWORD_ONLY
-        assert params["poll_s"].kind is inspect.Parameter.KEYWORD_ONLY
-
-
-class TestAsgiDisconnectSmoke:
-    """Real ASGI transport disconnect (test-only app; no product route)."""
-
-    def _app(self, harness: Harness) -> FastAPI:
-        test_app = FastAPI()
-
-        @test_app.get("/stream")
-        async def _stream() -> StreamingResponse:
-            return StreamingResponse(
-                harness.engine(max_idle_windows=400),
-                media_type="text/event-stream",
-            )
-
-        return test_app
-
-    def test_client_disconnect_is_clean_and_state_untouched(self):
-        harness = Harness()
-        harness.events = [_event(1, SSEEventType.RUN_ACCEPTED)]
-        client = TestClient(self._app(harness))
-        with client.stream("GET", "/stream") as response:
-            assert response.headers["content-type"].startswith("text/event-stream")
-            lines = response.iter_lines()
-            assert next(lines) == "id: 1"
-        # response closed by the client: the engine must not cancel anything
-        assert harness.state is RunState.ACCEPTED
-        assert harness.cancelled == 0
+        assert "poll_s" not in params  # polling (and its clock) is gone
+        assert "max_idle_windows" not in params
