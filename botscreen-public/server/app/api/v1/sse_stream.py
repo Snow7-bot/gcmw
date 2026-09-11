@@ -127,38 +127,51 @@ def _validate_heartbeat(heartbeat_s: float) -> float:
 
 def _validate_snapshot(snapshot: StreamSnapshot, cursor: int) -> None:
     """Enforce the snapshot invariants before ANY branch is taken."""
-    if snapshot.oldest_available_seq < 0 or (
-        snapshot.latest_seq < snapshot.oldest_available_seq
-    ):
+    oldest = snapshot.oldest_available_seq
+    latest = snapshot.latest_seq
+    if oldest < 0 or latest < oldest:
         raise SSEStreamError(
             StreamFault.SNAPSHOT_INCONSISTENT,
-            f"window bounds invalid: oldest {snapshot.oldest_available_seq}, "
-            f"latest {snapshot.latest_seq}",
+            f"window bounds invalid: oldest {oldest}, latest {latest}",
         )
-    if cursor > snapshot.latest_seq:
-        raise SSEStreamError(
-            StreamFault.CURSOR_AHEAD,
-            f"cursor_ahead: cursor {cursor} > latest_seq {snapshot.latest_seq}",
-        )
-    for event in snapshot.events:
-        if not (snapshot.oldest_available_seq <= event.seq <= snapshot.latest_seq):
+    # zero-value semantics: 0 means "empty window" and nothing else; SSE seq
+    # numbers start at 1, so a non-empty window can never start below 1
+    if latest == 0:
+        if oldest != 0:
             raise SSEStreamError(
                 StreamFault.SNAPSHOT_INCONSISTENT,
-                f"event seq {event.seq} outside window "
-                f"[{snapshot.oldest_available_seq}, {snapshot.latest_seq}]",
+                f"empty window must be (0, 0), got oldest {oldest}",
+            )
+    elif oldest < 1:
+        raise SSEStreamError(
+            StreamFault.SNAPSHOT_INCONSISTENT,
+            f"non-empty window must start at seq >= 1, got oldest {oldest}",
+        )
+    if cursor > latest:
+        raise SSEStreamError(
+            StreamFault.CURSOR_AHEAD,
+            f"cursor_ahead: cursor {cursor} > latest_seq {latest}",
+        )
+    for event in snapshot.events:
+        if not (oldest <= event.seq <= latest):
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                f"event seq {event.seq} outside window [{oldest}, {latest}]",
             )
     terminal_state = snapshot.state in TERMINAL_STATES
     if terminal_state:
-        if snapshot.terminal_seq is None:
+        # seq 0 cannot be a real event: a terminal run must carry a terminal
+        # seq >= 1, and it must be the newest retained event
+        if snapshot.terminal_seq is None or snapshot.terminal_seq < 1:
             raise SSEStreamError(
                 StreamFault.MISSING_TERMINAL_EVENT,
-                f"terminal state {snapshot.state.value} without terminal_seq",
+                f"terminal state {snapshot.state.value} without a valid "
+                f"terminal_seq (got {snapshot.terminal_seq!r})",
             )
-        if snapshot.terminal_seq != snapshot.latest_seq:
+        if snapshot.terminal_seq != latest:
             raise SSEStreamError(
                 StreamFault.SNAPSHOT_INCONSISTENT,
-                f"terminal_seq {snapshot.terminal_seq} != latest_seq "
-                f"{snapshot.latest_seq}",
+                f"terminal_seq {snapshot.terminal_seq} != latest_seq {latest}",
             )
     elif snapshot.terminal_seq is not None:
         raise SSEStreamError(
@@ -171,20 +184,22 @@ def _validate_snapshot(snapshot: StreamSnapshot, cursor: int) -> None:
             raise SSEStreamError(
                 StreamFault.SNAPSHOT_INCONSISTENT, "timed_out snapshot with events"
             )
-        if terminal_state or snapshot.latest_seq != cursor:
+        if terminal_state or latest != cursor:
             raise SSEStreamError(
                 StreamFault.SNAPSHOT_INCONSISTENT,
                 "timed_out snapshot must be idle and non-terminal at the cursor",
             )
-    elif not snapshot.events:
-        # an empty non-timeout read is only legal when the client already sits
-        # at the end of a terminal run (silent close); a running run must be
-        # reported as a timeout, never as an empty "no progress" snapshot
-        if not terminal_state or snapshot.latest_seq != cursor:
-            raise SSEStreamError(
-                StreamFault.SNAPSHOT_INCONSISTENT,
-                "non-timeout snapshot without progress",
-            )
+        return
+    # a non-timeout read must make progress: overlapping duplicates alone are
+    # NOT progress (a page that only repeats the cursor would otherwise spin)
+    if any(event.seq != cursor for event in snapshot.events):
+        return
+    if terminal_state and cursor == snapshot.terminal_seq == latest:
+        return  # client already holds the terminal frame: silent close
+    raise SSEStreamError(
+        StreamFault.SNAPSHOT_INCONSISTENT,
+        "non-timeout snapshot without new events",
+    )
 
 
 def _validate_event(event: SSEEvent, cursor: int, snapshot: StreamSnapshot) -> None:

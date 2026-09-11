@@ -87,7 +87,13 @@ def snap(
     an explicit value (including explicit ``None``) is provided."""
     seqs = [e.seq for e in events]
     resolved_latest = latest if latest is not None else (max(seqs) if seqs else 0)
-    resolved_oldest = oldest if oldest is not None else (min(seqs) if seqs else 0)
+    if oldest is not None:
+        resolved_oldest = oldest
+    elif seqs:
+        resolved_oldest = min(seqs)
+    else:
+        # no events: a non-empty window still starts at >= 1 (0 only for empty)
+        resolved_oldest = max(0, resolved_latest)
     if terminal is _AUTO:
         terminal = (
             resolved_latest
@@ -307,6 +313,37 @@ class TestSnapshotValidation:
         )
         frames = await _collect(reader)
         assert [f.split("\n", 1)[0] for f in frames] == ["id: 1", "id: 2"]
+
+
+class TestNoProgressAndZeroSemantics:
+    @mark.asyncio
+    async def test_duplicate_only_page_is_not_progress(self):
+        # cursor=1 with a page that only repeats seq 1 must NOT spin silently
+        reader = FakeReader([snap([ACCEPTED], oldest=1, latest=2)])
+        with pytest.raises(SSEStreamError) as exc:
+            await _collect(reader, after_seq=1)
+        assert exc.value.fault is StreamFault.SNAPSHOT_INCONSISTENT
+        assert reader.reads == 1  # no busy loop
+
+    @mark.asyncio
+    async def test_terminal_seq_zero_is_not_a_real_event(self):
+        # seq 0 cannot exist: COMPLETED with latest=0/terminal_seq=0 must fail
+        reader = FakeReader(
+            [snap(state=RunState.COMPLETED, latest=0, oldest=0, terminal=0)]
+        )
+        with pytest.raises(SSEStreamError) as exc:
+            await _collect(reader)
+        assert exc.value.fault in {
+            StreamFault.MISSING_TERMINAL_EVENT,
+            StreamFault.SNAPSHOT_INCONSISTENT,
+        }
+
+    @mark.asyncio
+    async def test_non_empty_window_must_start_at_one(self):
+        reader = FakeReader([snap([_event(1)], oldest=0, latest=1)])
+        with pytest.raises(SSEStreamError) as exc:
+            await _collect(reader)
+        assert exc.value.fault is StreamFault.SNAPSHOT_INCONSISTENT
 
 
 class TestHeartbeatTiming:
