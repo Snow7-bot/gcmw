@@ -594,16 +594,17 @@ class FakeRedis:
 
     def _twin_delete(self, keys, args):
         state_key, stream_key = keys
-        if state_key not in self.hashes and stream_key not in self.streams:
+        if state_key not in self.hashes:
+            if stream_key in self.streams:
+                return -5  # orphan stream: refuse, zero writes
             return -1
-        if state_key in self.hashes:
-            fields = self.hashes[state_key]
-            if (
-                fields["tenant_id"] != args[0]
-                or fields["device_id"] != args[1]
-                or fields["session_id"] != args[2]
-            ):
-                return -2
+        fields = self.hashes[state_key]
+        if (
+            fields["tenant_id"] != args[0]
+            or fields["device_id"] != args[1]
+            or fields["session_id"] != args[2]
+        ):
+            return -2
         self.hashes.pop(state_key, None)
         self.streams.pop(stream_key, None)
         return 1
@@ -939,6 +940,138 @@ class TestRedisRepository:
         assert snapshot.events == () and snapshot.latest_seq == 1
 
     @mark.asyncio
+    async def test_long_poll_budget_is_not_cut_by_command_timeout(self):
+        redis = FakeRedis()
+        # command timeout far below the requested wait window: the blocking read
+        # must still run to completion and yield a legal timeout snapshot
+        repo = _redis_repo(redis, op_timeout_s=0.05, block_grace_s=0.5)
+        await repo.create(T1)
+        snapshot = await repo.snapshot(T1, 1, timeout_s=0.2)
+        assert snapshot.timed_out is True
+        assert snapshot.events == () and snapshot.latest_seq == 1
+
+    @mark.asyncio
+    async def test_hanging_blocking_read_fails_after_grace(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis, op_timeout_s=0.05, block_grace_s=0.05)
+        await repo.create(T1)  # create uses the (small) command budget
+        redis.hang = True  # only the subsequent blocking read hangs
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 1, timeout_s=0.05)
+        assert exc.value.fault is RunRepositoryFault.UNAVAILABLE
+
+    @mark.asyncio
+    async def test_key_components_cannot_collide(self):
+        repo = _redis_repo()
+        first = RunIdentity(run_id="c", tenant_id="a:b", device_id="d", session_id="s")
+        second = RunIdentity(run_id="b:c", tenant_id="a", device_id="d", session_id="s")
+        assert repo.keys(first)[0] != repo.keys(second)[0]
+        braces = RunIdentity(
+            run_id="r{}", tenant_id="t{1}", device_id="d", session_id="s"
+        )
+        assert "{" not in repo.keys(braces)[0].split("}")[0].lstrip("{")
+        with pytest.raises(ValueError):
+            repo.keys(
+                RunIdentity(
+                    run_id="r" * 129, tenant_id="t", device_id="d", session_id="s"
+                )
+            )
+
+    @mark.asyncio
+    async def test_orphan_stream_delete_is_refused(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await repo.create(T1)
+        state_key, stream_key = repo.keys(T1)
+        redis.hashes.pop(state_key)  # orphan stream: state gone, stream remains
+        # same tenant namespace (any principal): refuse as invariant, zero writes
+        for identity in (T1, T1_WRONG_DEVICE):
+            with pytest.raises(RunRepositoryError) as exc:
+                await repo.delete(identity)
+            assert exc.value.fault is RunRepositoryFault.INVARIANT
+            assert "ORPHAN" in str(exc.value) or "orphan" in str(exc.value).lower()
+        # another tenant's namespace simply has no such run
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.delete(T2)
+        assert exc.value.fault is RunRepositoryFault.NOT_FOUND
+        assert stream_key in redis.streams  # zero writes in every case
+
+    @mark.asyncio
+    async def test_malformed_snapshot_payloads_are_invariant(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await repo.create(T1)
+        state_key, stream_key = repo.keys(T1)
+
+        # 1. physical id with a counter ("1-999") is not a valid business id
+        entry = redis.streams[stream_key][0]
+        redis.streams[stream_key][0] = ("1-999", entry[1])
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        redis.streams[stream_key][0] = entry
+
+        # 2. broken JSON never leaks a raw decode error
+        redis.streams[stream_key][0] = ("1-0", {"event": "{not-json"})
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        redis.streams[stream_key][0] = entry
+
+        # 3. non-terminal hash carrying terminal_seq must not be hidden
+        redis.hashes[state_key]["terminal_seq"] = "1"
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        redis.hashes[state_key].pop("terminal_seq")
+
+        # 4. terminal state without a terminal event
+        redis.hashes[state_key]["state"] = "COMPLETED"
+        redis.hashes[state_key]["terminal_seq"] = "1"
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+
+    @mark.asyncio
+    async def test_run_completed_event_without_terminal_state_is_invariant(self):
+        redis = FakeRedis()
+        repo = _redis_repo(redis)
+        await repo.create(T1)
+        state_key, stream_key = repo.keys(T1)
+        _, payload = redis.streams[stream_key][0]
+        import json as _json
+
+        forged = _json.loads(payload["event"])
+        forged["event"] = "run.completed"
+        forged["data"] = {"status": "completed"}
+        redis.streams[stream_key][0] = ("1-0", {"event": _json.dumps(forged)})
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        assert state_key in redis.hashes  # nothing written
+
+    @mark.asyncio
+    async def test_completed_without_answer_is_documented_behaviour(self):
+        repo = MemoryRunRepository()
+        await _to_streaming(repo)
+        # no answer.completed at all: the terminal transition is still legal
+        seq = await repo.commit_transition(
+            T1,
+            expected_state=STREAMING,
+            next_state=COMPLETED,
+            data={"status": "completed"},
+        )
+        snapshot = await repo.snapshot(T1, 0, 0.01)
+        assert snapshot.terminal_seq == seq == snapshot.latest_seq
+        assert SSEEventType.ANSWER_COMPLETED not in [e.event for e in snapshot.events]
+
+    @mark.asyncio
+    async def test_snapshot_limit_is_validated(self):
+        for bad in (0, -1, True):
+            with pytest.raises(ValueError):
+                _redis_repo(snapshot_limit=bad)
+
+    @mark.asyncio
     async def test_orphan_and_wrong_type_and_unavailable(self):
         redis = FakeRedis()
         repo = _redis_repo(redis)
@@ -1149,6 +1282,86 @@ class TestRealRedis:
         assert await repo.state(R2) is ACCEPTED
         await repo.delete(R2)
         await client.aclose()
+
+    @mark.asyncio
+    async def test_long_poll_budget_and_heartbeat_window(self, repo):
+        """A short command timeout must not cut the blocking read short."""
+        import redis.asyncio as aioredis
+
+        client = aioredis.from_url(os.environ["GCMW_REDIS_TEST_URL"])
+        bounded = RedisRunRepository(
+            client,
+            prefix="gcmw:test:lp",
+            op_timeout_s=0.05,
+            block_grace_s=1.0,
+        )
+        try:
+            await bounded.delete(T1)
+        except RunRepositoryError:
+            pass
+        await bounded.create(T1)
+        snapshot = await bounded.snapshot(T1, 1, timeout_s=0.3)
+        assert snapshot.timed_out is True  # legal idle snapshot, not UNAVAILABLE
+        assert snapshot.events == () and snapshot.latest_seq == 1
+        await bounded.delete(T1)
+        await client.aclose()
+
+    @mark.asyncio
+    async def test_key_components_cannot_collide(self, repo):
+        first = RunIdentity(run_id="c", tenant_id="a:b", device_id="d", session_id="s")
+        second = RunIdentity(run_id="b:c", tenant_id="a", device_id="d", session_id="s")
+        assert repo.keys(first)[0] != repo.keys(second)[0]
+        await repo.create(first)
+        # the sibling identity must not collide onto the same key
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.create(first)  # duplicate for the SAME identity
+        assert exc.value.fault is RunRepositoryFault.CAS_CONFLICT
+        await repo.create(second)  # different identity: must succeed
+        assert await repo.state(second) is ACCEPTED
+        await repo.delete(first)
+        await repo.delete(second)
+
+    @mark.asyncio
+    async def test_orphan_stream_delete_is_refused(self, repo):
+        await repo.create(T1)
+        state_key, stream_key = repo.keys(T1)
+        await repo._client.delete(state_key)  # orphan stream remains
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.delete(T1)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+        with pytest.raises(RunRepositoryError):
+            await repo.delete(T1_WRONG_DEVICE)
+        assert await repo._client.exists(stream_key) == 1  # zero writes
+        await repo._client.delete(stream_key)  # controlled cleanup
+
+    @mark.asyncio
+    async def test_malformed_snapshot_is_invariant(self, repo):
+        await repo.create(T1)
+        state_key, stream_key = repo.keys(T1)
+        raw = await repo._client.xrange(stream_key)
+        payload = raw[0][1][b"event"].decode()
+
+        # physical id with a counter is not a valid business id
+        await repo._client.delete(stream_key)
+        await repo._client.xadd(stream_key, {"event": payload}, id="1-999")
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+
+        # broken JSON must not leak a raw decode error
+        await repo._client.delete(stream_key)
+        await repo._client.xadd(stream_key, {"event": "{not-json"}, id="1-0")
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
+
+        # non-terminal hash carrying terminal_seq is not silently hidden
+        await repo._client.delete(stream_key)
+        await repo._client.xadd(stream_key, {"event": payload}, id="1-0")
+        await repo._client.hset(state_key, "terminal_seq", "1")
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.snapshot(T1, 0, 0.01)
+        assert exc.value.fault is RunRepositoryFault.INVARIANT
 
     @mark.asyncio
     async def test_answer_events_are_dual_layer_and_replay_stable(self, repo):

@@ -25,6 +25,10 @@ Reviewer-driven design (round 3):
   page; Python then verifies stream-id↔seq, event identity vs the stored
   record, newest id vs ``latest_seq`` and the terminal event, and reports
   violations as explicit invariant faults;
+- **COMPLETED without an answer is allowed and intentional**: a run may finish
+  without ``answer.completed`` (handoff, degraded, safety escalation or empty
+  approved knowledge). The answer seal only forbids answer events AFTER
+  ``answer.completed``; it never requires one before a terminal transition.
 - **bounded waits and operations**: blocking reads use async ``XREAD BLOCK``
   (``redis.asyncio``) wrapped in a repository-level timeout; a cursor beyond
   ``latest_seq`` returns immediately so the engine can classify ``cursor_ahead``;
@@ -67,6 +71,7 @@ DEFAULT_RUN_TTL_S = 1800  # V2.3 session idle window
 DEFAULT_BLOCK_MS = 15_000
 DEFAULT_SNAPSHOT_LIMIT = 500
 DEFAULT_OP_TIMEOUT_S = 5.0
+DEFAULT_BLOCK_GRACE_S = 5.0  # network grace added to a blocking read budget
 MAX_COMMIT_RETRIES = 5
 
 #: Lua control codes (negative so they can never look like a real seq)
@@ -146,7 +151,11 @@ class RunIdentity:
 
 
 def _validate_config(
-    max_events: int, ttl_s: int | None, op_timeout_s: float | None = None
+    max_events: int,
+    ttl_s: int | None,
+    op_timeout_s: float | None = None,
+    block_grace_s: float | None = None,
+    snapshot_limit: int | None = None,
 ) -> None:
     if (
         isinstance(max_events, bool)
@@ -158,15 +167,52 @@ def _validate_config(
         isinstance(ttl_s, bool) or not isinstance(ttl_s, int) or ttl_s < 1
     ):
         raise ValueError(f"ttl_s must be None or a positive integer, got {ttl_s!r}")
-    if op_timeout_s is not None and (
-        isinstance(op_timeout_s, bool)
-        or not isinstance(op_timeout_s, (int, float))
-        or not math.isfinite(op_timeout_s)
-        or op_timeout_s <= 0
+    for name, value in (
+        ("op_timeout_s", op_timeout_s),
+        ("block_grace_s", block_grace_s),
+    ):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive number, got {value!r}")
+    if snapshot_limit is not None and (
+        isinstance(snapshot_limit, bool)
+        or not isinstance(snapshot_limit, int)
+        or snapshot_limit < 1
     ):
         raise ValueError(
-            f"op_timeout_s must be a positive number, got {op_timeout_s!r}"
+            f"snapshot_limit must be a positive integer, got {snapshot_limit!r}"
         )
+
+
+#: maximum length accepted for identity components (matches the API contracts)
+_MAX_IDENTITY_COMPONENT = 128
+
+
+def _encode_component(value: str) -> str:
+    """Length-checked, delimiter-safe encoding for key components.
+
+    ``tenant``/``run`` may contain ``:``, ``{`` or ``}``; joining raw values
+    would let ``("a:b", "c")`` and ``("a", "b:c")`` collapse onto the same key.
+    Percent-escaping the delimiters (and ``%`` itself) keeps the mapping
+    injective while both derived keys still share one hash tag.
+    """
+    if not isinstance(value, str) or not value or not value.strip():
+        raise ValueError("key component must be a non-empty string")
+    if len(value) > _MAX_IDENTITY_COMPONENT:
+        raise ValueError(
+            f"key component exceeds {_MAX_IDENTITY_COMPONENT} characters: {value!r}"
+        )
+    safe = (
+        value.replace("%", "%25")
+        .replace(":", "%3A")
+        .replace("{", "%7B")
+        .replace("}", "%7D")
+    )
+    return safe
 
 
 def _layer_for(event_type: SSEEventType) -> EventLayer:
@@ -560,14 +606,13 @@ return seq
 """
 
 _LUA_DELETE = """
-if redis.call('EXISTS', KEYS[1]) == 0 and redis.call('EXISTS', KEYS[2]) == 0 then
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  if redis.call('EXISTS', KEYS[2]) == 1 then return -5 end
   return -1
 end
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  if redis.call('HGET', KEYS[1], 'tenant_id') ~= ARGV[1] then return -2 end
-  if redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2] then return -2 end
-  if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -2 end
-end
+if redis.call('HGET', KEYS[1], 'tenant_id') ~= ARGV[1] then return -2 end
+if redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2] then return -2 end
+if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -2 end
 redis.call('DEL', KEYS[1])
 redis.call('DEL', KEYS[2])
 return 1
@@ -614,8 +659,14 @@ end
 local out = {state, latest, terminal, device, session, oldest, newest, terminal_ok}
 local entries = redis.call('XRANGE', KEYS[2], ARGV[4], '+', 'COUNT', ARGV[5])
 for i = 1, #entries do
+  local fields = entries[i][2]
+  local payload = nil
+  for j = 1, #fields - 1, 2 do
+    if fields[j] == 'event' then payload = fields[j + 1] end
+  end
+  if payload == nil then return redis.error_reply('MALFORMED_ENTRY') end
   out[#out + 1] = entries[i][1]
-  out[#out + 1] = entries[i][2][2]
+  out[#out + 1] = payload
 end
 return out
 """
@@ -656,29 +707,60 @@ class RedisRunRepository:
         ttl_s: int | None = DEFAULT_RUN_TTL_S,
         snapshot_limit: int = DEFAULT_SNAPSHOT_LIMIT,
         op_timeout_s: float = DEFAULT_OP_TIMEOUT_S,
+        block_grace_s: float = DEFAULT_BLOCK_GRACE_S,
     ) -> None:
-        _validate_config(max_events, ttl_s, op_timeout_s)
+        _validate_config(max_events, ttl_s, op_timeout_s, block_grace_s, snapshot_limit)
         self._client = client
         self._prefix = prefix
         self._max_events = max_events
         self._ttl_s = ttl_s
         self._snapshot_limit = snapshot_limit
+        # ordinary commands get a short budget; a blocking read is allowed
+        # ``heartbeat_timeout + block_grace_s`` so an idle stream can reach its
+        # heartbeat instead of failing as unavailable
         self._op_timeout_s = float(op_timeout_s)
+        self._block_grace_s = float(block_grace_s)
 
     # -- helpers ---------------------------------------------------------------
 
     def keys(self, identity: RunIdentity) -> tuple[str, str]:
-        """Tenant-scoped keys inside ONE hash tag (same cluster slot)."""
-        tag = f"{self._prefix}:{identity.tenant_id}:{identity.run_id}"
+        """Tenant-scoped keys inside ONE hash tag (same cluster slot).
+
+        Components are delimiter-escaped so distinct identities can never
+        collide onto one key (``tenant="a:b", run="c"`` vs ``tenant="a",
+        run="b:c"``).
+        """
+        tenant = _encode_component(identity.tenant_id)
+        run_id = _encode_component(identity.run_id)
+        tag = f"{self._prefix}:{tenant}:{run_id}"
         return (f"{{{tag}}}:state", f"{{{tag}}}:events")
 
     @staticmethod
     def _arg(value: Any) -> str:
         return value.decode() if isinstance(value, bytes) else str(value)
 
-    async def _call(self, awaitable: Any, what: str) -> Any:
+    @staticmethod
+    def _strict_id_seq(stream_id: str) -> int:
+        """Physical stream ids must be exactly ``<seq>-0`` (no counters)."""
+        head, _, tail = stream_id.partition("-")
+        if not head.isdigit() or tail != "0":
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"malformed stream id {stream_id!r} (expected <seq>-0)",
+            )
+        seq = int(head)
+        if seq < 1:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT, f"stream id {stream_id!r} below seq 1"
+            )
+        return seq
+
+    async def _call(
+        self, awaitable: Any, what: str, *, budget_s: float | None = None
+    ) -> Any:
+        budget = self._op_timeout_s if budget_s is None else budget_s
         try:
-            async with asyncio.timeout(self._op_timeout_s):
+            async with asyncio.timeout(budget):
                 return await awaitable
         except TimeoutError as exc:
             raise RunRepositoryError(
@@ -915,8 +997,11 @@ class RedisRunRepository:
                 RunRepositoryFault.INVARIANT, "run is already terminal"
             )
         if code == _CODE_ORPHAN_STATE:
+            # -5 covers both directions: state without stream (commit/append)
+            # and stream without state (delete) — never silently operated on
             return RunRepositoryError(
-                RunRepositoryFault.INVARIANT, "state key without its stream"
+                RunRepositoryFault.INVARIANT,
+                "orphan key pair: state and stream disagree",
             )
         if code == _CODE_STATE_NOT_ALLOWED:
             return RunRepositoryError(
@@ -952,41 +1037,74 @@ class RedisRunRepository:
             ),
             "snapshot",
         )
-        values = [self._arg(v) for v in raw]
-        state = RunState(values[0])
-        latest = int(values[1])
-        terminal = int(values[2]) if values[2] else None
-        device_id, session_id = values[3], values[4]
+        try:
+            values = [self._arg(v) for v in raw]
+            state = RunState(values[0])
+            latest = int(values[1])
+            terminal = int(values[2]) if values[2] else None
+            device_id, session_id = values[3], values[4]
+            retained_oldest = int(values[5].split("-")[0]) if values[5] else 0
+            newest_id = values[6]
+            terminal_ok = values[7] == "1"
+        except (ValueError, IndexError, KeyError) as exc:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"malformed snapshot fields for {identity.run_id!r}: {exc}",
+            ) from exc
         if device_id != identity.device_id or session_id != identity.session_id:
             raise RunRepositoryError(
                 RunRepositoryFault.NOT_FOUND,
                 f"run {identity.run_id!r} not found for this principal",
             )
-        retained_oldest = int(values[5].split("-")[0]) if values[5] else 0
-        newest_id = values[6]
-        terminal_ok = values[7] == "1"
-        if newest_id:
-            newest_seq = int(newest_id.split("-")[0])
-            if newest_seq != latest:
-                raise RunRepositoryError(
-                    RunRepositoryFault.INVARIANT,
-                    f"stream newest id {newest_seq} != hash latest_seq {latest}",
-                )
-        if terminal is not None and not terminal_ok:
+        # physical ids must be exactly "<seq>-0": "1-999" is a corruption, not seq 1
+        newest_seq = self._strict_id_seq(newest_id) if newest_id else 0
+        if newest_id and newest_seq != latest:
             raise RunRepositoryError(
                 RunRepositoryFault.INVARIANT,
-                f"terminal_seq {terminal} does not hold run.completed",
+                f"stream newest id {newest_id!r} != hash latest_seq {latest}",
+            )
+        if terminal is not None:
+            if is_terminal_state(state) is False:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"non-terminal state {state.value} carries terminal_seq {terminal}",
+                )
+            if terminal != latest:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"terminal_seq {terminal} != latest_seq {latest}",
+                )
+            if not terminal_ok:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"terminal_seq {terminal} does not hold run.completed",
+                )
+        elif is_terminal_state(state):
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"terminal state {state.value} without terminal_seq",
             )
         events: list[SSEEvent] = []
         pairs = values[8:]
+        if len(pairs) % 2:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"odd snapshot payload for {identity.run_id!r}",
+            )
         for index in range(0, len(pairs) - 1, 2):
             stream_id, payload = pairs[index], pairs[index + 1]
-            event = SSEEvent.model_validate(json.loads(payload))
-            id_seq = int(stream_id.split("-")[0])
+            id_seq = self._strict_id_seq(stream_id)
+            try:
+                event = SSEEvent.model_validate(json.loads(payload))
+            except Exception as exc:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"malformed event payload at {stream_id!r}: {exc}",
+                ) from exc
             if id_seq != event.seq:
                 raise RunRepositoryError(
                     RunRepositoryFault.INVARIANT,
-                    f"stream id {id_seq} != event seq {event.seq}",
+                    f"stream id {stream_id!r} != event seq {event.seq}",
                 )
             if (
                 event.tenant_id != identity.tenant_id
@@ -997,6 +1115,13 @@ class RedisRunRepository:
                 raise RunRepositoryError(
                     RunRepositoryFault.INVARIANT,
                     f"event {event.seq} identity does not match the run record",
+                )
+            if event.event is SSEEventType.RUN_COMPLETED and not is_terminal_state(
+                state
+            ):
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"run.completed at {event.seq} while state is {state.value}",
                 )
             events.append(event)
         return _Page(
@@ -1027,9 +1152,12 @@ class RedisRunRepository:
             )
         block_ms = max(int(timeout_s * 1000), 1)
         _, stream_key = self.keys(identity)
+        # blocking read budget = requested wait window + network grace, so the
+        # SSE heartbeat can never be cut short by the command timeout
         await self._call(
             self._client.xread({stream_key: f"{cursor}-0"}, count=1, block=block_ms),
             "xread",
+            budget_s=max(timeout_s, 0.0) + self._block_grace_s,
         )
         page = await self._read_atomic(
             identity, cursor=cursor, limit=self._snapshot_limit
@@ -1050,6 +1178,7 @@ class RedisRunRepository:
 
 
 __all__ = [
+    "DEFAULT_BLOCK_GRACE_S",
     "DEFAULT_BLOCK_MS",
     "DEFAULT_MAX_EVENTS_PER_RUN",
     "DEFAULT_OP_TIMEOUT_S",
