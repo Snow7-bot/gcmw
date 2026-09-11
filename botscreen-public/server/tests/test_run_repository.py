@@ -736,25 +736,31 @@ class TestRealRedis:
             (VERIFYING, STREAMING),
             (STREAMING, COMPLETED),
         ]
-        for expected, nxt in path:
-            await repo.commit_transition(
-                T1,
-                expected_state=expected,
-                next_state=nxt,
-                data={"status": "completed"} if nxt is COMPLETED else None,
-            )
+        for expected, nxt in path[:-1]:
+            await repo.commit_transition(T1, expected_state=expected, next_state=nxt)
+        # dual-layer events land while the run is still streaming (not terminal)
         await repo.append_event(
             T1, event_type=SSEEventType.ANSWER_DELTA, data={"delta": "x"}
+        )
+        await repo.append_event(
+            T1,
+            event_type=SSEEventType.ANSWER_COMPLETED,
+            data={"citations": [], "content_origin": "ai_generated"},
+        )
+        await repo.commit_transition(
+            T1,
+            expected_state=path[-1][0],
+            next_state=path[-1][1],
+            data={"status": "completed"},
         )
         snapshot = await repo.snapshot(T1, 0, 0.01)
         assert snapshot.state is COMPLETED
         assert snapshot.terminal_seq == snapshot.latest_seq
         events = [e.event for e in snapshot.events]
-        assert (
-            events[-1] is SSEEventType.ANSWER_DELTA
-            or events[-1] is SSEEventType.RUN_COMPLETED
-        )
-        assert snapshot.events[0].event is SSEEventType.RUN_ACCEPTED
+        assert events[0] is SSEEventType.RUN_ACCEPTED
+        assert SSEEventType.ANSWER_DELTA in events
+        assert SSEEventType.ANSWER_COMPLETED in events
+        assert events[-1] is SSEEventType.RUN_COMPLETED
 
     @mark.asyncio
     async def test_physical_ids_are_business_seq(self, repo):
@@ -819,7 +825,7 @@ class TestRealRedis:
 
         async def writer():
             current = ACCEPTED
-            for nxt in (GUARDING, ROUTING, DRAFTING, STREAMING, COMPLETED):
+            for nxt in (GUARDING, ROUTING, DRAFTING, VERIFYING, STREAMING, COMPLETED):
                 await repo.commit_transition(
                     T1,
                     expected_state=current,
