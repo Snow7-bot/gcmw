@@ -1,45 +1,45 @@
 """RunRepository — the single durable authority for run state + events (#65B-2 A).
 
-Reviewer-driven design (round 2):
+Reviewer-driven design (round 3):
 
-- **one persistence authority**: this repository owns run state AND its event
-  stream. The older ``event_store`` module is deprecated for run events (see
-  its docstring); nothing else may claim that authority;
-- **tenant binding everywhere**: keys carry the run id, every write/delete/
-  read is bound to the trusted tenant, and ownership is verified INSIDE the
-  Redis Lua scripts (delete included) — another tenant's run reads/writes as
-  "not found", never as data;
-- **two atomic write operations**:
-  * ``commit_transition`` — a legal state transition (rules reused from
-    ``RunStateMachine``) that changes the state and appends its event in the
-    same atomic step, deriving the event type (``process.status`` /
-    ``run.completed``) and layer (``process``) from the target state;
-  * ``append_event`` — a state-preserving event append (``answer.delta``,
-    ``answer.completed``, ``evidence.found``, ...) for the answer layer;
-- **business seq == physical Stream ID**: events are written with the explicit
-  Redis id ``<seq>-0``, so ``XREAD``/``XRANGE`` resume directly by business
-  cursor — no id/seq mixing;
-- **atomic snapshot**: a single Lua script returns the state fields together
-  with the event page, so a commit can never be observed half-applied;
-  blocking waits use async ``XREAD BLOCK`` (``redis.asyncio``) followed by a
-  fresh atomic snapshot, and an idle wait yields a valid timeout snapshot;
-- **validated before commit**: the ``SSEEvent`` (layer, data whitelist,
-  identity, immutable timestamp) is fully constructed and validated in Python
-  BEFORE the atomic write, using the identity persisted at create time
-  (never caller placeholders); the commit re-checks tenant/device/session and
-  the expected seq, so a concurrent change forces a bounded retry;
-- **first event is fixed**: ``create`` always writes ``run.accepted``;
-- **configuration is validated**: ``max_events >= 1``, ``ttl_s`` is ``None``
-  (no expiry) or ``>= 1`` — in both implementations;
-- **orphan/terminal invariants**: a state key without its stream (or the
-  reverse), a wrong-type key or a commit out of a terminal run is reported as
-  an explicit invariant fault.
+- **one persistence authority**: run state AND its event stream are owned here;
+  the legacy ``event_store`` module is deprecated for run events;
+- **tenant + device + session bound**: Redis keys are scoped by tenant and run
+  inside one hash tag (``{gcmw:run:<tenant>:<run_id>}``) so both keys land in
+  the same cluster slot; Memory keys on ``(tenant_id, run_id)``; and every
+  write/read/delete compares the CALLER's tenant/device/session against the
+  stored record (a mismatch is "not found", never data);
+- **two atomic writes with an explicit state whitelist**:
+  * ``commit_transition`` — legal transitions only (rules reused from
+    ``RunStateMachine``), event type + layer derived from the target state;
+  * ``append_event`` — state-preserving events restricted per state:
+    ``answer.delta``/``answer.completed`` only while STREAMING,
+    ``evidence.found`` during retrieval/draft/verify/stream, ``reflection.result``
+    while VERIFYING, ``mic_status`` at the edges. ``heartbeat`` is NEVER
+    persisted (B-1 defines it as a sequence-free comment frame), and
+    ``answer.completed`` is single-shot — no delta afterwards;
+- **business seq == physical stream id** (``<seq>-0``), so resume uses the
+  business cursor directly;
+- **atomic snapshot with full invariant validation**: one Lua read returns
+  state fields, retained-oldest, newest id, terminal-event validity and the
+  page; Python then verifies stream-id↔seq, event identity vs the stored
+  record, newest id vs ``latest_seq`` and the terminal event, and reports
+  violations as explicit invariant faults;
+- **bounded waits and operations**: blocking reads use async ``XREAD BLOCK``
+  (``redis.asyncio``) wrapped in a repository-level timeout; a cursor beyond
+  ``latest_seq`` returns immediately so the engine can classify ``cursor_ahead``;
+- **retry-safe conflict codes**: Lua control codes are negative and never
+  collide with a real (positive) sequence number; a seq that moved under us
+  retries, state mismatch is a CAS conflict;
+- **Memory parity**: expired records are purged before ``create``, and both
+  writes and reads use deep copies so callers can never mutate stored history.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -66,19 +66,36 @@ DEFAULT_MAX_EVENTS_PER_RUN = 10_000
 DEFAULT_RUN_TTL_S = 1800  # V2.3 session idle window
 DEFAULT_BLOCK_MS = 15_000
 DEFAULT_SNAPSHOT_LIMIT = 500
-MAX_COMMIT_RETRIES = 4
+DEFAULT_OP_TIMEOUT_S = 5.0
+MAX_COMMIT_RETRIES = 5
 
-#: events that may be appended WITHOUT changing run state (answer layer etc.)
-STATELESS_EVENT_TYPES: frozenset[SSEEventType] = frozenset(
-    {
-        SSEEventType.ANSWER_DELTA,
-        SSEEventType.ANSWER_COMPLETED,
-        SSEEventType.EVIDENCE_FOUND,
-        SSEEventType.REFLECTION_RESULT,
-        SSEEventType.HEARTBEAT,
-        SSEEventType.MIC_STATUS,
-    }
-)
+#: Lua control codes (negative so they can never look like a real seq)
+_CODE_NOT_FOUND = -1
+_CODE_TENANT_MISMATCH = -2
+_CODE_TERMINAL = -3
+_CODE_IDENTITY_MISMATCH = -4
+_CODE_ORPHAN_STATE = -5
+_CODE_SEQ_MOVED = -6  # retry with a fresh snapshot
+_CODE_STATE_MISMATCH = -7  # CAS conflict
+_CODE_STATE_NOT_ALLOWED = -8  # event/state whitelist or answer already sealed
+
+#: state-preserving events and the states they may be written in.
+#: ``heartbeat`` is intentionally absent: B-1 defines it as a comment frame
+#: without a sequence number, so it must never occupy a business seq.
+STATELESS_EVENT_STATES: dict[SSEEventType, frozenset[RunState]] = {
+    SSEEventType.ANSWER_DELTA: frozenset({RunState.STREAMING}),
+    SSEEventType.ANSWER_COMPLETED: frozenset({RunState.STREAMING}),
+    SSEEventType.EVIDENCE_FOUND: frozenset(
+        {RunState.RETRIEVING, RunState.DRAFTING, RunState.VERIFYING, RunState.STREAMING}
+    ),
+    SSEEventType.REFLECTION_RESULT: frozenset({RunState.VERIFYING}),
+    SSEEventType.MIC_STATUS: frozenset(
+        {RunState.ACCEPTED, RunState.GUARDING, RunState.STREAMING}
+    ),
+}
+
+#: events that seal the answer: no further delta may follow them
+SEALING_EVENT_TYPES = frozenset({SSEEventType.ANSWER_COMPLETED})
 
 
 class RunRepositoryFault(str, Enum):
@@ -128,7 +145,9 @@ class RunIdentity:
                 raise ValueError(f"RunIdentity.{name} must be non-empty")
 
 
-def _validate_config(max_events: int, ttl_s: int | None) -> None:
+def _validate_config(
+    max_events: int, ttl_s: int | None, op_timeout_s: float | None = None
+) -> None:
     if (
         isinstance(max_events, bool)
         or not isinstance(max_events, int)
@@ -139,15 +158,21 @@ def _validate_config(max_events: int, ttl_s: int | None) -> None:
         isinstance(ttl_s, bool) or not isinstance(ttl_s, int) or ttl_s < 1
     ):
         raise ValueError(f"ttl_s must be None or a positive integer, got {ttl_s!r}")
+    if op_timeout_s is not None and (
+        isinstance(op_timeout_s, bool)
+        or not isinstance(op_timeout_s, (int, float))
+        or not math.isfinite(op_timeout_s)
+        or op_timeout_s <= 0
+    ):
+        raise ValueError(
+            f"op_timeout_s must be a positive number, got {op_timeout_s!r}"
+        )
 
 
 def _layer_for(event_type: SSEEventType) -> EventLayer:
     """Derive the SSE layer from the event type (single authority)."""
-    allowed = EVENT_DATA_ALLOWED_KEYS
     if event_type in {SSEEventType.ANSWER_DELTA, SSEEventType.ANSWER_COMPLETED}:
         return EventLayer.ANSWER
-    if event_type.value in allowed or event_type in allowed:
-        return EventLayer.PROCESS
     return EventLayer.PROCESS
 
 
@@ -160,7 +185,7 @@ def build_event(
     timestamp: Any = None,
 ) -> SSEEvent:
     """Construct + validate the event BEFORE any write (whitelist enforced)."""
-    payload = dict(data or {})
+    payload = json.loads(json.dumps(data or {}))  # detach from caller objects
     for key in payload:
         if key in FORBIDDEN_DATA_KEYS:
             raise RunRepositoryError(
@@ -208,6 +233,34 @@ def _snapshot_from(
     )
 
 
+def _require_stateless_support(
+    event_type: SSEEventType, state: RunState, *, answer_sealed: bool
+) -> None:
+    """Python-side safety gate (the Lua script re-checks the same rules)."""
+    if event_type not in STATELESS_EVENT_STATES:
+        if event_type is SSEEventType.HEARTBEAT:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                "heartbeat is a comment frame and must never occupy a seq",
+            )
+        raise RunRepositoryError(
+            RunRepositoryFault.INVARIANT,
+            f"{event_type.value} is not a state-preserving event",
+        )
+    allowed_states = STATELESS_EVENT_STATES[event_type]
+    if state not in allowed_states:
+        raise RunRepositoryError(
+            RunRepositoryFault.INVARIANT,
+            f"{event_type.value} is not allowed while {state.value} "
+            f"(allowed: {sorted(s.value for s in allowed_states)})",
+        )
+    if answer_sealed:
+        raise RunRepositoryError(
+            RunRepositoryFault.INVARIANT,
+            "the answer is already completed — no further answer events",
+        )
+
+
 # ---------------------------------------------------------------------------
 # In-memory implementation (deterministic; same invariants as Redis)
 # ---------------------------------------------------------------------------
@@ -219,6 +272,7 @@ class _Record:
     state: RunState
     events: list[SSEEvent] = field(default_factory=list)
     terminal_seq: int | None = None
+    answer_sealed: bool = False
     expires_at: float | None = None
     waiters: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -239,14 +293,16 @@ class MemoryRunRepository:
         self._max_events = max_events
         self._ttl_s = ttl_s
         self._monotonic = monotonic or time.monotonic
-        self._records: dict[str, _Record] = {}
+        # tenant-scoped keys: (tenant_id, run_id)
+        self._records: dict[tuple[str, str], _Record] = {}
         self._lock = asyncio.Lock()
 
     # -- lifecycle -------------------------------------------------------------
 
     async def create(self, identity: RunIdentity) -> int:
         async with self._lock:
-            if identity.run_id in self._records:
+            self._purge_expired(identity)  # expired ids may be recreated
+            if self._key(identity) in self._records:
                 raise RunRepositoryError(
                     RunRepositoryFault.CAS_CONFLICT,
                     f"run {identity.run_id!r} already exists",
@@ -254,9 +310,7 @@ class MemoryRunRepository:
             record = _Record(
                 identity=identity,
                 state=RunState.ACCEPTED,
-                expires_at=(
-                    None if self._ttl_s is None else self._monotonic() + self._ttl_s
-                ),
+                expires_at=self._deadline(),
             )
             record.events.append(
                 build_event(
@@ -264,9 +318,9 @@ class MemoryRunRepository:
                     1,
                     SSEEventType.RUN_ACCEPTED,
                     {"status": "accepted", "message": "问题已接收"},
-                )
+                ).model_copy(deep=True)
             )
-            self._records[identity.run_id] = record
+            self._records[self._key(identity)] = record
             record.waiters.set()
             return 1
 
@@ -286,37 +340,27 @@ class MemoryRunRepository:
                     f"run {identity.run_id!r} is {record.state.value}, "
                     f"expected {expected_state.value}",
                 )
-            return self._transition_locked(record, expected_state, next_state, data)
-
-    def _transition_locked(
-        self,
-        record: _Record,
-        expected_state: RunState,
-        next_state: RunState,
-        data: dict[str, Any] | None,
-    ) -> int:
-        if is_terminal_state(record.state):
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"run {record.identity.run_id!r} is already terminal",
-            )
-        if not is_allowed_transition(expected_state, next_state):
-            raise RunRepositoryError(
-                RunRepositoryFault.ILLEGAL_TRANSITION,
-                f"illegal transition {expected_state.value} -> {next_state.value}",
-            )
-        event_type = SSEEventType(transition_event_type(next_state))
-        seq = record.latest_seq + 1
-        # identity comes from the persisted record — never from the caller
-        event = build_event(record.identity, seq, event_type, data)
-        record.events.append(event)
-        record.state = next_state
-        if is_terminal_state(next_state):
-            record.terminal_seq = seq
-        self._trim(record)
-        self._refresh_ttl(record)
-        record.waiters.set()
-        return seq
+            if is_terminal_state(record.state):
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"run {identity.run_id!r} is already terminal",
+                )
+            if not is_allowed_transition(expected_state, next_state):
+                raise RunRepositoryError(
+                    RunRepositoryFault.ILLEGAL_TRANSITION,
+                    f"illegal transition {expected_state.value} -> {next_state.value}",
+                )
+            event_type = SSEEventType(transition_event_type(next_state))
+            seq = record.latest_seq + 1
+            event = build_event(record.identity, seq, event_type, data)
+            record.events.append(event.model_copy(deep=True))
+            record.state = next_state
+            if is_terminal_state(next_state):
+                record.terminal_seq = seq
+            self._trim(record)
+            self._refresh_ttl(record)
+            record.waiters.set()
+            return seq
 
     async def append_event(
         self,
@@ -325,21 +369,22 @@ class MemoryRunRepository:
         event_type: SSEEventType,
         data: dict[str, Any] | None = None,
     ) -> int:
-        """State-preserving append for the answer layer (e.g. answer.delta)."""
-        if event_type not in STATELESS_EVENT_TYPES:
-            raise RunRepositoryError(
-                RunRepositoryFault.INVARIANT,
-                f"{event_type.value} is not a state-preserving event",
-            )
+        """State-preserving append; the event/state whitelist is enforced."""
         async with self._lock:
             record = self._require(identity)
             if is_terminal_state(record.state):
                 raise RunRepositoryError(
                     RunRepositoryFault.INVARIANT,
-                    f"run {record.identity.run_id!r} is terminal",
+                    f"run {identity.run_id!r} is terminal",
                 )
+            _require_stateless_support(
+                event_type, record.state, answer_sealed=record.answer_sealed
+            )
             seq = record.latest_seq + 1
-            record.events.append(build_event(record.identity, seq, event_type, data))
+            event = build_event(record.identity, seq, event_type, data)
+            record.events.append(event.model_copy(deep=True))
+            if event_type in SEALING_EVENT_TYPES:
+                record.answer_sealed = True
             self._trim(record)
             self._refresh_ttl(record)
             record.waiters.set()
@@ -350,10 +395,10 @@ class MemoryRunRepository:
             return self._require(identity).state
 
     async def delete(self, identity: RunIdentity) -> None:
-        """Tenant-authenticated delete (foreign runs are never removed)."""
+        """Tenant+device+session authenticated delete."""
         async with self._lock:
             self._require(identity)
-            self._records.pop(identity.run_id, None)
+            self._records.pop(self._key(identity), None)
 
     # -- engine read interface --------------------------------------------------
 
@@ -363,6 +408,8 @@ class MemoryRunRepository:
         async with self._lock:
             record = self._require(identity)
             if record.latest_seq > cursor or is_terminal_state(record.state):
+                return self._page(record, cursor, timed_out=False)
+            if cursor > record.latest_seq:
                 return self._page(record, cursor, timed_out=False)
             record.waiters.clear()
         try:
@@ -376,7 +423,11 @@ class MemoryRunRepository:
             return self._page(record, cursor, timed_out=True)
 
     def _page(self, record: _Record, cursor: int, *, timed_out: bool) -> StreamSnapshot:
-        events = () if timed_out else tuple(e for e in record.events if e.seq > cursor)
+        events = (
+            ()
+            if timed_out
+            else tuple(e.model_copy(deep=True) for e in record.events if e.seq > cursor)
+        )
         return _snapshot_from(
             state=record.state,
             events=events,
@@ -388,28 +439,47 @@ class MemoryRunRepository:
 
     # -- helpers ---------------------------------------------------------------
 
+    @staticmethod
+    def _key(identity: RunIdentity) -> tuple[str, str]:
+        return (identity.tenant_id, identity.run_id)
+
+    def _deadline(self) -> float | None:
+        return None if self._ttl_s is None else self._monotonic() + self._ttl_s
+
+    def _expired(self, record: _Record) -> bool:
+        return record.expires_at is not None and self._monotonic() >= record.expires_at
+
+    def _purge_expired(self, identity: RunIdentity) -> None:
+        key = self._key(identity)
+        record = self._records.get(key)
+        if record is not None and self._expired(record):
+            del self._records[key]
+
     def _trim(self, record: _Record) -> None:
         while len(record.events) > self._max_events:
             record.events.pop(0)
 
     def _refresh_ttl(self, record: _Record) -> None:
-        if self._ttl_s is not None:
-            record.expires_at = self._monotonic() + self._ttl_s
+        record.expires_at = self._deadline()
 
     def _require(self, identity: RunIdentity) -> _Record:
-        record = self._records.get(identity.run_id)
+        record = self._records.get(self._key(identity))
         if record is None:
             raise RunRepositoryError(
                 RunRepositoryFault.NOT_FOUND, f"run {identity.run_id!r} not found"
             )
-        if record.identity.tenant_id != identity.tenant_id:
-            # foreign run: absent, never data
+        if (
+            record.identity.tenant_id != identity.tenant_id
+            or record.identity.device_id != identity.device_id
+            or record.identity.session_id != identity.session_id
+        ):
+            # foreign/mismatched identity: absent, never data
             raise RunRepositoryError(
                 RunRepositoryFault.NOT_FOUND,
-                f"run {identity.run_id!r} not found for this tenant",
+                f"run {identity.run_id!r} not found for this principal",
             )
-        if record.expires_at is not None and self._monotonic() >= record.expires_at:
-            del self._records[identity.run_id]
+        if self._expired(record):
+            del self._records[self._key(identity)]
             raise RunRepositoryError(
                 RunRepositoryFault.NOT_FOUND, f"run {identity.run_id!r} expired"
             )
@@ -417,7 +487,7 @@ class MemoryRunRepository:
 
 
 # ---------------------------------------------------------------------------
-# Redis implementation (redis.asyncio; explicit seq == stream id)
+# Redis implementation (redis.asyncio; tenant-scoped keys, Lua-only writes)
 # ---------------------------------------------------------------------------
 
 _LUA_CREATE = """
@@ -426,8 +496,8 @@ if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
 end
 redis.call('HSET', KEYS[1],
   'state', 'ACCEPTED', 'tenant_id', ARGV[1], 'device_id', ARGV[2],
-  'session_id', ARGV[3], 'latest_seq', '1')
-redis.call('XADD', KEYS[2], 'MAXLEN', '=', ARGV[5], ARGV[7], 'event', ARGV[6])
+  'session_id', ARGV[3], 'latest_seq', '1', 'answer_sealed', '0')
+redis.call('XADD', KEYS[2], 'MAXLEN', '=', ARGV[5], '1-0', 'event', ARGV[6])
 if tonumber(ARGV[4]) > 0 then
   redis.call('EXPIRE', KEYS[1], ARGV[4])
   redis.call('EXPIRE', KEYS[2], ARGV[4])
@@ -442,9 +512,9 @@ if redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2] then return -4 end
 if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -4 end
 if redis.call('EXISTS', KEYS[2]) == 0 then return -5 end
 if redis.call('HGET', KEYS[1], 'terminal_seq') then return -3 end
-if redis.call('HGET', KEYS[1], 'state') ~= ARGV[4] then return 0 end
+if redis.call('HGET', KEYS[1], 'state') ~= ARGV[4] then return -7 end
 local latest = tonumber(redis.call('HGET', KEYS[1], 'latest_seq') or '0')
-if latest ~= tonumber(ARGV[5]) then return 1 end
+if latest ~= tonumber(ARGV[5]) then return -6 end
 local seq = latest + 1
 redis.call('XADD', KEYS[2], 'MAXLEN', '=', ARGV[9], tostring(seq) .. '-0',
   'event', ARGV[7])
@@ -466,15 +536,25 @@ if redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2] then return -4 end
 if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -4 end
 if redis.call('EXISTS', KEYS[2]) == 0 then return -5 end
 if redis.call('HGET', KEYS[1], 'terminal_seq') then return -3 end
+if redis.call('HGET', KEYS[1], 'answer_sealed') == '1' then return -8 end
+local state = redis.call('HGET', KEYS[1], 'state')
+local allowed = false
+for token in string.gmatch(ARGV[8], '[^,]+') do
+  if token == state then allowed = true end
+end
+if not allowed then return -8 end
 local latest = tonumber(redis.call('HGET', KEYS[1], 'latest_seq') or '0')
-if latest ~= tonumber(ARGV[4]) then return 1 end
+if latest ~= tonumber(ARGV[4]) then return -6 end
 local seq = latest + 1
 redis.call('XADD', KEYS[2], 'MAXLEN', '=', ARGV[7], tostring(seq) .. '-0',
   'event', ARGV[5])
 redis.call('HSET', KEYS[1], 'latest_seq', tostring(seq))
-if tonumber(ARGV[8]) > 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[8])
-  redis.call('EXPIRE', KEYS[2], ARGV[8])
+if ARGV[9] == '1' then
+  redis.call('HSET', KEYS[1], 'answer_sealed', '1')
+end
+if tonumber(ARGV[10]) > 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[10])
+  redis.call('EXPIRE', KEYS[2], ARGV[10])
 end
 return seq
 """
@@ -485,6 +565,8 @@ if redis.call('EXISTS', KEYS[1]) == 0 and redis.call('EXISTS', KEYS[2]) == 0 the
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then
   if redis.call('HGET', KEYS[1], 'tenant_id') ~= ARGV[1] then return -2 end
+  if redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2] then return -2 end
+  if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -2 end
 end
 redis.call('DEL', KEYS[1])
 redis.call('DEL', KEYS[2])
@@ -496,7 +578,9 @@ if redis.call('EXISTS', KEYS[1]) == 0 then
   if redis.call('EXISTS', KEYS[2]) == 1 then return redis.error_reply('ORPHAN_STREAM') end
   return redis.error_reply('NOT_FOUND')
 end
-if redis.call('HGET', KEYS[1], 'tenant_id') ~= ARGV[1] then
+if redis.call('HGET', KEYS[1], 'tenant_id') ~= ARGV[1]
+   or redis.call('HGET', KEYS[1], 'device_id') ~= ARGV[2]
+   or redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then
   return redis.error_reply('NOT_FOUND')
 end
 if redis.call('EXISTS', KEYS[2]) == 0 then
@@ -507,9 +591,30 @@ local latest = redis.call('HGET', KEYS[1], 'latest_seq') or '0'
 local terminal = redis.call('HGET', KEYS[1], 'terminal_seq') or ''
 local device = redis.call('HGET', KEYS[1], 'device_id') or ''
 local session = redis.call('HGET', KEYS[1], 'session_id') or ''
-local entries = redis.call('XRANGE', KEYS[2], ARGV[2], '+', 'COUNT', ARGV[3])
-local out = {state, latest, terminal, device, session}
+local oldest = ''
+local first = redis.call('XRANGE', KEYS[2], '-', '+', 'COUNT', 1)
+if first[1] then oldest = first[1][1] end
+local newest = ''
+local last = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+if last[1] then newest = last[1][1] end
+local terminal_ok = '0'
+if terminal ~= '' then
+  local entry = redis.call('XRANGE', KEYS[2], terminal .. '-0', terminal .. '-0',
+    'COUNT', 1)
+  if entry[1] then
+    local fields = entry[1][2]
+    for i = 1, #fields - 1, 2 do
+      if fields[i] == 'event' then
+        local payload = cjson.decode(fields[i + 1])
+        if payload['event'] == 'run.completed' then terminal_ok = '1' end
+      end
+    end
+  end
+end
+local out = {state, latest, terminal, device, session, oldest, newest, terminal_ok}
+local entries = redis.call('XRANGE', KEYS[2], ARGV[4], '+', 'COUNT', ARGV[5])
 for i = 1, #entries do
+  out[#out + 1] = entries[i][1]
   out[#out + 1] = entries[i][2][2]
 end
 return out
@@ -528,33 +633,59 @@ class RedisClientDuck(Protocol):
     async def delete(self, *names: str) -> int: ...
 
 
+@dataclass(frozen=True)
+class _Page:
+    state: RunState
+    latest_seq: int
+    terminal_seq: int | None
+    device_id: str
+    session_id: str
+    oldest_seq: int
+    events: tuple[SSEEvent, ...]
+
+
 class RedisRunRepository:
-    """Redis-backed implementation with atomic Lua writes and snapshots."""
+    """Redis-backed implementation: tenant-scoped keys, Lua-only atomic writes."""
 
     def __init__(
         self,
         client: RedisClientDuck,
         *,
-        prefix: str = "gcmw:run:",
+        prefix: str = "gcmw:run",
         max_events: int = DEFAULT_MAX_EVENTS_PER_RUN,
         ttl_s: int | None = DEFAULT_RUN_TTL_S,
         snapshot_limit: int = DEFAULT_SNAPSHOT_LIMIT,
+        op_timeout_s: float = DEFAULT_OP_TIMEOUT_S,
     ) -> None:
-        _validate_config(max_events, ttl_s)
+        _validate_config(max_events, ttl_s, op_timeout_s)
         self._client = client
         self._prefix = prefix
         self._max_events = max_events
         self._ttl_s = ttl_s
         self._snapshot_limit = snapshot_limit
+        self._op_timeout_s = float(op_timeout_s)
 
     # -- helpers ---------------------------------------------------------------
 
-    def keys(self, run_id: str) -> tuple[str, str]:
-        return (f"{self._prefix}{run_id}:state", f"{self._prefix}{run_id}:events")
+    def keys(self, identity: RunIdentity) -> tuple[str, str]:
+        """Tenant-scoped keys inside ONE hash tag (same cluster slot)."""
+        tag = f"{self._prefix}:{identity.tenant_id}:{identity.run_id}"
+        return (f"{{{tag}}}:state", f"{{{tag}}}:events")
 
     @staticmethod
     def _arg(value: Any) -> str:
         return value.decode() if isinstance(value, bytes) else str(value)
+
+    async def _call(self, awaitable: Any, what: str) -> Any:
+        try:
+            async with asyncio.timeout(self._op_timeout_s):
+                return await awaitable
+        except TimeoutError as exc:
+            raise RunRepositoryError(
+                RunRepositoryFault.UNAVAILABLE, f"redis {what} timed out"
+            ) from exc
+        except Exception as exc:
+            raise self._fault_for(exc) from exc
 
     @staticmethod
     def _is_redis_error(exc: Exception) -> str | None:
@@ -581,15 +712,15 @@ class RedisRunRepository:
     # -- lifecycle -------------------------------------------------------------
 
     async def create(self, identity: RunIdentity) -> int:
-        state_key, stream_key = self.keys(identity.run_id)
+        state_key, stream_key = self.keys(identity)
         event = build_event(
             identity,
             1,
             SSEEventType.RUN_ACCEPTED,
             {"status": "accepted", "message": "问题已接收"},
         )
-        try:
-            outcome = await self._client.eval(
+        outcome = await self._call(
+            self._client.eval(
                 _LUA_CREATE,
                 2,
                 state_key,
@@ -600,10 +731,9 @@ class RedisRunRepository:
                 str(self._ttl_s or 0),
                 str(self._max_events),
                 event.model_dump_json(),
-                "1-0",
-            )
-        except Exception as exc:
-            raise self._fault_for(exc) from exc
+            ),
+            "create",
+        )
         if int(self._arg(outcome)) != 1:
             raise RunRepositoryError(
                 RunRepositoryFault.CAS_CONFLICT,
@@ -624,12 +754,52 @@ class RedisRunRepository:
                 RunRepositoryFault.ILLEGAL_TRANSITION,
                 f"illegal transition {expected_state.value} -> {next_state.value}",
             )
-        return await self._write(
-            identity,
-            expected_state=expected_state,
-            next_state=next_state,
-            event_type=SSEEventType(transition_event_type(next_state)),
-            data=data,
+        state_key, stream_key = self.keys(identity)
+        for _ in range(MAX_COMMIT_RETRIES):
+            page = await self._read_atomic(identity, cursor=0, limit=1)
+            if is_terminal_state(page.state):
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"run {identity.run_id!r} is already terminal",
+                )
+            seq = page.latest_seq + 1
+            event = build_event(
+                RunIdentity(
+                    run_id=identity.run_id,
+                    tenant_id=identity.tenant_id,
+                    device_id=page.device_id,
+                    session_id=page.session_id,
+                ),
+                seq,
+                SSEEventType(transition_event_type(next_state)),
+                data,
+            )
+            terminal = "1" if is_terminal_state(next_state) else "0"
+            code = await self._eval_code(
+                _LUA_COMMIT,
+                (state_key, stream_key),
+                (
+                    identity.tenant_id,
+                    identity.device_id,
+                    identity.session_id,
+                    expected_state.value,
+                    str(page.latest_seq),
+                    next_state.value,
+                    event.model_dump_json(),
+                    terminal,
+                    str(self._max_events),
+                    str(self._ttl_s or 0),
+                ),
+                what="commit",
+            )
+            if code > 0:
+                return code
+            if code == _CODE_SEQ_MOVED:
+                continue  # another writer advanced: retry with a fresh read
+            raise self._control_fault(code, expected_state)
+        raise RunRepositoryError(
+            RunRepositoryFault.CONCURRENT_MODIFICATION,
+            f"run {identity.run_id!r}: too many concurrent modifications",
         )
 
     async def append_event(
@@ -639,102 +809,65 @@ class RedisRunRepository:
         event_type: SSEEventType,
         data: dict[str, Any] | None = None,
     ) -> int:
-        if event_type not in STATELESS_EVENT_TYPES:
+        if event_type not in STATELESS_EVENT_STATES:
+            if event_type is SSEEventType.HEARTBEAT:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    "heartbeat is a comment frame and must never occupy a seq",
+                )
             raise RunRepositoryError(
                 RunRepositoryFault.INVARIANT,
                 f"{event_type.value} is not a state-preserving event",
             )
-        return await self._write(
-            identity,
-            expected_state=None,
-            next_state=None,
-            event_type=event_type,
-            data=data,
-        )
-
-    async def _write(
-        self,
-        identity: RunIdentity,
-        *,
-        expected_state: RunState | None,
-        next_state: RunState | None,
-        event_type: SSEEventType,
-        data: dict[str, Any] | None,
-    ) -> int:
-        """Bounded retry loop: read persisted identity+seq atomically, build and
-        validate the event, then commit with CAS on that exact seq."""
-        state_key, stream_key = self.keys(identity.run_id)
+        state_key, stream_key = self.keys(identity)
         for _ in range(MAX_COMMIT_RETRIES):
             page = await self._read_atomic(identity, cursor=0, limit=1)
-            stored_identity = RunIdentity(
-                run_id=identity.run_id,
-                tenant_id=identity.tenant_id,  # tenant already verified in Lua
-                device_id=page.device_id,
-                session_id=page.session_id,
-            )
             if is_terminal_state(page.state):
                 raise RunRepositoryError(
                     RunRepositoryFault.INVARIANT,
-                    f"run {identity.run_id!r} is already terminal",
+                    f"run {identity.run_id!r} is terminal",
+                )
+            allowed = STATELESS_EVENT_STATES[event_type]
+            if page.state not in allowed:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"{event_type.value} is not allowed while {page.state.value}",
                 )
             seq = page.latest_seq + 1
-            event = build_event(stored_identity, seq, event_type, data)
-            terminal = "1" if (next_state and is_terminal_state(next_state)) else "0"
-            script = _LUA_COMMIT if next_state is not None else _LUA_APPEND
-            if next_state is not None:
-                args = (
+            event = build_event(
+                RunIdentity(
+                    run_id=identity.run_id,
+                    tenant_id=identity.tenant_id,
+                    device_id=page.device_id,
+                    session_id=page.session_id,
+                ),
+                seq,
+                event_type,
+                data,
+            )
+            sealing = "1" if event_type in SEALING_EVENT_TYPES else "0"
+            code = await self._eval_code(
+                _LUA_APPEND,
+                (state_key, stream_key),
+                (
                     identity.tenant_id,
-                    page.device_id,
-                    page.session_id,
-                    expected_state.value,
-                    str(page.latest_seq),
-                    next_state.value,
-                    event.model_dump_json(),
-                    terminal,
-                    str(self._max_events),
-                    str(self._ttl_s or 0),
-                )
-            else:
-                args = (
-                    identity.tenant_id,
-                    page.device_id,
-                    page.session_id,
+                    identity.device_id,
+                    identity.session_id,
                     str(page.latest_seq),
                     event.model_dump_json(),
                     "0",
                     str(self._max_events),
+                    ",".join(sorted(s.value for s in allowed)),
+                    sealing,
                     str(self._ttl_s or 0),
-                )
-            try:
-                outcome = await self._client.eval(
-                    script, 2, state_key, stream_key, *args
-                )
-            except Exception as exc:
-                raise self._fault_for(exc) from exc
-            code = int(self._arg(outcome))
+                ),
+                what="append",
+            )
             if code > 0:
                 return code
-            if code == 1:
-                continue  # seq moved under us: retry with fresh state
-            if code in (-1, -2, -4):
-                raise RunRepositoryError(
-                    RunRepositoryFault.NOT_FOUND,
-                    f"run {identity.run_id!r} not found for this tenant",
-                )
-            if code == -3:
-                raise RunRepositoryError(
-                    RunRepositoryFault.INVARIANT,
-                    f"run {identity.run_id!r} is already terminal",
-                )
-            if code == -5:
-                raise RunRepositoryError(
-                    RunRepositoryFault.INVARIANT,
-                    f"run {identity.run_id!r} has a state key without its stream",
-                )
-            raise RunRepositoryError(
-                RunRepositoryFault.CAS_CONFLICT,
-                f"run {identity.run_id!r}: expected {expected_state}",
-            )
+            if code == _CODE_SEQ_MOVED:
+                continue
+            raise self._control_fault(code, page.state)
         raise RunRepositoryError(
             RunRepositoryFault.CONCURRENT_MODIFICATION,
             f"run {identity.run_id!r}: too many concurrent modifications",
@@ -745,71 +878,135 @@ class RedisRunRepository:
         return page.state
 
     async def delete(self, identity: RunIdentity) -> None:
-        state_key, stream_key = self.keys(identity.run_id)
-        try:
-            outcome = await self._client.eval(
-                _LUA_DELETE, 2, state_key, stream_key, identity.tenant_id
-            )
-        except Exception as exc:
-            raise self._fault_for(exc) from exc
-        code = int(self._arg(outcome))
-        if code == -1:
-            raise RunRepositoryError(
-                RunRepositoryFault.NOT_FOUND, f"run {identity.run_id!r} not found"
-            )
-        if code == -2:
+        state_key, stream_key = self.keys(identity)
+        code = await self._eval_code(
+            _LUA_DELETE,
+            (state_key, stream_key),
+            (identity.tenant_id, identity.device_id, identity.session_id),
+            what="delete",
+        )
+        if code == 1:
+            return
+        if code in (_CODE_NOT_FOUND, _CODE_TENANT_MISMATCH):
             raise RunRepositoryError(
                 RunRepositoryFault.NOT_FOUND,
-                f"run {identity.run_id!r} not found for this tenant",
+                f"run {identity.run_id!r} not found for this principal",
             )
+        raise self._control_fault(code, None)
 
     # -- reads ------------------------------------------------------------------
 
-    @dataclass(frozen=True)
-    class _Page:
-        state: RunState
-        latest_seq: int
-        terminal_seq: int | None
-        device_id: str
-        session_id: str
-        events: tuple[SSEEvent, ...]
-        oldest_seq: int
+    async def _eval_code(
+        self, script: str, keys: tuple[str, str], args: tuple[Any, ...], *, what: str
+    ) -> int:
+        raw = await self._call(
+            self._client.eval(script, 2, keys[0], keys[1], *args), what
+        )
+        return int(self._arg(raw))
+
+    @staticmethod
+    def _control_fault(code: int, expected: RunState | None) -> RunRepositoryError:
+        if code in (_CODE_NOT_FOUND, _CODE_TENANT_MISMATCH, _CODE_IDENTITY_MISMATCH):
+            return RunRepositoryError(
+                RunRepositoryFault.NOT_FOUND, "run not found for this principal"
+            )
+        if code == _CODE_TERMINAL:
+            return RunRepositoryError(
+                RunRepositoryFault.INVARIANT, "run is already terminal"
+            )
+        if code == _CODE_ORPHAN_STATE:
+            return RunRepositoryError(
+                RunRepositoryFault.INVARIANT, "state key without its stream"
+            )
+        if code == _CODE_STATE_NOT_ALLOWED:
+            return RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                "event not allowed in the current state (or answer sealed)",
+            )
+        if code == _CODE_STATE_MISMATCH:
+            return RunRepositoryError(
+                RunRepositoryFault.CAS_CONFLICT,
+                f"expected {expected.value if expected else '?'}",
+            )
+        return RunRepositoryError(
+            RunRepositoryFault.INVARIANT, f"unexpected repository code {code}"
+        )
 
     async def _read_atomic(
         self, identity: RunIdentity, *, cursor: int, limit: int
-    ) -> RedisRunRepository._Page:
-        state_key, stream_key = self.keys(identity.run_id)
+    ) -> _Page:
+        """One atomic Lua read + full invariant validation of the result."""
+        state_key, stream_key = self.keys(identity)
         start = "-" if cursor <= 0 else f"({cursor}-0"
-        try:
-            raw = await self._client.eval(
+        raw = await self._call(
+            self._client.eval(
                 _LUA_SNAPSHOT,
                 2,
                 state_key,
                 stream_key,
                 identity.tenant_id,
+                identity.device_id,
+                identity.session_id,
                 start,
                 str(limit),
-            )
-        except Exception as exc:
-            raise self._fault_for(exc) from exc
+            ),
+            "snapshot",
+        )
         values = [self._arg(v) for v in raw]
         state = RunState(values[0])
         latest = int(values[1])
         terminal = int(values[2]) if values[2] else None
-        # identity travels INSIDE the same atomic snapshot (no second read)
         device_id, session_id = values[3], values[4]
-        events = tuple(
-            SSEEvent.model_validate(json.loads(payload)) for payload in values[5:]
-        )
-        oldest = events[0].seq if events else (cursor if latest == cursor else 0)
-        return self._Page(
+        if device_id != identity.device_id or session_id != identity.session_id:
+            raise RunRepositoryError(
+                RunRepositoryFault.NOT_FOUND,
+                f"run {identity.run_id!r} not found for this principal",
+            )
+        retained_oldest = int(values[5].split("-")[0]) if values[5] else 0
+        newest_id = values[6]
+        terminal_ok = values[7] == "1"
+        if newest_id:
+            newest_seq = int(newest_id.split("-")[0])
+            if newest_seq != latest:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"stream newest id {newest_seq} != hash latest_seq {latest}",
+                )
+        if terminal is not None and not terminal_ok:
+            raise RunRepositoryError(
+                RunRepositoryFault.INVARIANT,
+                f"terminal_seq {terminal} does not hold run.completed",
+            )
+        events: list[SSEEvent] = []
+        pairs = values[8:]
+        for index in range(0, len(pairs) - 1, 2):
+            stream_id, payload = pairs[index], pairs[index + 1]
+            event = SSEEvent.model_validate(json.loads(payload))
+            id_seq = int(stream_id.split("-")[0])
+            if id_seq != event.seq:
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"stream id {id_seq} != event seq {event.seq}",
+                )
+            if (
+                event.tenant_id != identity.tenant_id
+                or event.device_id != device_id
+                or event.session_id != session_id
+                or event.run_id != identity.run_id
+            ):
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    f"event {event.seq} identity does not match the run record",
+                )
+            events.append(event)
+        return _Page(
             state=state,
             latest_seq=latest,
             terminal_seq=terminal,
             device_id=device_id,
             session_id=session_id,
-            events=events,
-            oldest_seq=oldest,
+            oldest_seq=retained_oldest,
+            events=tuple(events),
         )
 
     async def snapshot(
@@ -818,34 +1015,30 @@ class RedisRunRepository:
         page = await self._read_atomic(
             identity, cursor=cursor, limit=self._snapshot_limit
         )
-        if page.events or is_terminal_state(page.state):
-            return self._to_snapshot(page, cursor, timed_out=False)
+        if page.events or is_terminal_state(page.state) or cursor > page.latest_seq:
+            # cursor beyond the newest seq: hand it straight to the engine so it
+            # can classify cursor_ahead — never wait a heartbeat for it
+            return self._to_snapshot(page, timed_out=False)
         if page.latest_seq > cursor:
-            # the stream lost entries the state still counts: invariant break
             raise RunRepositoryError(
                 RunRepositoryFault.INVARIANT,
                 f"run {identity.run_id!r}: latest_seq {page.latest_seq} exceeds "
                 f"visible events at cursor {cursor}",
             )
         block_ms = max(int(timeout_s * 1000), 1)
-        _, stream_key = self.keys(identity.run_id)
-        try:
-            # async XREAD BLOCK: no event-loop blocking, cancellable by the caller
-            await self._client.xread(
-                {stream_key: f"{cursor}-0"}, count=1, block=block_ms
-            )
-        except Exception as exc:
-            raise self._fault_for(exc) from exc
+        _, stream_key = self.keys(identity)
+        await self._call(
+            self._client.xread({stream_key: f"{cursor}-0"}, count=1, block=block_ms),
+            "xread",
+        )
         page = await self._read_atomic(
             identity, cursor=cursor, limit=self._snapshot_limit
         )
         if page.events or is_terminal_state(page.state):
-            return self._to_snapshot(page, cursor, timed_out=False)
-        return self._to_snapshot(page, cursor, timed_out=True)
+            return self._to_snapshot(page, timed_out=False)
+        return self._to_snapshot(page, timed_out=True)
 
-    def _to_snapshot(
-        self, page: RedisRunRepository._Page, cursor: int, *, timed_out: bool
-    ) -> StreamSnapshot:
+    def _to_snapshot(self, page: _Page, *, timed_out: bool) -> StreamSnapshot:
         return _snapshot_from(
             state=page.state,
             events=() if timed_out else page.events,
@@ -859,9 +1052,11 @@ class RedisRunRepository:
 __all__ = [
     "DEFAULT_BLOCK_MS",
     "DEFAULT_MAX_EVENTS_PER_RUN",
+    "DEFAULT_OP_TIMEOUT_S",
     "DEFAULT_RUN_TTL_S",
     "MAX_COMMIT_RETRIES",
-    "STATELESS_EVENT_TYPES",
+    "SEALING_EVENT_TYPES",
+    "STATELESS_EVENT_STATES",
     "MemoryRunRepository",
     "RedisClientDuck",
     "RedisRunRepository",
