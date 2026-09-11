@@ -53,14 +53,16 @@ class TestLayerMap:
             SSEEvent(**_event(event, layer="process"))
 
     def test_answer_events_accept_answer_layer(self):
-        for event in (SSEEventType.ANSWER_DELTA, SSEEventType.ANSWER_COMPLETED):
-            SSEEvent(
-                **_event(
-                    event,
-                    layer="answer",
-                    data={"delta": "x"} if event == SSEEventType.ANSWER_DELTA else None,
-                )
+        SSEEvent(
+            **_event(SSEEventType.ANSWER_DELTA, layer="answer", data={"delta": "x"})
+        )
+        SSEEvent(
+            **_event(
+                SSEEventType.ANSWER_COMPLETED,
+                layer="answer",
+                data={"content_origin": "ai_generated"},
             )
+        )
 
     def test_answer_event_on_process_layer_rejected(self):
         with pytest.raises(ValidationError, match="not allowed on layer"):
@@ -149,7 +151,7 @@ class TestValueDomains:
             )
 
     def test_content_origin_value_domain_enforced(self):
-        with pytest.raises(ValidationError, match="invalid content_origin"):
+        with pytest.raises(ValidationError, match="valid content_origin"):
             SSEEvent(
                 **_event(
                     SSEEventType.ANSWER_COMPLETED,
@@ -157,14 +159,15 @@ class TestValueDomains:
                     data={"content_origin": "origin:leaked-internal"},
                 )
             )
-        # optional key: absent content_origin stays valid
-        SSEEvent(
-            **_event(
-                SSEEventType.ANSWER_COMPLETED,
-                layer="answer",
-                data={"citations": []},
+        # the key is NEVER optional: an answer without provenance is rejected
+        with pytest.raises(ValidationError, match="requires a valid content_origin"):
+            SSEEvent(
+                **_event(
+                    SSEEventType.ANSWER_COMPLETED,
+                    layer="answer",
+                    data={"citations": []},
+                )
             )
-        )
 
 
 class TestMisc:
