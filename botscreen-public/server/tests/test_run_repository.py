@@ -15,6 +15,7 @@ import asyncio
 import os
 
 import pytest
+import pytest_asyncio
 from pytest import mark
 
 from app.api.v1.sse_stream import stream_engine
@@ -705,7 +706,7 @@ class TestRedisRepository:
 class TestRealRedis:
     """End-to-end against a real Redis server (CI service container)."""
 
-    @pytest.fixture()
+    @pytest_asyncio.fixture()
     async def repo(self):
         import redis.asyncio as aioredis
 
