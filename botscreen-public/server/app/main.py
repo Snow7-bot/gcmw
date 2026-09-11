@@ -23,6 +23,7 @@ from app.api.v1.agent_api import AppError
 from app.api.v1.agent_api import router as agent_router
 from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 from app.providers.model_gateway import ModelGatewayError
+from app.tools.gateway import ToolGatewayError
 
 X_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -80,6 +81,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(ModelGatewayError)
     async def gateway_error_handler(request: Request, exc: ModelGatewayError):
+        return _envelope_response(request, exc.code)
+
+    @app.exception_handler(ToolGatewayError)
+    async def tool_error_handler(request: Request, exc: ToolGatewayError):
         return _envelope_response(request, exc.code)
 
     @app.exception_handler(RequestValidationError)
