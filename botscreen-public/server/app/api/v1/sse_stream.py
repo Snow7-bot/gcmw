@@ -30,6 +30,10 @@ Heartbeats are emitted ONLY for a validated idle timeout; ``heartbeat_s`` is
 validated when the engine is created (non-positive, NaN and infinity are
 rejected immediately). The engine holds no cancellation policy and never
 mutates run state.
+
+Transport frames (never protocol events, never persisted, no ``id`` line):
+``keep_alive()`` for a validated idle window and ``stream_error_frame()`` for a
+fault raised after the response has already started (B2-B route boundary).
 """
 
 from __future__ import annotations
@@ -40,11 +44,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from app.contracts.errors import ErrorCode
+from app.contracts.errors import ErrorCode, ErrorEnvelope
 from app.contracts.events import SSEEvent, SSEEventType
 from app.contracts.run import TERMINAL_STATES, RunState
 
 DEFAULT_HEARTBEAT_MS = 15_000
+
+#: transport-level failure frame (never a protocol event, never persisted)
+STREAM_ERROR_EVENT = "stream.error"
 
 
 class StreamFault(str, Enum):
@@ -93,6 +100,21 @@ def frame(event: SSEEvent) -> str:
 def keep_alive() -> str:
     """SSE comment frame: no ``id``, so it never perturbs seq authority."""
     return ": keep-alive\n\n"
+
+
+def stream_error_frame(code: ErrorCode, *, request_id: str, trace_id: str) -> str:
+    """Structured transport-level failure frame.
+
+    A fault raised AFTER the response has started can no longer become an HTTP
+    status, so the very same :class:`ErrorEnvelope` used by the JSON boundary is
+    carried as one frame and the stream ends. The frame deliberately has **no
+    ``id`` line**: a failed read must never look like progress, so the client's
+    ``Last-Event-ID`` cursor stays on the last real event. The message always
+    comes from the error registry — raw exception text never reaches a client.
+    """
+    envelope = ErrorEnvelope.build(code=code, request_id=request_id, trace_id=trace_id)
+    payload = json.dumps(envelope.model_dump(mode="json"), ensure_ascii=False)
+    return f"event: {STREAM_ERROR_EVENT}\ndata: {payload}\n\n"
 
 
 def effective_after_seq(after_seq: int, last_event_id: str | None) -> int:
@@ -316,6 +338,7 @@ def stream_engine(
 
 __all__ = [
     "DEFAULT_HEARTBEAT_MS",
+    "STREAM_ERROR_EVENT",
     "SSEStreamError",
     "SnapshotReader",
     "StreamFault",
@@ -324,4 +347,5 @@ __all__ = [
     "frame",
     "keep_alive",
     "stream_engine",
+    "stream_error_frame",
 ]

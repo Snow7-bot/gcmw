@@ -79,7 +79,18 @@ def transition_event_type(target: RunState) -> str:
 
 
 class RunStateMachine:
-    """Tracks one run's state, event sequence, and immutable terminal states."""
+    """Tracks one run's state, event sequence, and immutable terminal states.
+
+    DEPRECATED for run persistence (#65B-2 B2-A/B2-B): the authoritative run
+    state, sequence and terminal position live in ``RunRepository``, and the
+    transition rules are the module-level ``is_terminal_state`` /
+    ``is_allowed_transition`` / ``transition_event_type`` helpers above. This
+    class owns its own event list and ``event_seq``, so no production module may
+    use it any more — a second sequence holder is exactly the divergence the
+    repository exists to prevent. Kept only until the legacy in-memory stores
+    are physically deleted together (see ``EventStore``) behind a
+    no-new-references test.
+    """
 
     def __init__(self, run_id: str, initial: RunState = RunState.ACCEPTED) -> None:
         if not run_id:
