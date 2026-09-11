@@ -1,46 +1,41 @@
 """Internal SSE stream engine (issue #65B — slice B-1, engine only).
 
-Reviewer-narrowed scope (round 2): this slice defines the ASYNC SNAPSHOT READ
-INTERFACE and the stream algorithm, plus a fake implementation in tests. It
-ships no Redis wiring and no public HTTP route — those are #65B-2.
+This slice owns the async snapshot READ INTERFACE, the snapshot invariants and
+the stream algorithm. No Redis wiring, no public HTTP route (both #65B-2).
 
-Read interface (the only way the engine learns about a run):
+Read interface (single atomic snapshot, blocking):
 
     await wait_page(cursor, timeout_s) -> StreamSnapshot(
-        events,               # ordered events with seq > cursor
-        state,                # authoritative run state
-        oldest_available_seq, # first seq still retained (0 when empty)
-        latest_seq,           # newest seq the store holds (0 when empty)
-        timed_out,            # no event arrived within timeout_s
-    )
+        events, state, oldest_available_seq, latest_seq, terminal_seq, timed_out)
 
-A blocking async read replaces polling entirely: there is no fixed poll
-interval, no injected clock and no idle-window counter. Heartbeats are emitted
-ONLY when the read times out with no events; an event that arrives immediately
-never triggers a keep-alive.
+Invariants are enforced BEFORE any branch is taken (``_validate_snapshot``):
+``0 <= oldest_available_seq <= latest_seq``; ``cursor <= latest_seq``; every
+event seq inside the declared window; ``timed_out`` implies no events, a
+non-terminal state and ``latest_seq == cursor``; a terminal state carries
+``terminal_seq == latest_seq``; a non-terminal state carries no
+``terminal_seq``; a non-timeout snapshot always makes progress.
 
-Stream rules:
-- frames carry ``id: <seq>``; the client resumes with ``Last-Event-ID``;
-- **only a terminal EVENT (``run.completed``) ends page emission** — an
-  authoritative terminal state never truncates a page mid-way;
-- while ``cursor < latest_seq`` the engine keeps reading (pagination-safe,
-  even with page size 1);
-- only after the page is drained AND ``cursor`` has reached ``latest_seq`` may
-  the stream close on the authoritative terminal state;
-- a terminal state whose expected terminal event is missing from the retained
-  window is reported explicitly (storage invariant fault), never silently
-  accepted;
-- continuity uses the window bounds: cursor before the retained window →
-  ``stale_cursor``; a missing seq inside the window → ``replay_gap``; an
-  older seq after the cursor → ``out_of_order``; an exact re-read of the last
-  emitted seq is the only tolerated overlap;
-- the engine holds NO cancellation policy and never mutates run state, so an
-  internal read failure can never cancel a run.
+Terminal rules:
+- only a terminal EVENT (``run.completed``) ends page emission;
+- that event must sit exactly at ``terminal_seq == latest_seq`` — a terminal
+  event with further seqs behind it is a storage invariant violation, never a
+  silent success;
+- a cursor already at ``terminal_seq`` closes the stream silently (the client
+  has the terminal frame);
+- a cursor before ``terminal_seq`` keeps paging until the terminal frame is
+  emitted;
+- a terminal state with no legal terminal position fails explicitly.
+
+Heartbeats are emitted ONLY for a validated idle timeout; ``heartbeat_s`` is
+validated when the engine is created (non-positive, NaN and infinity are
+rejected immediately). The engine holds no cancellation policy and never
+mutates run state.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -59,6 +54,8 @@ class StreamFault(str, Enum):
     OUT_OF_ORDER = "out_of_order"
     STALE_CURSOR = "stale_cursor"
     MISSING_TERMINAL_EVENT = "missing_terminal_event"
+    CURSOR_AHEAD = "cursor_ahead"
+    SNAPSHOT_INCONSISTENT = "snapshot_inconsistent"
 
 
 class SSEStreamError(RuntimeError):
@@ -72,13 +69,16 @@ class SSEStreamError(RuntimeError):
 
 @dataclass(frozen=True)
 class StreamSnapshot:
-    """One atomic read result: events plus the store's window bounds."""
+    """One atomic read result. Every field is required: a partially filled
+    snapshot is exactly the kind of illegal state this interface must reject,
+    so no defaults are provided."""
 
-    events: tuple[SSEEvent, ...] = ()
-    state: RunState = RunState.ACCEPTED
-    oldest_available_seq: int = 0
-    latest_seq: int = 0
-    timed_out: bool = False
+    events: tuple[SSEEvent, ...]
+    state: RunState
+    oldest_available_seq: int
+    latest_seq: int
+    terminal_seq: int | None
+    timed_out: bool
 
 
 SnapshotReader = Callable[[int, float], Awaitable[StreamSnapshot]]
@@ -112,7 +112,82 @@ def effective_after_seq(after_seq: int, last_event_id: str | None) -> int:
     return cursor
 
 
-def _validate(event: SSEEvent, cursor: int, snapshot: StreamSnapshot) -> None:
+def _validate_heartbeat(heartbeat_s: float) -> float:
+    """Reject non-positive / NaN / infinite heartbeat windows immediately."""
+    if isinstance(heartbeat_s, bool) or not isinstance(heartbeat_s, (int, float)):
+        raise TypeError(
+            f"heartbeat_s must be a positive finite number: {heartbeat_s!r}"
+        )
+    if not math.isfinite(heartbeat_s) or heartbeat_s <= 0:
+        raise ValueError(
+            f"heartbeat_s must be a positive finite number: {heartbeat_s!r}"
+        )
+    return float(heartbeat_s)
+
+
+def _validate_snapshot(snapshot: StreamSnapshot, cursor: int) -> None:
+    """Enforce the snapshot invariants before ANY branch is taken."""
+    if snapshot.oldest_available_seq < 0 or (
+        snapshot.latest_seq < snapshot.oldest_available_seq
+    ):
+        raise SSEStreamError(
+            StreamFault.SNAPSHOT_INCONSISTENT,
+            f"window bounds invalid: oldest {snapshot.oldest_available_seq}, "
+            f"latest {snapshot.latest_seq}",
+        )
+    if cursor > snapshot.latest_seq:
+        raise SSEStreamError(
+            StreamFault.CURSOR_AHEAD,
+            f"cursor_ahead: cursor {cursor} > latest_seq {snapshot.latest_seq}",
+        )
+    for event in snapshot.events:
+        if not (snapshot.oldest_available_seq <= event.seq <= snapshot.latest_seq):
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                f"event seq {event.seq} outside window "
+                f"[{snapshot.oldest_available_seq}, {snapshot.latest_seq}]",
+            )
+    terminal_state = snapshot.state in TERMINAL_STATES
+    if terminal_state:
+        if snapshot.terminal_seq is None:
+            raise SSEStreamError(
+                StreamFault.MISSING_TERMINAL_EVENT,
+                f"terminal state {snapshot.state.value} without terminal_seq",
+            )
+        if snapshot.terminal_seq != snapshot.latest_seq:
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                f"terminal_seq {snapshot.terminal_seq} != latest_seq "
+                f"{snapshot.latest_seq}",
+            )
+    elif snapshot.terminal_seq is not None:
+        raise SSEStreamError(
+            StreamFault.SNAPSHOT_INCONSISTENT,
+            f"non-terminal state {snapshot.state.value} carries terminal_seq "
+            f"{snapshot.terminal_seq}",
+        )
+    if snapshot.timed_out:
+        if snapshot.events:
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT, "timed_out snapshot with events"
+            )
+        if terminal_state or snapshot.latest_seq != cursor:
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                "timed_out snapshot must be idle and non-terminal at the cursor",
+            )
+    elif not snapshot.events:
+        # an empty non-timeout read is only legal when the client already sits
+        # at the end of a terminal run (silent close); a running run must be
+        # reported as a timeout, never as an empty "no progress" snapshot
+        if not terminal_state or snapshot.latest_seq != cursor:
+            raise SSEStreamError(
+                StreamFault.SNAPSHOT_INCONSISTENT,
+                "non-timeout snapshot without progress",
+            )
+
+
+def _validate_event(event: SSEEvent, cursor: int, snapshot: StreamSnapshot) -> None:
     """Strict continuity, classified from the store's window bounds."""
     if event.seq == cursor:
         return  # exact re-read of the last emitted seq: tolerated overlap
@@ -135,48 +210,54 @@ def _validate(event: SSEEvent, cursor: int, snapshot: StreamSnapshot) -> None:
         )
 
 
-async def stream_engine(
+def _validate_terminal_event(event: SSEEvent, snapshot: StreamSnapshot) -> None:
+    """A terminal event must be the LAST retained event, exactly."""
+    if event.event is not SSEEventType.RUN_COMPLETED:
+        return
+    if snapshot.terminal_seq is None or event.seq != snapshot.terminal_seq:
+        raise SSEStreamError(
+            StreamFault.SNAPSHOT_INCONSISTENT,
+            f"terminal event at seq {event.seq} but terminal_seq is "
+            f"{snapshot.terminal_seq}",
+        )
+
+
+async def _stream(
+    wait_page: SnapshotReader, cursor: int, heartbeat_s: float
+) -> AsyncIterator[str]:
+    while True:
+        snapshot = await wait_page(cursor, heartbeat_s)
+        _validate_snapshot(snapshot, cursor)
+        if snapshot.timed_out:
+            # validated idle timeout: exactly one keep-alive, cursor unchanged
+            yield keep_alive()
+            continue
+        for event in snapshot.events:
+            _validate_event(event, cursor, snapshot)
+            if event.seq == cursor:
+                continue
+            _validate_terminal_event(event, snapshot)
+            cursor = event.seq
+            yield frame(event)
+            if event.event is SSEEventType.RUN_COMPLETED:
+                return
+        if snapshot.state in TERMINAL_STATES:
+            if cursor == snapshot.terminal_seq:
+                return  # client already received the terminal frame
+            continue  # keep paging until terminal_seq is emitted
+        # non-terminal: wait for the next snapshot
+
+
+def stream_engine(
     *,
     wait_page: SnapshotReader,
     after_seq: int = 0,
     heartbeat_s: float = DEFAULT_HEARTBEAT_MS / 1000,
 ) -> AsyncIterator[str]:
-    """Yield SSE frames for one run until its terminal event is delivered.
-
-    ``wait_page`` blocks (async) until events are available or ``heartbeat_s``
-    elapses; the engine never polls, never cancels runs and never writes state.
-    """
-    cursor = max(after_seq, 0)
-    while True:
-        snapshot = await wait_page(cursor, heartbeat_s)
-        if snapshot.timed_out and not snapshot.events:
-            # idle for a full heartbeat window: one keep-alive, keep waiting
-            yield keep_alive()
-            continue
-        drained = False
-        for event in snapshot.events:
-            _validate(event, cursor, snapshot)
-            if event.seq == cursor:
-                continue
-            drained = True
-            cursor = event.seq
-            yield frame(event)
-            if event.event is SSEEventType.RUN_COMPLETED:
-                return  # terminal EVENT only — never truncated by state
-        if cursor < snapshot.latest_seq:
-            continue  # pagination: keep reading until we reach latest_seq
-        if snapshot.state in TERMINAL_STATES:
-            if drained and not _saw_terminal(snapshot):
-                raise SSEStreamError(
-                    StreamFault.MISSING_TERMINAL_EVENT,
-                    f"storage invariant: state {snapshot.state.value} at "
-                    f"latest seq {snapshot.latest_seq} without a terminal event",
-                )
-            return
-
-
-def _saw_terminal(snapshot: StreamSnapshot) -> bool:
-    return any(e.event is SSEEventType.RUN_COMPLETED for e in snapshot.events)
+    """Create the run stream. ``heartbeat_s`` is validated here, so an invalid
+    window fails at creation time rather than mid-stream."""
+    window = _validate_heartbeat(heartbeat_s)
+    return _stream(wait_page, max(after_seq, 0), window)
 
 
 __all__ = [
