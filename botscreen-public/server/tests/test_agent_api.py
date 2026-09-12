@@ -1,146 +1,134 @@
-"""Tests for Agent API, admission service, auth boundary (issue #36)."""
+"""Tests for Agent API, admission service, auth boundary (issue #36).
 
+Round B2-B (review round 2): the admission service keeps LIFECYCLE bookkeeping
+only. Run state and sequences belong to ``RunRepository``, and every state
+decision in the API layer is answered by the repository — never by a local
+mirror that another worker (or a future agent) could have outdated.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi.testclient import TestClient
+from api_harness import (
+    OTHER_DEVICE,
+    PRINCIPAL,
+    FakeClock,
+    ForcedStateRepository,
+    Harness,
+    VanishingRepository,
+    new_run,
+    new_session,
+    running_app,
+)
+from sse_frames import event_ids, event_names, protocol_frames
 
-from app.api.v1.agent_api import SERVICE
-from app.api.v1.auth import DevicePrincipal, get_device_principal
+from app.api.v1.agent_api import RunAdmissionService
+from app.api.v1.auth import get_device_principal
 from app.api.v1.errors import AppError
 from app.contracts.api import Channel, CreateRunRequest, CreateSessionRequest, RunInput
-from app.contracts.errors import ErrorEnvelope
+from app.contracts.errors import ErrorCode
 from app.contracts.run import RunState
-from app.main import app
-
-PRINCIPAL = DevicePrincipal(tenant_id="t1", device_id="d1")
-OTHER_DEVICE = DevicePrincipal(tenant_id="t1", device_id="OTHER")
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.value = datetime.now(timezone.utc)
-
-    def __call__(self) -> datetime:
-        return self.value
-
-    def advance(self, seconds: int) -> None:
-        self.value = self.value + timedelta(seconds=seconds)
+from app.storage.run_repository import (
+    MemoryRunRepository,
+    RunIdentity,
+    RunRepositoryError,
+    RunRepositoryFault,
+)
 
 
 @pytest.fixture
-def client():
-    SERVICE.sessions.clear()
-    SERVICE.runs.clear()
-    SERVICE.idempotency.clear()
-    clock = FakeClock()
-    original_clock = SERVICE._clock
-    SERVICE._clock = clock
-    app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
-    with TestClient(app, raise_server_exceptions=False) as c:
-        yield c, clock
-    app.dependency_overrides.clear()
-    SERVICE._clock = original_clock
-    SERVICE.sessions.clear()
-    SERVICE.runs.clear()
-    SERVICE.idempotency.clear()
+def harness() -> Harness:
+    with running_app() as h:
+        yield h
 
 
-def _env(response):
-    return ErrorEnvelope.model_validate(response.json())
+async def _durable_seqs(repository, identity: RunIdentity) -> list[int]:
+    page = await repository.snapshot(identity, 0, 0.0)
+    return [event.seq for event in page.events]
 
 
-def _new_session(client, channel: str = "text") -> dict:
-    res = client.post("/api/v1/sessions", json={"channel": channel})
-    assert res.status_code == 201
-    return res.json()
-
-
-def _new_run(client, session_id: str, text: str = "hi", key: str = "k") -> dict:
-    res = client.post(
-        "/api/v1/agent/runs",
-        json={
-            "session_id": session_id,
-            "input": {"type": "text", "text": text},
-            "idempotency_key": key,
-        },
-    )
-    assert res.status_code == 200
-    return res.json()
+def _stream_seqs(harness: Harness, run_id: str, **kwargs) -> list[int]:
+    """Read a TERMINAL run stream to completion (a non-terminal one is open)."""
+    res = harness.client.get(f"/api/v1/agent/runs/{run_id}/events", **kwargs)
+    assert res.status_code == 200, res.text
+    return event_ids(protocol_frames(res.text))
 
 
 class TestHealth:
-    def test_live(self, client):
-        c, _ = client
-        assert c.get("/api/v1/health/live").json() == {"status": "alive"}
+    def test_live(self, harness):
+        assert harness.client.get("/api/v1/health/live").json() == {"status": "alive"}
 
-    def test_ready_does_not_leak_counts(self, client):
-        c, _ = client
-        body = c.get("/api/v1/health/ready").json()
+    def test_ready_reports_backends_without_counts(self, harness):
+        body = harness.client.get("/api/v1/health/ready").json()
         assert body["status"] == "ready"
-        assert "sessions" not in json.dumps(body)
-        assert "runs" not in json.dumps(body)
+        assert body["checks"]["run_repository"] == "memory"
+        assert body["checks"]["admission_store"] == "memory"
+        assert body["problems"] == []
+        dump = json.dumps(body)
+        assert "sessions" not in dump and "runs" not in dump
 
 
 class TestAuthBoundary:
     def test_default_deny_without_principal(self):
-        with TestClient(app, raise_server_exceptions=False) as anon:
-            res = anon.post("/api/v1/sessions", json={"channel": "text"})
-            assert res.status_code == 401
-            assert _env(res).code == "E_AUTH_MISSING_CREDENTIALS"
+        with running_app(overrides=False) as h:
+            res = h.client.post("/api/v1/sessions", json={"channel": "text"})
+        assert res.status_code == 401
+        assert ErrorCode.AUTH_MISSING_CREDENTIALS.value == "E_AUTH_MISSING_CREDENTIALS"
+        assert res.json()["code"] == "E_AUTH_MISSING_CREDENTIALS"
 
 
 class TestSessions:
-    def test_create_session_derives_identity(self, client):
-        c, _ = client
-        body = _new_session(c)
+    def test_create_session_derives_identity(self, harness):
+        body = new_session(harness)
         assert body["tenant_id"] == "t1"
         assert body["device_id"] == "d1"
 
-    def test_validation_error_is_envelope(self, client):
-        c, _ = client
-        res = c.post("/api/v1/sessions", json={"channel": "nope"})
+    def test_validation_error_is_envelope(self, harness):
+        res = harness.client.post("/api/v1/sessions", json={"channel": "nope"})
         assert res.status_code == 400
-        assert _env(res).code == "E_VALIDATION_INVALID_INPUT"
+        assert harness.env(res).code == "E_VALIDATION_INVALID_INPUT"
 
-    def test_delete_cleans_runs_and_idempotency(self, client):
-        c, _ = client
-        session = _new_session(c)
-        _new_run(c, session["session_id"])
-        assert len(SERVICE.idempotency) == 1
-        assert c.delete(f"/api/v1/sessions/{session['session_id']}").status_code == 204
-        assert SERVICE.sessions == {}
-        assert SERVICE.runs == {}
-        assert SERVICE.idempotency == {}
+    def test_delete_cleans_runs_and_idempotency(self, harness):
+        session = new_session(harness)
+        new_run(harness, session["session_id"])
+        assert len(harness.service.idempotency) == 1
+        res = harness.client.delete(f"/api/v1/sessions/{session['session_id']}")
+        assert res.status_code == 204
+        assert harness.service.sessions == {}
+        assert harness.service.runs == {}
+        assert harness.service.idempotency == {}
 
-    def test_delete_foreign_session_forbidden(self, client):
-        c, _ = client
-        session = _new_session(c)
-        app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
+    def test_delete_foreign_session_forbidden(self, harness):
+        session = new_session(harness)
+        harness.app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
         try:
-            res = c.delete(f"/api/v1/sessions/{session['session_id']}")
+            res = harness.client.delete(f"/api/v1/sessions/{session['session_id']}")
         finally:
-            app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+            harness.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
         assert res.status_code == 403
-        assert _env(res).code == "E_AUTHZ_FORBIDDEN"
+        assert harness.env(res).code == "E_AUTHZ_FORBIDDEN"
 
 
 class TestExpiry:
-    def test_expired_session_rejects_new_runs_and_purges_snapshots(self, client):
-        c, clock = client
-        session = _new_session(c)
-        run = _new_run(
-            c, session["session_id"], text="敏感医疗问题-必须随过期消失", key="ttl"
+    def test_expired_session_rejects_new_runs_and_purges_snapshots(self, harness):
+        session = new_session(harness)
+        run = new_run(
+            harness,
+            session["session_id"],
+            text="敏感医疗问题-必须随过期消失",
+            key="ttl",
         )
-        assert SERVICE.runs[run["run_id"]].snapshot.text.startswith("敏感")
-        clock.advance(SERVICE.sessions[session["session_id"]].ttl_s + 1)
+        assert harness.service.runs[run["run_id"]].snapshot.text.startswith("敏感")
+        harness.clock.advance(harness.service.sessions[session["session_id"]].ttl_s + 1)
 
-        # run reads now fail, run creation on the expired session fails
-        assert c.get(f"/api/v1/agent/runs/{run['run_id']}").status_code == 404
-        res = c.post(
+        assert (
+            harness.client.get(f"/api/v1/agent/runs/{run['run_id']}").status_code == 404
+        )
+        res = harness.client.post(
             "/api/v1/agent/runs",
             json={
                 "session_id": session["session_id"],
@@ -149,24 +137,22 @@ class TestExpiry:
             },
         )
         assert res.status_code == 404
-        assert _env(res).code == "E_NOT_FOUND_SESSION"
-        # session, runs and raw snapshots are gone
-        assert SERVICE.sessions == {}
-        assert SERVICE.runs == {}
-        assert SERVICE.idempotency == {}
+        assert harness.env(res).code == "E_NOT_FOUND_SESSION"
+        assert harness.service.sessions == {}
+        assert harness.service.runs == {}
+        assert harness.service.idempotency == {}
 
-    def test_expired_session_delete_returns_not_found(self, client):
-        c, clock = client
-        session = _new_session(c)
-        clock.advance(3600)
-        assert c.delete(f"/api/v1/sessions/{session['session_id']}").status_code == 404
+    def test_expired_session_delete_returns_not_found(self, harness):
+        session = new_session(harness)
+        harness.clock.advance(3600)
+        res = harness.client.delete(f"/api/v1/sessions/{session['session_id']}")
+        assert res.status_code == 404
 
 
 class TestRuns:
-    def test_snapshot_preserves_input_and_ids(self, client):
-        c, _ = client
-        session = _new_session(c)
-        res = c.post(
+    def test_snapshot_preserves_input_and_ids(self, harness):
+        session = new_session(harness)
+        res = harness.client.post(
             "/api/v1/agent/runs",
             json={
                 "session_id": session["session_id"],
@@ -175,17 +161,16 @@ class TestRuns:
             },
             headers={"X-Request-ID": "my-req-42"},
         )
-        snap = SERVICE.runs[res.json()["run_id"]].snapshot
+        snap = harness.service.runs[res.json()["run_id"]].snapshot
         assert snap.text == "孩子近视后需要复查吗"
         assert snap.request_id == "my-req-42"
         assert snap.trace_id
 
-    def test_payload_hash_never_contains_plaintext(self, client):
-        c, _ = client
-        session = _new_session(c)
+    def test_payload_hash_never_contains_plaintext(self, harness):
+        session = new_session(harness)
         secret = "疑似青光眼-20260907-秘密问题"
-        run = _new_run(c, session["session_id"], text=secret, key="hash")
-        stored = SERVICE.runs[run["run_id"]]
+        run = new_run(harness, session["session_id"], text=secret, key="hash")
+        stored = harness.service.runs[run["run_id"]]
         assert secret not in stored.payload_hash
         assert len(stored.payload_hash) == 64
         canonical = json.dumps(
@@ -195,19 +180,34 @@ class TestRuns:
         )
         assert stored.payload_hash == hashlib.sha256(canonical.encode()).hexdigest()
 
-    def test_state_machine_authority_and_seq_consistency(self, client):
-        c, _ = client
-        session = _new_session(c)
-        run = _new_run(c, session["session_id"])
-        machine = SERVICE.runs[run["run_id"]].machine
-        assert machine.current.value == run["state"] == "ACCEPTED"
-        events = c.get(f"/api/v1/agent/runs/{run['run_id']}/events").json()
-        assert events["next_seq"] == machine.event_seq == 1
-        assert [e["seq"] for e in events["events"]] == [1]
+    def test_admission_record_holds_no_state_or_sequence(self, harness):
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"])
+        record = harness.service.runs[run["run_id"]]
+        assert not hasattr(record, "state")
+        assert not hasattr(record, "machine")
+        assert not hasattr(record, "sse_events")
+        assert run["state"] == "ACCEPTED"
+        assert (
+            harness.client.delete(f"/api/v1/agent/runs/{run['run_id']}").json()["state"]
+            == "CANCELLED"
+        )
+        assert _stream_seqs(harness, run["run_id"]) == [1, 2]
 
-    def test_missing_session_run(self, client):
-        c, _ = client
-        res = c.post(
+    def test_repository_is_the_only_state_and_seq_authority(self, harness):
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"], key="authority")
+        assert (
+            harness.client.delete(f"/api/v1/agent/runs/{run['run_id']}").status_code
+            == 200
+        )
+        res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
+        frames = protocol_frames(res.text)
+        assert event_names(frames) == ["run.accepted", "run.completed"]
+        assert event_ids(frames) == [1, 2]  # no gaps, terminal event once
+
+    def test_missing_session_run(self, harness):
+        res = harness.client.post(
             "/api/v1/agent/runs",
             json={
                 "session_id": "ghost",
@@ -216,276 +216,671 @@ class TestRuns:
             },
         )
         assert res.status_code == 404
-        assert _env(res).code == "E_NOT_FOUND_SESSION"
+        assert harness.env(res).code == "E_NOT_FOUND_SESSION"
 
-    def test_idempotent_replay_same_run_no_duplicate_events(self, client):
-        c, _ = client
-        session = _new_session(c)
+    def test_idempotent_replay_same_run_no_duplicate_events(self, harness):
+        session = new_session(harness)
         payload = {
             "session_id": session["session_id"],
             "input": {"type": "text", "text": "hi"},
             "idempotency_key": "same-key",
         }
-        first = c.post("/api/v1/agent/runs", json=payload).json()
-        replay = c.post("/api/v1/agent/runs", json=payload)
+        first = harness.client.post("/api/v1/agent/runs", json=payload).json()
+        replay = harness.client.post("/api/v1/agent/runs", json=payload)
         assert replay.status_code == 200
         assert replay.json()["run_id"] == first["run_id"]
-        events = c.get(f"/api/v1/agent/runs/{first['run_id']}/events").json()
-        assert len(events["events"]) == 1
+        assert (
+            harness.client.delete(f"/api/v1/agent/runs/{first['run_id']}").status_code
+            == 200
+        )
+        assert _stream_seqs(harness, first["run_id"]) == [1, 2]
 
-    def test_same_key_different_payload_conflicts(self, client):
-        c, _ = client
-        session = _new_session(c)
+    def test_same_key_different_payload_conflicts(self, harness):
+        session = new_session(harness)
         payload = {
             "session_id": session["session_id"],
             "input": {"type": "text", "text": "first"},
             "idempotency_key": "same-key-2",
         }
-        assert c.post("/api/v1/agent/runs", json=payload).status_code == 200
+        assert (
+            harness.client.post("/api/v1/agent/runs", json=payload).status_code == 200
+        )
         changed = dict(payload, input={"type": "text", "text": "second"})
-        res = c.post("/api/v1/agent/runs", json=changed)
+        res = harness.client.post("/api/v1/agent/runs", json=changed)
         assert res.status_code == 409
-        assert _env(res).code == "E_CONFLICT_IDEMPOTENCY"
+        assert harness.env(res).code == "E_CONFLICT_IDEMPOTENCY"
 
-    def test_ownership_enforced(self, client):
-        c, _ = client
-        session = _new_session(c)
-        run = _new_run(c, session["session_id"])
-        app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
+    def test_ownership_enforced(self, harness):
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"])
+        harness.app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
         try:
-            assert c.get(f"/api/v1/agent/runs/{run['run_id']}").status_code == 403
+            run_id = run["run_id"]
+            assert harness.client.get(f"/api/v1/agent/runs/{run_id}").status_code == 403
             assert (
-                c.get(f"/api/v1/agent/runs/{run['run_id']}/events").status_code == 403
+                harness.client.get(f"/api/v1/agent/runs/{run_id}/events").status_code
+                == 403
             )
-            assert c.delete(f"/api/v1/agent/runs/{run['run_id']}").status_code == 403
+            assert (
+                harness.client.delete(f"/api/v1/agent/runs/{run_id}").status_code == 403
+            )
         finally:
-            app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+            harness.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
 
-    def test_cancel_terminal_once_and_events_no_gap(self, client):
-        c, _ = client
-        session = _new_session(c)
-        run = _new_run(c, session["session_id"])
-        cancelled = c.delete(f"/api/v1/agent/runs/{run['run_id']}").json()
+    def test_cancel_terminal_once_and_events_no_gap(self, harness):
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"])
+        cancelled = harness.client.delete(f"/api/v1/agent/runs/{run['run_id']}").json()
         assert cancelled["state"] == "CANCELLED"
-        again = c.delete(f"/api/v1/agent/runs/{run['run_id']}").json()
+        again = harness.client.delete(f"/api/v1/agent/runs/{run['run_id']}").json()
         assert again["state"] == "CANCELLED"
-        events = c.get(f"/api/v1/agent/runs/{run['run_id']}/events").json()
-        names = [e["event"] for e in events["events"]]
-        seqs = [e["seq"] for e in events["events"]]
-        assert names == ["run.accepted", "run.completed"]
-        assert seqs == [1, 2]  # no gaps; terminal event appended exactly once
+        res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
+        frames = protocol_frames(res.text)
+        assert event_names(frames) == ["run.accepted", "run.completed"]
+        assert event_ids(frames) == [1, 2]
 
-    def test_missing_run(self, client):
-        c, _ = client
-        res = c.get("/api/v1/agent/runs/ghost")
+    def test_missing_run(self, harness):
+        res = harness.client.get("/api/v1/agent/runs/ghost")
         assert res.status_code == 404
-        assert _env(res).code == "E_NOT_FOUND_RUN"
+        assert harness.env(res).code == "E_NOT_FOUND_RUN"
+
+
+class TestRepositoryAuthority:
+    """Review probes: the durable state must win in every decision."""
+
+    def test_durable_terminal_state_frees_the_session_without_any_get(self):
+        """A run finished by ANOTHER component must not block the next question."""
+        repository = ForcedStateRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            first = new_run(h, session["session_id"], key="first")
+            # an external writer (worker/ManagerAgent) finishes the run durably
+            repository.forced[first["run_id"]] = RunState.FAILED
+
+            second = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "follow-up"},
+                    "idempotency_key": "second",
+                },
+            )
+            assert second.status_code == 200, second.text
+            assert second.json()["run_id"] != first["run_id"]
+
+    def test_idempotent_replay_returns_the_durable_state(self):
+        repository = ForcedStateRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            payload = {
+                "session_id": session["session_id"],
+                "input": {"type": "text", "text": "hi"},
+                "idempotency_key": "replay",
+            }
+            first = h.client.post("/api/v1/agent/runs", json=payload).json()
+            assert first["state"] == "ACCEPTED"
+            repository.forced[first["run_id"]] = RunState.FAILED
+
+            replay = h.client.post("/api/v1/agent/runs", json=payload)
+            assert replay.status_code == 200
+            assert replay.json()["run_id"] == first["run_id"]
+            # the replay reports what the repository says NOW, not a local mirror
+            assert replay.json()["state"] == "FAILED"
+
+    def test_replay_of_a_run_that_vanished_durably_creates_a_new_one(self):
+        repository = VanishingRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="vanish")
+            # the durable run expires (TTL) while admission still lists it
+            repository.vanished.add(run["run_id"])
+
+            replay = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "hi"},
+                    "idempotency_key": "vanish",
+                },
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json()["run_id"] != run["run_id"]
+            # the stale bookkeeping entry went with it
+            assert run["run_id"] not in h.service.runs
+
+    def test_stale_run_read_is_never_answered_from_memory(self):
+        repository = ForcedStateRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"])
+            repository.forced[run["run_id"]] = RunState.CANCELLED
+            body = h.client.get(f"/api/v1/agent/runs/{run['run_id']}").json()
+            assert body["state"] == "CANCELLED"
+            assert body["cancelled"] is True
+
+
+class StubRepository:
+    """Duck-typed repository that fails exactly where a test wants it to."""
+
+    def __init__(self, fault: RunRepositoryFault) -> None:
+        self.fault = fault
+        self.state_value = RunState.ACCEPTED
+
+    async def create(self, identity) -> int:
+        return 1
+
+    async def commit_transition(self, identity, **kwargs) -> int:
+        raise RunRepositoryError(self.fault, "stub failure")
+
+    async def state(self, identity) -> RunState:
+        return self.state_value
+
+    async def delete(self, identity) -> None:
+        return None
+
+    async def snapshot(self, identity, cursor, timeout_s):
+        raise AssertionError("streaming is not part of this stub")
+
+
+class TestRepositoryErrorMapping:
+    """Repository failures become mapped ErrorCodes and never move state."""
+
+    async def _cancel_with(self, fault: RunRepositoryFault):
+        service = RunAdmissionService(repository=StubRepository(fault))
+        session_id = service.create_session(
+            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+        ).session_id
+        run = await service.create_run(
+            PRINCIPAL,
+            CreateRunRequest(
+                session_id=session_id,
+                input=RunInput(type="text", text="mapped"),
+                idempotency_key="m",
+            ),
+            "req",
+            "trace",
+        )
+        with pytest.raises(AppError) as excinfo:
+            await service.cancel_run(PRINCIPAL, run.run_id)
+        state = await service.repository.state(service.runs[run.run_id].identity)
+        return excinfo.value.code, state
+
+    def test_invariant_failure_maps_and_leaves_state_untouched(self):
+        code, state = asyncio.run(self._cancel_with(RunRepositoryFault.INVARIANT))
+        assert code is ErrorCode.INTERNAL_UNKNOWN
+        assert state is RunState.ACCEPTED
+
+    def test_unavailable_failure_maps_to_overloaded(self):
+        code, state = asyncio.run(self._cancel_with(RunRepositoryFault.UNAVAILABLE))
+        assert code is ErrorCode.UNAVAILABLE_OVERLOADED
+        assert state is RunState.ACCEPTED
+
+    def test_persistent_cas_conflict_is_bounded_not_infinite(self):
+        async def main():
+            service = RunAdmissionService(
+                repository=StubRepository(RunRepositoryFault.CAS_CONFLICT)
+            )
+            session_id = service.create_session(
+                PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+            ).session_id
+            run = await service.create_run(
+                PRINCIPAL,
+                CreateRunRequest(
+                    session_id=session_id,
+                    input=RunInput(type="text", text="cas"),
+                    idempotency_key="cas",
+                ),
+                "req",
+                "trace",
+            )
+            with pytest.raises(AppError) as excinfo:
+                await service.cancel_run(PRINCIPAL, run.run_id)
+            return excinfo.value.code
+
+        assert asyncio.run(main()) is ErrorCode.CONFLICT_ACTIVE_RUN
+
+    def test_status_state_cancelled_always_consistent(self, harness):
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"], key="sc-1")
+        before = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}").json()
+        assert before["state"] == "ACCEPTED" and before["cancelled"] is False
+        cancelled = harness.client.delete(f"/api/v1/agent/runs/{run['run_id']}").json()
+        assert cancelled["state"] == "CANCELLED" and cancelled["cancelled"] is True
+        after = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}").json()
+        assert after["state"] == "CANCELLED" and after["cancelled"] is True
+
+
+class SessionScopedLockRepository(MemoryRunRepository):
+    """Blocks ``create`` for ONE session, to prove locks do not cross sessions."""
+
+    def __init__(self, slow_session_id: str) -> None:
+        super().__init__()
+        self.slow_session_id = slow_session_id
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create(self, identity) -> int:
+        if identity.session_id == self.slow_session_id:
+            self.entered.set()
+            await self.release.wait()
+        return await super().create(identity)
+
+
+class BlockingDeleteRepository(MemoryRunRepository):
+    """Blocks inside ``delete`` so another request can queue on the session lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def delete(self, identity) -> None:
+        self.entered.set()
+        await self.release.wait()
+        return await super().delete(identity)
 
 
 class TestConcurrency:
-    """Concurrency semantics are asserted on RunAdmissionService directly —
-    TestClient/httpx portals are not thread-safe for parallel requests."""
+    """Concurrency is asserted on the service directly, each test with its own
+    service + repository inside one event loop."""
 
-    def _seed_session(self) -> str:
+    @staticmethod
+    def _service(repository=None) -> RunAdmissionService:
+        return RunAdmissionService(repository=repository or MemoryRunRepository())
+
+    @staticmethod
+    def _session(service: RunAdmissionService) -> str:
         req = CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
-        return SERVICE.create_session(PRINCIPAL, req).session_id
+        return service.create_session(PRINCIPAL, req).session_id
 
     def test_concurrent_same_key_same_payload_single_run(self):
-        session_id = self._seed_session()
-        req = CreateRunRequest(
-            session_id=session_id,
-            input=RunInput(type="text", text="同题并发"),
-            idempotency_key="conc-same",
-        )
+        async def main():
+            service = self._service()
+            session_id = self._session(service)
+            req = CreateRunRequest(
+                session_id=session_id,
+                input=RunInput(type="text", text="同题并发"),
+                idempotency_key="conc-same",
+            )
+            runs = await asyncio.gather(
+                *(service.create_run(PRINCIPAL, req, "req", "trace") for _ in range(16))
+            )
+            stored = [r for r in service.runs.values() if r.session_id == session_id]
+            return {r.run_id for r in runs}, len(stored)
 
-        def fire():
-            return SERVICE.create_run(PRINCIPAL, req, "req", "trace")
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            runs = list(pool.map(lambda _: fire(), range(16)))
-        ids = {r.run_id for r in runs}
+        ids, stored = asyncio.run(main())
         assert len(ids) == 1
-        stored = [r for r in SERVICE.runs.values() if r.session_id == session_id]
-        assert len(stored) == 1
+        assert stored == 1
 
     def test_concurrent_different_keys_single_active_run(self):
-        session_id = self._seed_session()
+        async def main():
+            service = self._service()
+            session_id = self._session(service)
 
-        def fire(i):
-            try:
-                SERVICE.create_run(
-                    PRINCIPAL,
-                    CreateRunRequest(
-                        session_id=session_id,
-                        input=RunInput(type="text", text=f"q-{i}"),
-                        idempotency_key=f"key-{i}",
-                    ),
-                    f"req-{i}",
-                    "trace",
-                )
-                return "created"
-            except AppError as exc:
-                return exc.code.value
+            async def fire(i):
+                try:
+                    await service.create_run(
+                        PRINCIPAL,
+                        CreateRunRequest(
+                            session_id=session_id,
+                            input=RunInput(type="text", text=f"q-{i}"),
+                            idempotency_key=f"key-{i}",
+                        ),
+                        f"req-{i}",
+                        "trace",
+                    )
+                    return "created"
+                except AppError as exc:
+                    return exc.code.value
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            outcomes = list(pool.map(fire, range(12)))
+            outcomes = await asyncio.gather(*(fire(i) for i in range(12)))
+            active = [r for r in service.runs.values() if r.session_id == session_id]
+            return outcomes, active
+
+        outcomes, active = asyncio.run(main())
         assert outcomes.count("created") == 1
         assert all(o == "E_CONFLICT_ACTIVE_RUN" for o in outcomes if o != "created")
-        active = [r for r in SERVICE.runs.values() if r.session_id == session_id]
         assert len(active) == 1
-        assert active[0].machine.current is RunState.ACCEPTED
 
     def test_concurrent_cancel_single_terminal_event(self):
-        session_id = self._seed_session()
-        run = SERVICE.create_run(
-            PRINCIPAL,
-            CreateRunRequest(
+        async def main():
+            service = self._service()
+            session_id = self._session(service)
+            run = await service.create_run(
+                PRINCIPAL,
+                CreateRunRequest(
+                    session_id=session_id,
+                    input=RunInput(type="text", text="cancel me"),
+                    idempotency_key="cc",
+                ),
+                "req-c",
+                "trace",
+            )
+            await asyncio.gather(
+                *(service.cancel_run(PRINCIPAL, run.run_id) for _ in range(12))
+            )
+            identity = RunIdentity(
+                run_id=run.run_id,
+                tenant_id=PRINCIPAL.tenant_id,
+                device_id=PRINCIPAL.device_id,
                 session_id=session_id,
-                input=RunInput(type="text", text="cancel me"),
-                idempotency_key="cc",
-            ),
-            "req-c",
-            "trace",
-        )
-        run_id = run.run_id
+            )
+            return (
+                await _durable_seqs(service.repository, identity),
+                await service.repository.state(identity),
+            )
 
-        def fire():
-            return SERVICE.cancel_run(PRINCIPAL, run_id)
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(lambda _: fire(), range(12)))
-        events = SERVICE.runs[run_id].sse_events
-        assert [e.event.value for e in events] == ["run.accepted", "run.completed"]
-        assert SERVICE.runs[run_id].machine.current is RunState.CANCELLED
+        seqs, state = asyncio.run(main())
+        assert seqs == [1, 2]  # exactly one terminal event, no gap
+        assert state is RunState.CANCELLED
 
     def test_create_vs_delete_race_keeps_invariants(self):
-        session_id = self._seed_session()
+        async def main():
+            service = self._service()
+            session_id = self._session(service)
 
-        def creator():
-            try:
-                SERVICE.create_run(
+            async def creator():
+                try:
+                    await service.create_run(
+                        PRINCIPAL,
+                        CreateRunRequest(
+                            session_id=session_id,
+                            input=RunInput(type="text", text="race"),
+                            idempotency_key="race-key",
+                        ),
+                        "req-r",
+                        "trace",
+                    )
+                    return "created"
+                except AppError as exc:
+                    return exc.code.value
+
+            async def destroyer():
+                try:
+                    await service.delete_session(PRINCIPAL, session_id)
+                    return "deleted"
+                except AppError as exc:
+                    return exc.code.value
+
+            outcomes = await asyncio.gather(
+                *(creator() for _ in range(8)), *(destroyer() for _ in range(8))
+            )
+            orphans = [
+                run_id
+                for run_id, run in service.runs.items()
+                if run.session_id not in service.sessions
+            ]
+            return outcomes, orphans
+
+        outcomes, orphans = asyncio.run(main())
+        allowed = {"created", "deleted", "E_CONFLICT_ACTIVE_RUN", "E_NOT_FOUND_SESSION"}
+        assert set(outcomes) <= allowed
+        assert orphans == []
+
+    def test_slow_session_never_blocks_another_session(self):
+        """Per-session locks: no cross-tenant head-of-line blocking."""
+
+        async def main():
+            repository = SessionScopedLockRepository(slow_session_id="placeholder")
+            service = RunAdmissionService(repository=repository)
+            slow = self._session(service)
+            fast = self._session(service)
+            repository.slow_session_id = slow
+
+            async def create(session_id: str, key: str):
+                return await service.create_run(
                     PRINCIPAL,
                     CreateRunRequest(
                         session_id=session_id,
-                        input=RunInput(type="text", text="race"),
-                        idempotency_key="race-key",
+                        input=RunInput(type="text", text=key),
+                        idempotency_key=key,
                     ),
-                    "req-r",
+                    "req",
                     "trace",
                 )
-                return "created"
-            except AppError as exc:
-                return exc.code.value
 
-        def destroyer():
-            try:
-                SERVICE.delete_session(PRINCIPAL, session_id)
-                return "deleted"
-            except AppError as exc:
-                return exc.code.value
+            blocked = asyncio.create_task(create(slow, "slow"))
+            await repository.entered.wait()
+            started = asyncio.get_running_loop().time()
+            # the unrelated session completes while the first one is stuck
+            await asyncio.wait_for(create(fast, "fast"), timeout=1.0)
+            elapsed = asyncio.get_running_loop().time() - started
+            assert blocked.done() is False  # still blocked in storage
+            repository.release.set()
+            await blocked
+            return elapsed
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            outcomes = list(pool.map(lambda f: f(), [creator] * 8 + [destroyer] * 8))
-        allowed = {"created", "deleted", "E_CONFLICT_ACTIVE_RUN", "E_NOT_FOUND_SESSION"}
-        assert set(outcomes) <= allowed
-        for run_id, run in SERVICE.runs.items():
-            assert run.snapshot.session_id in SERVICE.sessions, f"orphan run {run_id}"
+        assert asyncio.run(main()) < 1.0
 
 
-class TestImmutability:
-    def test_failed_sse_validation_leaves_state_and_events_untouched(self):
-        """SSE 校验失败时：状态、event_seq、事件列表全部不变（事务性）。"""
-        session_id = RunAdmissionSeed.session()
-        run = SERVICE.create_run(
-            PRINCIPAL,
-            CreateRunRequest(
-                session_id=session_id,
-                input=RunInput(type="text", text="tx"),
-                idempotency_key="tx-1",
-            ),
-            "req",
-            "trace",
-        )
-        rec = SERVICE.runs[run.run_id]
-        assert rec.machine.current is RunState.ACCEPTED
-        assert rec.machine.event_seq == 1
-        assert len(rec.sse_events) == 1
+class TestResumableSessionDeletion:
+    """Two runs, the second delete fails, the retry completes."""
 
-        with pytest.raises(Exception):  # noqa: B017 - validation failure expected
-            # data key not in the RUN_COMPLETED allowlist -> SSEEvent raises
-            SERVICE._advance(rec, RunState.CANCELLED, {"bogus_key": 1})
+    class FlakyDeleteRepository(MemoryRunRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_for: set[str] = set()
+            self.deleted: list[str] = []
 
-        # nothing moved: no state change, no sequence bump, no extra event
-        assert rec.machine.current is RunState.ACCEPTED
-        assert rec.machine.event_seq == 1
-        assert [e.event.value for e in rec.sse_events] == ["run.accepted"]
+        async def delete(self, identity) -> None:
+            if identity.run_id in self.fail_for:
+                raise RunRepositoryError(RunRepositoryFault.UNAVAILABLE, "storage down")
+            self.deleted.append(identity.run_id)
+            return await super().delete(identity)
 
-    def test_concurrent_cancel_event_pages_are_consistent(self):
-        session_id = RunAdmissionSeed.session()
-        run = SERVICE.create_run(
-            PRINCIPAL,
-            CreateRunRequest(
-                session_id=session_id,
-                input=RunInput(type="text", text="cc"),
-                idempotency_key="cc-imm",
-            ),
-            "req",
-            "trace",
-        )
-        run_id = run.run_id
+    def test_partial_failure_keeps_memory_and_storage_in_step(self):
+        repository = self.FlakyDeleteRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            first = new_run(h, session["session_id"], key="first")
+            assert (
+                h.client.delete(f"/api/v1/agent/runs/{first['run_id']}").status_code
+                == 200
+            )
+            second = new_run(h, session["session_id"], key="second")
+            repository.fail_for.add(second["run_id"])
 
-        def cancel():
-            return SERVICE.cancel_run(PRINCIPAL, run_id)
+            res = h.client.delete(f"/api/v1/sessions/{session['session_id']}")
+            assert res.status_code == 503
+            assert h.env(res).code == "E_UNAVAILABLE_OVERLOADED"
 
-        def read_page():
-            page = SERVICE.events(PRINCIPAL, run_id, 0)
-            seqs = [e.seq for e in page.events]
-            assert seqs == list(range(1, page.next_seq + 1))  # no gaps, no tails
-            return page.next_seq
+            # exactly as durable as storage is: first is gone everywhere…
+            assert first["run_id"] not in h.service.runs
+            assert (
+                h.client.get(f"/api/v1/agent/runs/{first['run_id']}").status_code == 404
+            )
+            # …and the still-durable run is still reachable and still listed
+            assert second["run_id"] in h.service.runs
+            assert (
+                h.client.get(f"/api/v1/agent/runs/{second['run_id']}").status_code
+                == 200
+            )
+            # the session survives, so the client can retry the same request
+            assert session["session_id"] in h.service.sessions
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            cancels = pool.submit(lambda: [cancel() for _ in range(8)])
-            while not cancels.done():
-                read_page()
-            cancels.result()
-        final = SERVICE.events(PRINCIPAL, run_id, 0)
-        assert final.next_seq == 2
-        assert [e.seq for e in final.events] == [1, 2]
+            # retry: it resumes at the run that was still durable
+            repository.fail_for.clear()
+            retry = h.client.delete(f"/api/v1/sessions/{session['session_id']}")
+            assert retry.status_code == 204
+            assert set(repository.deleted) == {first["run_id"], second["run_id"]}
+            assert h.service.sessions == {}
+            assert h.service.runs == {}
+            assert h.service.idempotency == {}
+            assert (
+                h.client.get(f"/api/v1/agent/runs/{second['run_id']}").status_code
+                == 404
+            )
+            assert (
+                h.client.delete(f"/api/v1/sessions/{session['session_id']}").status_code
+                == 404
+            )
 
-    def test_status_state_cancelled_always_consistent(self):
-        session_id = RunAdmissionSeed.session()
-        run = SERVICE.create_run(
-            PRINCIPAL,
-            CreateRunRequest(
-                session_id=session_id,
-                input=RunInput(type="text", text="sc"),
-                idempotency_key="sc-1",
-            ),
-            "req",
-            "trace",
-        )
-        snap = SERVICE.get_run(PRINCIPAL, run.run_id)
-        assert snap.cancelled is False
-        assert snap.state is RunState.ACCEPTED
-        cancelled = SERVICE.cancel_run(PRINCIPAL, run.run_id)
-        assert cancelled.cancelled is True
-        assert cancelled.state is RunState.CANCELLED
-        after = SERVICE.get_run(PRINCIPAL, run.run_id)
-        assert after.cancelled is True
-        assert after.state is RunState.CANCELLED
+    def test_single_run_failure_then_retry(self):
+        repository = self.FlakyDeleteRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="only")
+            repository.fail_for.add(run["run_id"])
+
+            assert (
+                h.client.delete(f"/api/v1/sessions/{session['session_id']}").status_code
+                == 503
+            )
+            assert run["run_id"] in h.service.runs  # nothing was dropped
+            assert h.service.sessions != {}
+
+            repository.fail_for.clear()
+            assert (
+                h.client.delete(f"/api/v1/sessions/{session['session_id']}").status_code
+                == 204
+            )
+            assert h.service.runs == {} and h.service.sessions == {}
 
 
-class RunAdmissionSeed:
+class TestSessionLockLifecycle:
+    """The session guard must not outlive its users (review P1)."""
+
     @staticmethod
-    def session() -> str:
-        req = CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
-        return SERVICE.create_session(PRINCIPAL, req).session_id
+    def _service(repository=None) -> RunAdmissionService:
+        return RunAdmissionService(repository=repository or MemoryRunRepository())
+
+    @staticmethod
+    def _new_session(service: RunAdmissionService) -> str:
+        return service.create_session(
+            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+        ).session_id
+
+    def test_thousand_sessions_leave_no_guard_behind(self):
+        """Create + run + delete 1000 sessions: the lock table must be empty."""
+
+        async def main():
+            service = self._service()
+            for i in range(1000):
+                session_id = self._new_session(service)
+                await service.create_run(
+                    PRINCIPAL,
+                    CreateRunRequest(
+                        session_id=session_id,
+                        input=RunInput(type="text", text=f"q{i}"),
+                        idempotency_key=f"k{i}",
+                    ),
+                    "req",
+                    "trace",
+                )
+                await service.delete_session(PRINCIPAL, session_id)
+            return (
+                len(service._session_guards),
+                len(service.sessions),
+                len(service.runs),
+                len(service.idempotency),
+            )
+
+        guards, sessions, runs, idempotency = asyncio.run(main())
+        assert (guards, sessions, runs, idempotency) == (0, 0, 0, 0)
+
+    def test_expiry_path_also_releases_the_guard(self):
+        async def main():
+            service = self._service()
+            clock = FakeClock()
+            service._clock = clock
+            session_id = self._new_session(service)
+            run = await service.create_run(
+                PRINCIPAL,
+                CreateRunRequest(
+                    session_id=session_id,
+                    input=RunInput(type="text", text="ttl"),
+                    idempotency_key="ttl",
+                ),
+                "req",
+                "trace",
+            )
+            clock.advance(3600)
+            with pytest.raises(AppError):
+                await service.get_run(PRINCIPAL, run.run_id)
+            return len(service._session_guards), service.sessions
+
+        guards, sessions = asyncio.run(main())
+        assert guards == 0 and sessions == {}
+
+    def test_waiter_shares_one_guard_then_gets_not_found_and_clears(self):
+        async def main():
+            repository = BlockingDeleteRepository()
+            service = self._service(repository)
+            session_id = self._new_session(service)
+            run = await service.create_run(
+                PRINCIPAL,
+                CreateRunRequest(
+                    session_id=session_id,
+                    input=RunInput(type="text", text="queue"),
+                    idempotency_key="queue",
+                ),
+                "req",
+                "trace",
+            )
+
+            deleter = asyncio.create_task(service.delete_session(PRINCIPAL, session_id))
+            await repository.entered.wait()
+            guard = service._session_guards[session_id]
+            assert guard.lock.locked() and guard.refs == 1
+
+            # a second request for the SAME session queues on that very guard
+            waiter = asyncio.create_task(service.get_run(PRINCIPAL, run.run_id))
+            for _ in range(1000):
+                if guard.refs == 2:
+                    break
+                await asyncio.sleep(0)
+            assert guard.refs == 2
+            assert list(service._session_guards) == [session_id]
+            assert service._session_guards[session_id] is guard  # never a 2nd lock
+            assert waiter.done() is False  # it is queueing, not bypassing
+
+            repository.release.set()
+            await deleter
+            with pytest.raises(AppError) as excinfo:
+                await waiter
+            assert excinfo.value.code is ErrorCode.NOT_FOUND_RUN
+            return guard.refs, dict(service._session_guards)
+
+        refs, guards = asyncio.run(main())
+        assert refs == 0
+        assert guards == {}  # released once the last waiter left
+
+    def test_queued_request_after_delete_gets_a_fresh_guard(self):
+        """A later request starts a new guard (the old one is gone), and the
+        session is simply absent — never a second lock racing the first."""
+
+        async def main():
+            service = self._service()
+            session_id = self._new_session(service)
+            await service.delete_session(PRINCIPAL, session_id)
+            assert service._session_guards == {}
+            with pytest.raises(AppError) as excinfo:
+                await service.delete_session(PRINCIPAL, session_id)
+            return excinfo.value.code, dict(service._session_guards)
+
+        code, guards = asyncio.run(main())
+        assert code is ErrorCode.NOT_FOUND_SESSION
+        assert guards == {}
+
+    def test_concurrent_deletes_share_a_single_guard(self):
+        async def main():
+            service = self._service()
+            session_id = self._new_session(service)
+            results = await asyncio.gather(
+                *(service.delete_session(PRINCIPAL, session_id) for _ in range(8)),
+                return_exceptions=True,
+            )
+            codes = sorted(r.code.value for r in results if isinstance(r, AppError))
+            return codes, dict(service._session_guards)
+
+        codes, guards = asyncio.run(main())
+        assert codes == ["E_NOT_FOUND_SESSION"] * 7  # exactly one winner
+        assert guards == {}
 
 
 class TestRequestIds:
-    def test_malformed_x_request_id_replaced(self, client):
-        c, _ = client
-        res = c.post(
+    def test_malformed_x_request_id_replaced(self, harness):
+        res = harness.client.post(
             "/api/v1/sessions",
             json={"channel": "text"},
             headers={"X-Request-ID": "bad id <x>"},
@@ -493,9 +888,8 @@ class TestRequestIds:
         echoed = res.headers.get("x-request-id")
         assert echoed and "<x>" not in echoed
 
-    def test_ids_echoed(self, client):
-        c, _ = client
-        res = c.post(
+    def test_ids_echoed(self, harness):
+        res = harness.client.post(
             "/api/v1/sessions",
             json={"channel": "text"},
             headers={"X-Request-ID": "good-req-1"},
@@ -505,15 +899,15 @@ class TestRequestIds:
 
 
 class TestErrorBoundary:
-    def test_uncaught_exception_maps_to_internal_envelope(self, client):
-        c, _ = client
+    def test_uncaught_exception_maps_to_internal_envelope(self, harness):
+        app = harness.app
 
         @app.get("/__boom")
         async def boom():
             raise ValueError("sensitive provider detail: /etc/passwd")
 
         try:
-            res = c.get("/__boom")
+            res = harness.client.get("/__boom")
         finally:
             for route in list(app.routes):
                 if getattr(route, "path", None) == "/__boom":
@@ -530,3 +924,22 @@ class TestErrorBoundary:
             "retryable",
             "retry_after_ms",
         }
+
+
+class TestServiceScope:
+    def test_each_application_run_builds_its_own_service(self):
+        with running_app() as first:
+            service_a = first.service
+            session = new_session(first)
+            assert session["session_id"] in service_a.sessions
+        with running_app() as second:
+            assert second.service is not service_a
+            assert second.service.sessions == {}  # no state leaks across runs
+        assert first.app.state.agent_service is None  # lifespan cleaned up
+        assert first.app.state.readiness is None
+
+    def test_service_is_not_a_module_level_singleton(self):
+        from app.api.v1 import agent_api
+
+        assert not hasattr(agent_api, "SERVICE")
+        assert not hasattr(agent_api.RunAdmissionService, "_locks")
