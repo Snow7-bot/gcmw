@@ -237,6 +237,36 @@ class TestIdentityBoundsAtLoadTime:
         with pytest.raises(ValueError):
             CredentialStore.from_json(json.dumps([self._entry(token=token)]))
 
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "ZGV2LXRva2VuLXRlc3Q" + "=",  # one padding char
+            "ZGV2LXRva2VuLXRlc3Q" + "==",  # two padding chars (RFC 6750)
+            "dev-owned-" + "0" * 6 + "===",  # three padding chars
+        ],
+    )
+    def test_trailing_base64_padding_is_accepted(self, token):
+        """RFC 6750 b64token allows trailing ``=`` (review P2)."""
+        store = CredentialStore.from_json(json.dumps([self._entry(token=token)]))
+        assert len(store) == 1
+        assert store.resolve(token) is not None
+
+    @pytest.mark.parametrize("token", ["====" + "0" * 12, "a=b" + "0" * 13])
+    def test_padding_must_be_trailing_only(self, token):
+        with pytest.raises(ValueError):
+            CredentialStore.from_json(json.dumps([self._entry(token=token)]))
+
+    def test_a_padded_credential_authenticates_end_to_end(self):
+        padded = "ZGV2LXRva2VuLXRlc3Q" + "=="  # ≥ MIN_CREDENTIAL_LENGTH
+        entries = [{"tenant_id": "t1", "device_id": "d1", "token": padded}]
+        with running_app(overrides=False, credentials=entries) as h:
+            res = h.client.post(
+                "/api/v1/sessions",
+                json={"channel": "text"},
+                headers={"Authorization": f"Bearer {padded}"},
+            )
+            assert res.status_code == 201, res.text
+
     def test_over_long_token_is_rejected(self):
         with pytest.raises(ValueError):
             CredentialStore.from_json(

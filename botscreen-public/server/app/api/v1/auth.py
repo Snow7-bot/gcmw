@@ -42,11 +42,15 @@ MIN_CREDENTIAL_LENGTH = 16
 #: upper bound for a credential value: an absurdly long token is a config bug
 MAX_CREDENTIAL_LENGTH = 512
 
-#: RFC 6750 ``b64token`` characters — a credential outside this set could not be
-#: presented in an ``Authorization`` header anyway
-_CREDENTIAL_ALPHABET = frozenset(
+#: RFC 6750 section 2.1 ``b64token``:
+#:   b64token = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+#: i.e. the base characters plus ANY number of TRAILING ``=`` (base64 padding).
+#: A credential outside this set could not be presented in an ``Authorization``
+#: header at all, so it is rejected when the store is loaded.
+_CREDENTIAL_BASE_ALPHABET = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~+/"
 )
+_CREDENTIAL_PADDING = "="
 
 BEARER_SCHEME = "bearer"
 
@@ -126,7 +130,8 @@ def _credential_field(entry: dict, index: int) -> str:
             f"device credential #{index}: token must be "
             f"{MIN_CREDENTIAL_LENGTH}-{MAX_CREDENTIAL_LENGTH} characters"
         )
-    if not set(token) <= _CREDENTIAL_ALPHABET:
+    body = token.rstrip(_CREDENTIAL_PADDING)
+    if not body or not set(body) <= _CREDENTIAL_BASE_ALPHABET:
         raise ValueError(
             f"device credential #{index}: token contains characters that cannot "
             "appear in an Authorization header"
