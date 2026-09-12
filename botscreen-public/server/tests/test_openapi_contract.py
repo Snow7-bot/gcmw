@@ -19,7 +19,9 @@ from api_harness import (
 )
 
 from app.api.v1.auth import get_device_principal
+from app.api.v1.errors import AppError
 from app.config import Settings
+from app.contracts.errors import ErrorCode
 from app.main import create_app
 
 EVENTS_PATH = "/api/v1/agent/runs/{run_id}/events"
@@ -153,3 +155,40 @@ class TestWireParity:
         res = harness.client.get("/api/v1/agent/runs/ghost/events")
         assert res.status_code == 404
         assert res.json()["code"] == "E_NOT_FOUND_RUN"
+
+    def test_500_pre_stream_is_a_json_envelope_without_sse_bytes(self, harness):
+        """A pre-stream crash is answered like every other API failure."""
+        run = new_run(harness, new_session(harness)["session_id"])
+
+        async def exploding_authorize(principal, run_id):
+            raise ValueError("sensitive detail /etc/passwd")
+
+        harness.service.authorize_stream = exploding_authorize
+        res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
+        assert res.status_code == 500
+        assert res.headers["content-type"].startswith("application/json")
+        assert "data:" not in res.text and "event:" not in res.text
+        assert "sensitive" not in res.text
+        assert harness.env(res).code == "E_INTERNAL_UNKNOWN"
+
+    def test_503_pre_stream_is_a_json_envelope_without_sse_bytes(self, harness):
+        """Storage unavailable BEFORE the stream starts is a plain 503."""
+        run = new_run(harness, new_session(harness)["session_id"])
+
+        async def unavailable(principal, run_id):
+            raise AppError(ErrorCode.UNAVAILABLE_OVERLOADED)
+
+        harness.service.authorize_stream = unavailable
+        res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
+        assert res.status_code == 503
+        assert res.headers["content-type"].startswith("application/json")
+        assert "data:" not in res.text and "event:" not in res.text
+        envelope = harness.env(res)
+        assert envelope.code == "E_UNAVAILABLE_OVERLOADED"
+        assert envelope.retryable is True
+
+    def test_every_documented_status_is_reachable(self, schema, harness):
+        """Belt and braces: the parity tests above cover the whole declared set."""
+        documented = set(_operation(schema, EVENTS_PATH)["responses"])
+        covered = {"200", "400", "401", "403", "404", "500", "503"}
+        assert documented == covered

@@ -16,6 +16,7 @@ import pytest
 from api_harness import (
     OTHER_DEVICE,
     PRINCIPAL,
+    FakeClock,
     ForcedStateRepository,
     Harness,
     VanishingRepository,
@@ -465,6 +466,20 @@ class SessionScopedLockRepository(MemoryRunRepository):
         return await super().create(identity)
 
 
+class BlockingDeleteRepository(MemoryRunRepository):
+    """Blocks inside ``delete`` so another request can queue on the session lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def delete(self, identity) -> None:
+        self.entered.set()
+        await self.release.wait()
+        return await super().delete(identity)
+
+
 class TestConcurrency:
     """Concurrency is asserted on the service directly, each test with its own
     service + repository inside one event loop."""
@@ -720,6 +735,147 @@ class TestResumableSessionDeletion:
                 == 204
             )
             assert h.service.runs == {} and h.service.sessions == {}
+
+
+class TestSessionLockLifecycle:
+    """The session guard must not outlive its users (review P1)."""
+
+    @staticmethod
+    def _service(repository=None) -> RunAdmissionService:
+        return RunAdmissionService(repository=repository or MemoryRunRepository())
+
+    @staticmethod
+    def _new_session(service: RunAdmissionService) -> str:
+        return service.create_session(
+            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+        ).session_id
+
+    def test_thousand_sessions_leave_no_guard_behind(self):
+        """Create + run + delete 1000 sessions: the lock table must be empty."""
+
+        async def main():
+            service = self._service()
+            for i in range(1000):
+                session_id = self._new_session(service)
+                await service.create_run(
+                    PRINCIPAL,
+                    CreateRunRequest(
+                        session_id=session_id,
+                        input=RunInput(type="text", text=f"q{i}"),
+                        idempotency_key=f"k{i}",
+                    ),
+                    "req",
+                    "trace",
+                )
+                await service.delete_session(PRINCIPAL, session_id)
+            return (
+                len(service._session_guards),
+                len(service.sessions),
+                len(service.runs),
+                len(service.idempotency),
+            )
+
+        guards, sessions, runs, idempotency = asyncio.run(main())
+        assert (guards, sessions, runs, idempotency) == (0, 0, 0, 0)
+
+    def test_expiry_path_also_releases_the_guard(self):
+        async def main():
+            service = self._service()
+            clock = FakeClock()
+            service._clock = clock
+            session_id = self._new_session(service)
+            run = await service.create_run(
+                PRINCIPAL,
+                CreateRunRequest(
+                    session_id=session_id,
+                    input=RunInput(type="text", text="ttl"),
+                    idempotency_key="ttl",
+                ),
+                "req",
+                "trace",
+            )
+            clock.advance(3600)
+            with pytest.raises(AppError):
+                await service.get_run(PRINCIPAL, run.run_id)
+            return len(service._session_guards), service.sessions
+
+        guards, sessions = asyncio.run(main())
+        assert guards == 0 and sessions == {}
+
+    def test_waiter_shares_one_guard_then_gets_not_found_and_clears(self):
+        async def main():
+            repository = BlockingDeleteRepository()
+            service = self._service(repository)
+            session_id = self._new_session(service)
+            run = await service.create_run(
+                PRINCIPAL,
+                CreateRunRequest(
+                    session_id=session_id,
+                    input=RunInput(type="text", text="queue"),
+                    idempotency_key="queue",
+                ),
+                "req",
+                "trace",
+            )
+
+            deleter = asyncio.create_task(service.delete_session(PRINCIPAL, session_id))
+            await repository.entered.wait()
+            guard = service._session_guards[session_id]
+            assert guard.lock.locked() and guard.refs == 1
+
+            # a second request for the SAME session queues on that very guard
+            waiter = asyncio.create_task(service.get_run(PRINCIPAL, run.run_id))
+            for _ in range(1000):
+                if guard.refs == 2:
+                    break
+                await asyncio.sleep(0)
+            assert guard.refs == 2
+            assert list(service._session_guards) == [session_id]
+            assert service._session_guards[session_id] is guard  # never a 2nd lock
+            assert waiter.done() is False  # it is queueing, not bypassing
+
+            repository.release.set()
+            await deleter
+            with pytest.raises(AppError) as excinfo:
+                await waiter
+            assert excinfo.value.code is ErrorCode.NOT_FOUND_RUN
+            return guard.refs, dict(service._session_guards)
+
+        refs, guards = asyncio.run(main())
+        assert refs == 0
+        assert guards == {}  # released once the last waiter left
+
+    def test_queued_request_after_delete_gets_a_fresh_guard(self):
+        """A later request starts a new guard (the old one is gone), and the
+        session is simply absent — never a second lock racing the first."""
+
+        async def main():
+            service = self._service()
+            session_id = self._new_session(service)
+            await service.delete_session(PRINCIPAL, session_id)
+            assert service._session_guards == {}
+            with pytest.raises(AppError) as excinfo:
+                await service.delete_session(PRINCIPAL, session_id)
+            return excinfo.value.code, dict(service._session_guards)
+
+        code, guards = asyncio.run(main())
+        assert code is ErrorCode.NOT_FOUND_SESSION
+        assert guards == {}
+
+    def test_concurrent_deletes_share_a_single_guard(self):
+        async def main():
+            service = self._service()
+            session_id = self._new_session(service)
+            results = await asyncio.gather(
+                *(service.delete_session(PRINCIPAL, session_id) for _ in range(8)),
+                return_exceptions=True,
+            )
+            codes = sorted(r.code.value for r in results if isinstance(r, AppError))
+            return codes, dict(service._session_guards)
+
+        codes, guards = asyncio.run(main())
+        assert codes == ["E_NOT_FOUND_SESSION"] * 7  # exactly one winner
+        assert guards == {}
 
 
 class TestRequestIds:

@@ -34,6 +34,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -152,6 +153,20 @@ class RunRecord:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class _SessionGuard:
+    """Reference-counted session lock.
+
+    ``refs`` counts every coroutine that currently HOLDS or WAITS for the lock;
+    the owning service deletes the entry when it drops back to zero.
+    """
+
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
+
+
 # ---------------------------------------------------------------------------
 # RunAdmissionService: admission + lifecycle only (no state authority).
 # ---------------------------------------------------------------------------
@@ -179,10 +194,13 @@ class RunAdmissionService:
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.repository = repository or MemoryRunRepository()
-        # ONE lock per session. Idempotency keys and the single-active-run rule
-        # are both session-scoped, so per-session locking is sufficient for
-        # correctness while keeping unrelated sessions independent.
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # ONE reference-counted guard per session. Idempotency keys and the
+        # single-active-run rule are both session-scoped, so per-session locking
+        # is sufficient for correctness while keeping unrelated sessions
+        # independent — and the guard removes itself once nobody holds or waits
+        # (a long-running robot must not accumulate one lock per session ever
+        # created).
+        self._session_guards: dict[str, _SessionGuard] = {}
         self.sessions: dict[str, SessionRecord] = {}
         self.runs: dict[str, RunRecord] = {}
         # (session_id, idempotency_key) -> (run_id, payload_hash)
@@ -191,18 +209,30 @@ class RunAdmissionService:
     def now(self) -> datetime:
         return self._clock()
 
-    def _lock_for(self, session_id: str) -> asyncio.Lock:
-        """Session-scoped admission lock.
+    @asynccontextmanager
+    async def _session_guard(self, session_id: str) -> AsyncIterator[None]:
+        """Session-scoped admission lock with a reference-counted lifetime.
 
-        Lookup-and-create contains no await, so it is atomic on the single
-        event loop that owns this service (the service is created per
-        application run by the lifespan, never shared across loops).
+        The guard is created on first use and REMOVED as soon as the last
+        holder or waiter leaves (``refs`` back to zero), so the lock table
+        cannot grow with the number of sessions ever created. The lookup and the
+        increment contain no await, which is atomic on the single event loop
+        that owns this service — therefore a queued coroutine always keeps the
+        entry alive and **no second lock for the same session can ever be
+        created while someone is still waiting on the first one**.
         """
-        lock = self._session_locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._session_locks[session_id] = lock
-        return lock
+        guard = self._session_guards.get(session_id)
+        if guard is None:
+            guard = _SessionGuard()
+            self._session_guards[session_id] = guard
+        guard.refs += 1
+        try:
+            async with guard.lock:
+                yield
+        finally:
+            guard.refs -= 1
+            if guard.refs == 0 and self._session_guards.get(session_id) is guard:
+                del self._session_guards[session_id]
 
     # -- expiry ---------------------------------------------------------------
 
@@ -214,11 +244,10 @@ class RunAdmissionService:
             del self.runs[run_id]
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
-        # session ids are never reused, so an idle lock can be dropped safely: a
-        # coroutine still waiting on it re-checks and finds the session gone
-        lock = self._session_locks.get(session_id)
-        if lock is not None and not lock.locked():
-            del self._session_locks[session_id]
+        # NOTE: the session guard is deliberately NOT touched here. Purging
+        # always runs while HOLDING that guard, so a "delete it if idle" check
+        # can never fire — the guard removes itself when its last holder or
+        # waiter leaves (see ``_session_guard``).
 
     def _session_expired(self, session: SessionRecord) -> bool:
         return self.now() >= session.expires_at
@@ -264,7 +293,7 @@ class RunAdmissionService:
         )
 
     async def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
-        async with self._lock_for(session_id):
+        async with self._session_guard(session_id):
             session = self.sessions.get(session_id)
             if session is None:
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
@@ -386,7 +415,7 @@ class RunAdmissionService:
         request_id: str,
         trace_id: str,
     ) -> RunStatusSnapshot:
-        async with self._lock_for(req.session_id):
+        async with self._session_guard(req.session_id):
             self._expire_if_needed(req.session_id)
             session = self.sessions.get(req.session_id)
             if session is None:
@@ -461,14 +490,14 @@ class RunAdmissionService:
     async def get_run(
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
-        async with self._lock_for(self._session_of(run_id)):
+        async with self._session_guard(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
             return self._snapshot(record, await self._read_durable_state(record))
 
     async def cancel_run(
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
-        async with self._lock_for(self._session_of(run_id)):
+        async with self._session_guard(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
             for _ in range(MAX_CANCEL_ATTEMPTS):
                 state = await self._read_durable_state(record)
@@ -500,7 +529,7 @@ class RunAdmissionService:
         foreign or unknown run is answered with a JSON error envelope and never
         with a half-open stream.
         """
-        async with self._lock_for(self._session_of(run_id)):
+        async with self._session_guard(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
             state = await self._read_durable_state(record)
             return record.identity, state

@@ -59,9 +59,12 @@ STREAM_ERROR_EVENT = "stream.error"
 class SSEStreamingResponse(StreamingResponse):
     """StreamingResponse pinned to the SSE media type.
 
-    Used both as the response of the public route and as its ``response_class``,
-    so the published OpenAPI contract advertises ``text/event-stream`` instead of
-    the JSON default a bare ``StreamingResponse`` would produce.
+    Returned by the public route so the wire carries
+    ``Content-Type: text/event-stream``. It is deliberately **not** declared as
+    the route's ``response_class``: FastAPI stamps that class's media type onto
+    every documented response, which would advertise the pre-stream JSON error
+    envelopes as SSE. The published contract instead declares the 200 content
+    explicitly and is normalised in ``app.main``.
     """
 
     media_type = "text/event-stream"
