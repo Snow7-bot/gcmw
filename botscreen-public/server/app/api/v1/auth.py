@@ -42,11 +42,15 @@ MIN_CREDENTIAL_LENGTH = 16
 #: upper bound for a credential value: an absurdly long token is a config bug
 MAX_CREDENTIAL_LENGTH = 512
 
-#: RFC 6750 ``b64token`` characters — a credential outside this set could not be
-#: presented in an ``Authorization`` header anyway
-_CREDENTIAL_ALPHABET = frozenset(
+#: RFC 6750 section 2.1 ``b64token``:
+#:   b64token = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+#: i.e. the base characters plus ANY number of TRAILING ``=`` (base64 padding).
+#: A credential outside this set could not be presented in an ``Authorization``
+#: header at all, so it is rejected when the store is loaded.
+_CREDENTIAL_BASE_ALPHABET = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~+/"
 )
+_CREDENTIAL_PADDING = "="
 
 BEARER_SCHEME = "bearer"
 
@@ -121,15 +125,24 @@ def _credential_field(entry: dict, index: int) -> str:
         raise ValueError(
             f"device credential #{index}: token has surrounding whitespace"
         )
-    if not MIN_CREDENTIAL_LENGTH <= len(token) <= MAX_CREDENTIAL_LENGTH:
-        raise ValueError(
-            f"device credential #{index}: token must be "
-            f"{MIN_CREDENTIAL_LENGTH}-{MAX_CREDENTIAL_LENGTH} characters"
-        )
-    if not set(token) <= _CREDENTIAL_ALPHABET:
+    # Length rules apply to the BODY (base64 padding stripped): validating the
+    # raw value first would let ``"a" + "=" * 15`` satisfy a 16-character
+    # minimum while carrying a single character of entropy.
+    body = token.rstrip(_CREDENTIAL_PADDING)
+    if not body or not set(body) <= _CREDENTIAL_BASE_ALPHABET:
         raise ValueError(
             f"device credential #{index}: token contains characters that cannot "
             "appear in an Authorization header"
+        )
+    if len(body) < MIN_CREDENTIAL_LENGTH:
+        raise ValueError(
+            f"device credential #{index}: token must carry at least "
+            f"{MIN_CREDENTIAL_LENGTH} characters excluding base64 padding"
+        )
+    if len(token) > MAX_CREDENTIAL_LENGTH:
+        raise ValueError(
+            f"device credential #{index}: token must be at most "
+            f"{MAX_CREDENTIAL_LENGTH} characters including padding"
         )
     return token
 
