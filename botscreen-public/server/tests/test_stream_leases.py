@@ -18,7 +18,11 @@ from api_harness import PRINCIPAL, Harness, running_app
 from app.api.v1 import agent_api
 from app.api.v1.stream_leases import DEFAULT_RECONNECT_GRACE_S, RunLeaseRegistry
 from app.contracts.run import RunState
-from app.storage.run_repository import RunIdentity
+from app.storage.run_repository import (
+    RunIdentity,
+    RunRepositoryError,
+    RunRepositoryFault,
+)
 
 
 class ManualSleep:
@@ -88,12 +92,16 @@ class TestLeaseRegistry:
             registry.open("r1")
             assert registry.subscribers("r1") == 2
 
-            registry.close("r1")  # one subscriber left: nothing scheduled
+            registry.close(
+                "r1", client_gone=True
+            )  # one subscriber left: nothing scheduled
             assert registry.subscribers("r1") == 1
             assert registry.pending_expiries() == 0
             assert sleep.pending() == 0
 
-            registry.close("r1")  # last subscriber: grace window opens
+            registry.close(
+                "r1", client_gone=True
+            )  # last subscriber: grace window opens
             assert registry.subscribers("r1") == 0
             assert registry.pending_expiries() == 1
             await sleep.wait_pending()
@@ -113,7 +121,7 @@ class TestLeaseRegistry:
             registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
 
             registry.open("r1")
-            registry.close("r1")
+            registry.close("r1", client_gone=True)
             assert registry.pending_expiries() == 1
 
             registry.open("r1")  # the user reconnects inside the window
@@ -136,7 +144,7 @@ class TestLeaseRegistry:
             registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
             registry.open("r1")
             registry.open("r2")
-            registry.close("r1")  # only r1 enters its grace window
+            registry.close("r1", client_gone=True)  # only r1 enters its grace window
             assert registry.pending_expiries() == 1
             await sleep.fire()
             return expired, registry.subscribers("r2")
@@ -151,7 +159,7 @@ class TestLeaseRegistry:
             expired: list[str] = []
             registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
             registry.open("r1")
-            registry.close("r1")
+            registry.close("r1", client_gone=True)
             await sleep.fire()  # the decision was already taken
             registry.open("r1")  # a brand-new lease, it cannot un-cancel
             return expired
@@ -166,12 +174,68 @@ class TestLeaseRegistry:
             for i in range(1000):
                 run_id = f"run-{i}"
                 registry.open(run_id)
-                registry.close(run_id)
+                registry.close(run_id, client_gone=True)
                 await sleep.fire()
             return registry.tracked(), registry.pending_expiries(), len(expired)
 
         tracked, pending, expired = asyncio.run(main())
         assert (tracked, pending, expired) == (0, 0, 1000)
+
+    def test_server_side_end_never_schedules_a_cancel(self):
+        """A stream that ends on the server (terminal or stream.error) is NOT a
+        disconnect: the run must stay active with no grace timer at all."""
+
+        async def main():
+            sleep = ManualSleep()
+            expired: list[str] = []
+            registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
+            registry.open("r1")
+            registry.close("r1", client_gone=False)  # server ended the stream
+            for _ in range(50):
+                await asyncio.sleep(0)
+            return (
+                expired,
+                registry.pending_expiries(),
+                registry.tracked(),
+                sleep.pending(),
+            )
+
+        expired, pending, tracked, timers = asyncio.run(main())
+        assert expired == []  # no cancel, ever
+        assert (pending, tracked, timers) == (0, 0, 0)
+
+    def test_shutdown_ends_an_in_flight_callback_before_returning(self):
+        """After shutdown() returns, no disconnect cancel may still run."""
+
+        async def main():
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            applied: list[str] = []
+
+            async def on_expire(run_id: str) -> None:
+                entered.set()
+                await release.wait()  # a slow storage write, mid-flight
+                applied.append(run_id)
+
+            sleep = ManualSleep()
+            registry = RunLeaseRegistry(on_expire, sleep=sleep)
+            registry.open("r1")
+            registry.close("r1", client_gone=True)
+            await sleep.fire()  # the grace expired: the callback is running
+            await entered.wait()
+            assert registry.in_flight_callbacks() == 1
+
+            await registry.shutdown()  # must not return while it can still run
+            at_shutdown = list(applied)
+            release.set()  # would let a leaked callback finish
+            for _ in range(100):
+                await asyncio.sleep(0)
+            return at_shutdown, list(applied), registry.tracked()
+
+        at_shutdown, after, tracked = asyncio.run(main())
+        assert at_shutdown == []  # nothing had been applied at shutdown time
+        assert after == []  # and nothing continued afterwards
+        assert tracked == 0
 
     def test_shutdown_cancels_pending_timers(self):
         async def main():
@@ -179,7 +243,7 @@ class TestLeaseRegistry:
             expired: list[str] = []
             registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
             registry.open("r1")
-            registry.close("r1")
+            registry.close("r1", client_gone=True)
             assert registry.pending_expiries() == 1
             await registry.shutdown()
             for _ in range(50):
@@ -198,7 +262,7 @@ class TestLeaseRegistry:
     def test_closing_an_unopened_lease_is_a_noop(self):
         async def main():
             registry = RunLeaseRegistry(_recorder([]), sleep=ManualSleep())
-            registry.close("never-opened")
+            registry.close("never-opened", client_gone=True)
             return registry.tracked(), registry.pending_expiries()
 
         assert asyncio.run(main()) == (0, 0)
@@ -386,6 +450,131 @@ class TestRouteLeases:
             assert leases.tracked() == 0 and leases.pending_expiries() == 0
 
 
+class TestServerSideEndIsNotADisconnect:
+    """Review P1: a storage fault must never look like the user leaving."""
+
+    def test_error_frame_run_stays_active_and_no_grace_starts(self, harness):
+        sleep = ManualSleep()
+        expired: list[str] = []
+
+        async def on_expire(run_id: str) -> None:
+            expired.append(run_id)
+            await harness.service.cancel_for_disconnect(run_id)
+
+        registry = RunLeaseRegistry(on_expire, sleep=sleep)
+        harness.app.state.stream_leases = registry
+
+        async def main():
+            run = await _seed_run(harness, "server-end")
+
+            async def failing_snapshot(identity, cursor, timeout_s):
+                raise RunRepositoryError(
+                    RunRepositoryFault.UNAVAILABLE, "storage is down"
+                )
+
+            harness.repository.snapshot = failing_snapshot
+            response = await agent_api.stream_run_events(
+                run["run_id"],
+                _request(),
+                PRINCIPAL,
+                after_seq=0,
+                last_event_id=None,
+                service=harness.service,
+                leases=registry,
+            )
+            body = [chunk async for chunk in response.body_iterator]  # consumed
+            state = await harness.service.repository.state(run["identity"])
+            return (
+                "".join(body),
+                state,
+                registry.pending_expiries(),
+                registry.tracked(),
+                sleep.pending(),
+                expired,
+            )
+
+        body, state, pending, tracked, timers, expired = asyncio.run(main())
+        assert "stream.error" in body  # the client got a structured failure…
+        assert state is RunState.ACCEPTED  # …and the run is untouched
+        assert (pending, tracked, timers) == (0, 0, 0)  # no grace was armed
+        assert expired == []
+
+    def test_terminal_stream_end_arms_nothing_either(self, harness):
+        sleep = ManualSleep()
+        registry = RunLeaseRegistry(harness.service.cancel_for_disconnect, sleep=sleep)
+        harness.app.state.stream_leases = registry
+
+        async def main():
+            run = await _seed_run(harness, "terminal-end")
+            await harness.service.cancel_run(PRINCIPAL, run["run_id"])
+            response = await agent_api.stream_run_events(
+                run["run_id"],
+                _request(),
+                PRINCIPAL,
+                after_seq=0,
+                last_event_id=None,
+                service=harness.service,
+                leases=registry,
+            )
+            body = [chunk async for chunk in response.body_iterator]
+            return (
+                "".join(body),
+                registry.pending_expiries(),
+                registry.tracked(),
+                sleep.pending(),
+            )
+
+        body, pending, tracked, timers = asyncio.run(main())
+        assert body.count("event: run.completed") == 1
+        assert (pending, tracked, timers) == (0, 0, 0)
+
+    def test_disconnect_after_an_error_frame_still_cancels(self, harness):
+        """The grace is armed by the DISCONNECT, not by the fault before it."""
+        sleep = ManualSleep()
+        expired: list[str] = []
+
+        async def on_expire(run_id: str) -> None:
+            expired.append(run_id)
+            await harness.service.cancel_for_disconnect(run_id)
+
+        registry = RunLeaseRegistry(on_expire, sleep=sleep)
+        harness.app.state.stream_leases = registry
+
+        async def main():
+            run = await _seed_run(harness, "error-then-drop")
+
+            async def failing_snapshot(identity, cursor, timeout_s):
+                raise RunRepositoryError(
+                    RunRepositoryFault.UNAVAILABLE, "storage is down"
+                )
+
+            harness.repository.snapshot = failing_snapshot
+            response = await agent_api.stream_run_events(
+                run["run_id"],
+                _request(),
+                PRINCIPAL,
+                after_seq=0,
+                last_event_id=None,
+                service=harness.service,
+                leases=registry,
+            )
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+                break  # the client walks away right after the error frame
+            await response.body_iterator.aclose()
+            armed = registry.pending_expiries()
+            await sleep.fire()
+            state = await harness.service.repository.state(run["identity"])
+            return "".join(chunks), armed, state, expired
+
+        body, armed, state, expired = asyncio.run(main())
+        assert "stream.error" in body
+        assert armed == 1  # the disconnect itself armed the grace
+        assert expired  # and it was applied
+        assert state is RunState.CANCELLED
+
+
 class TestExplicitCancelStillWins:
     def test_explicit_delete_cancel_is_not_reversed_by_a_lease_expiry(self, harness):
         sleep = ManualSleep()
@@ -395,7 +584,7 @@ class TestExplicitCancelStillWins:
         async def main():
             run = await _seed_run(harness, "explicit")
             registry.open(run["run_id"])
-            registry.close(run["run_id"])  # grace window opens
+            registry.close(run["run_id"], client_gone=True)  # grace opens
             await harness.service.cancel_run(
                 PRINCIPAL, run["run_id"]
             )  # explicit DELETE

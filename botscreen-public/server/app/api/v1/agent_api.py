@@ -640,17 +640,27 @@ async def _stream_with_lease(
     """Hold one connection lease for the lifetime of a single SSE response.
 
     The lease is taken when streaming actually starts (the generator body runs
-    on first iteration, i.e. only for an already authorised request) and
-    released in ``finally`` — on normal completion, on client disconnect (the
-    ASGI server closes the body iterator) and on cancellation alike. Releasing
-    the LAST lease starts the reconnect grace window.
+    on first iteration, i.e. only for an already authorised request) and always
+    released in ``finally``.
+
+    Only a CONFIRMED disconnect arms the reconnect grace: the ASGI server closes
+    or cancels this body generator exactly when the client goes away
+    (``GeneratorExit`` / ``CancelledError``). A stream that ends on the SERVER
+    side — a terminal frame, or a structured ``stream.error`` frame after a
+    storage fault — completes normally and therefore releases the lease with
+    ``client_gone=False``, so an outage can never be mistaken for the user
+    leaving and silently cancel the run.
     """
     leases.open(run_id)
+    client_gone = False
     try:
         async for chunk in source:
             yield chunk
+    except (GeneratorExit, asyncio.CancelledError):
+        client_gone = True
+        raise
     finally:
-        leases.close(run_id)
+        leases.close(run_id, client_gone=client_gone)
 
 
 @router.post(

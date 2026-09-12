@@ -161,6 +161,52 @@ class TestRealDisconnect:
             ) as res:
                 assert "".join(res.iter_text()).count("event: run.completed") == 1
 
+    def test_server_side_fault_never_cancels_the_run(self, server):
+        """A storage fault ends the stream with stream.error — the run lives on.
+
+        Over a real socket this is the case that used to be mistaken for a
+        disconnect: the server closes the response, but the client never left.
+        """
+        from app.storage.run_repository import (
+            RunRepositoryError,
+            RunRepositoryFault,
+        )
+
+        repository = server.app.state.agent_service.repository
+        original = repository.snapshot
+        failing: set[str] = set()
+
+        async def flaky_snapshot(identity, cursor, timeout_s):
+            if identity.run_id in failing:
+                raise RunRepositoryError(RunRepositoryFault.UNAVAILABLE, "down")
+            return await original(identity, cursor, timeout_s)
+
+        repository.snapshot = flaky_snapshot
+        try:
+            with httpx.Client(timeout=10) as client:
+                run = _new_run(client, server.base, "real-fault")
+                failing.add(run["run_id"])
+                with httpx.stream(
+                    "GET",
+                    f"{server.base}/agent/runs/{run['run_id']}/events",
+                    timeout=30,
+                ) as res:
+                    body = "".join(res.iter_text())
+                assert "stream.error" in body
+                assert server.leases.subscribers(run["run_id"]) == 0
+                assert server.leases.pending_expiries() == 0  # no grace armed
+                time.sleep(RECONNECT_GRACE_S * 2)
+                assert _state(client, server.base, run["run_id"]) == "ACCEPTED"
+                # and the run is still streamable/cancellable normally
+                assert (
+                    client.delete(
+                        f"{server.base}/agent/runs/{run['run_id']}"
+                    ).status_code
+                    == 200
+                )
+        finally:
+            repository.snapshot = original
+
     def test_no_lease_leaks_after_every_stream_ended(self, server):
         with httpx.Client(timeout=10) as client:
             for i in range(5):
