@@ -27,7 +27,7 @@ from app.main import create_app
 EVENTS_PATH = "/api/v1/agent/runs/{run_id}/events"
 
 #: statuses the public SSE route documents (and must actually return)
-EVENTS_ERROR_STATUSES = {"400", "401", "403", "404", "500", "503"}
+EVENTS_ERROR_STATUSES = {"400", "401", "403", "404", "429", "500", "503"}
 ENVELOPE_FIELDS = {
     "code",
     "message",
@@ -128,6 +128,23 @@ class TestDocumentedContract:
         for path in ("/api/v1/health/live", "/api/v1/health/ready"):
             assert "security" not in schema["paths"][path]["get"]
 
+    def test_rate_limited_routes_document_429(self, schema):
+        """Every route that charges a window publishes the 429 it can return."""
+        for path, path_item in schema["paths"].items():
+            for method, operation in path_item.items():
+                responses = operation.get("responses", {})
+                if path.startswith("/api/v1/health"):
+                    assert "429" not in responses, (method, path)
+                    continue
+                assert "429" in responses, (method, path)
+                ref = responses["429"]["content"]["application/json"]["schema"]["$ref"]
+                assert ref.endswith("/ErrorEnvelope")
+
+    def test_ready_documentation_matches_the_published_schema(self, schema):
+        """The readiness body shape is documented, not implied."""
+        body = schema["paths"]["/api/v1/health/ready"]["get"]["responses"]["200"]
+        assert "application/json" in body["content"]
+
     def test_readiness_documents_503(self, schema):
         responses = _operation(schema, "/api/v1/health/ready")["responses"]
         assert set(responses) == {"200", "503"}
@@ -172,6 +189,24 @@ class TestWireParity:
         assert res.status_code == 404
         assert res.json()["code"] == "E_NOT_FOUND_RUN"
 
+    def test_429_is_reachable_and_carries_the_wait_hint(self):
+        """The declared 429 really happens, with retry_after_ms and Retry-After."""
+        from api_harness import running_app
+
+        limits = {"rate_limit_tenant_per_minute": 1}
+        with running_app(settings_kwargs=limits) as h:
+            assert (
+                h.client.post("/api/v1/sessions", json={"channel": "text"}).status_code
+                == 201
+            )
+            res = h.client.get("/api/v1/agent/runs/ghost/events")
+        assert res.status_code == 429
+        body = res.json()
+        assert body["code"] == "E_RATE_LIMIT_EXCEEDED"
+        assert body["retry_after_ms"] > 0
+        assert int(res.headers["retry-after"]) >= 1
+        assert "data:" not in res.text  # never a streamed byte
+
     def test_500_pre_stream_is_a_json_envelope_without_sse_bytes(self, harness):
         """A pre-stream crash is answered like every other API failure."""
         run = new_run(harness, new_session(harness)["session_id"])
@@ -206,5 +241,5 @@ class TestWireParity:
     def test_every_documented_status_is_reachable(self, schema, harness):
         """Belt and braces: the parity tests above cover the whole declared set."""
         documented = set(_operation(schema, EVENTS_PATH)["responses"])
-        covered = {"200", "400", "401", "403", "404", "500", "503"}
+        covered = {"200", "400", "401", "403", "404", "429", "500", "503"}
         assert documented == covered
