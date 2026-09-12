@@ -12,7 +12,10 @@
   friends) and the run service lives in the **lifespan scope**: one service per
   application run, i.e. exactly one event loop owns its asyncio primitives;
 - startup FAILS CLOSED in staging/production while the run repository or the
-  session/idempotency admission store is in-memory (see :mod:`app.runtime`);
+  session/idempotency admission store is in-memory, or no device credentials are
+  configured (see :mod:`app.runtime`);
+- device credentials come from the environment (``GCMW_DEVICE_CREDENTIALS`` by
+  default) and are only ever kept as digests (see :mod:`app.api.v1.auth`);
 - SSE connection leases (subscriber counting + reconnect grace) are created in
   the same lifespan scope and torn down with the application.
 """
@@ -30,6 +33,7 @@ from fastapi.responses import JSONResponse
 from app.agents.registry import RegistryError
 from app.api.v1.agent_api import AppError, RunAdmissionService
 from app.api.v1.agent_api import router as agent_router
+from app.api.v1.auth import CredentialStore
 from app.api.v1.errors import request_ids
 from app.api.v1.stream_leases import DEFAULT_RECONNECT_GRACE_S, RunLeaseRegistry
 from app.config import Settings
@@ -39,6 +43,9 @@ from app.runtime import build_run_repository, readiness_report
 
 APP_TITLE = "gcmw agent api"
 APP_VERSION = "0.1.0"
+
+#: routes that are public by design (liveness/readiness probes)
+PUBLIC_PATHS = frozenset({"/api/v1/health/live", "/api/v1/health/ready"})
 
 
 def _envelope_response(
@@ -52,6 +59,29 @@ def _envelope_response(
         content=envelope.model_dump(mode="json"),
         headers=headers,
     )
+
+
+def _declare_bearer_auth(schema: dict) -> None:
+    """Publish the credential scheme the API actually enforces (#66).
+
+    Every route except the health probes requires a device credential, so the
+    contract says so instead of leaving a client to discover the 401s.
+    """
+    components = schema.setdefault("components", {})
+    components.setdefault("securitySchemes", {})["BearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "description": (
+            "设备凭据（Authorization: Bearer <credential>）。缺失/非法凭据 → 401；"
+            "凭据不属于目标 tenant/device → 403，均为统一错误信封。"
+        ),
+    }
+    for path, path_item in schema.get("paths", {}).items():
+        if path in PUBLIC_PATHS:
+            continue
+        for operation in path_item.values():
+            if isinstance(operation, dict):
+                operation["security"] = [{"BearerAuth": []}]
 
 
 def _normalize_stream_media_types(responses: dict) -> None:
@@ -100,7 +130,8 @@ def create_app(
         # owns its asyncio locks, and no module-level singleton can be shared
         # between loops (or between workers) by accident
         service = RunAdmissionService(repository=factory(settings))
-        report = readiness_report(settings, service.repository)
+        credentials = CredentialStore.from_env(settings.auth_credentials_env)
+        report = readiness_report(settings, service.repository, credentials)
         if not report.ready:
             raise RuntimeError(
                 f"refusing to start in environment {settings.environment!r}: "
@@ -114,6 +145,7 @@ def create_app(
             grace_s=reconnect_grace_s,
         )
         app.state.agent_service = service
+        app.state.credentials = credentials
         app.state.readiness = report
         app.state.stream_leases = leases
         try:
@@ -121,12 +153,14 @@ def create_app(
         finally:
             await leases.shutdown()
             app.state.agent_service = None
+            app.state.credentials = None
             app.state.readiness = None
             app.state.stream_leases = None
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.agent_service = None
+    app.state.credentials = None
     app.state.readiness = None
     app.state.stream_leases = None
 
@@ -180,6 +214,7 @@ def create_app(
             schema = get_openapi(
                 title=APP_TITLE, version=APP_VERSION, routes=app.routes
             )
+            _declare_bearer_auth(schema)
             for path_item in schema.get("paths", {}).values():
                 for operation in path_item.values():
                     if not isinstance(operation, dict):
