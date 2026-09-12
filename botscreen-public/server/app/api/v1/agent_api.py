@@ -54,6 +54,7 @@ from app.api.v1.sse_stream import (
     stream_engine,
     stream_error_frame,
 )
+from app.api.v1.stream_leases import RunLeaseRegistry
 from app.contracts.api import (
     CreateRunRequest,
     CreateSessionRequest,
@@ -494,29 +495,61 @@ class RunAdmissionService:
             record = self._owned_run(principal, run_id)
             return self._snapshot(record, await self._read_durable_state(record))
 
+    async def _cancel_record(self, record: RunRecord) -> RunState:
+        """CAS-cancel under the session guard; returns the resulting state.
+
+        Terminal runs are returned untouched (cancel is idempotent); a CAS
+        conflict means the run moved under us, so the state is re-read and the
+        attempt repeated — bounded by ``MAX_CANCEL_ATTEMPTS``.
+        """
+        for _ in range(MAX_CANCEL_ATTEMPTS):
+            state = await self._read_durable_state(record)
+            if is_terminal_state(state):
+                return state
+            try:
+                # expected-state CAS: a concurrent transition (another worker, a
+                # future agent) can never be overwritten silently
+                await self.repository.commit_transition(
+                    record.identity,
+                    expected_state=state,
+                    next_state=RunState.CANCELLED,
+                )
+            except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.CAS_CONFLICT:
+                    continue  # the run moved: re-read and retry, bounded
+                raise AppError(exc.code) from exc
+            return RunState.CANCELLED
+        raise AppError(ErrorCode.CONFLICT_ACTIVE_RUN)
+
     async def cancel_run(
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
         async with self._session_guard(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
-            for _ in range(MAX_CANCEL_ATTEMPTS):
-                state = await self._read_durable_state(record)
-                if is_terminal_state(state):
-                    return self._snapshot(record, state)  # cancel is idempotent
-                try:
-                    # expected-state CAS: a concurrent transition (another
-                    # worker, a future agent) can never be overwritten silently
-                    await self.repository.commit_transition(
-                        record.identity,
-                        expected_state=state,
-                        next_state=RunState.CANCELLED,
-                    )
-                except RunRepositoryError as exc:
-                    if exc.fault is RunRepositoryFault.CAS_CONFLICT:
-                        continue  # the run moved: re-read and retry, bounded
-                    raise AppError(exc.code) from exc
-                return self._snapshot(record, RunState.CANCELLED)
-            raise AppError(ErrorCode.CONFLICT_ACTIVE_RUN)
+            return self._snapshot(record, await self._cancel_record(record))
+
+    async def cancel_for_disconnect(self, run_id: str) -> None:
+        """Cancel a run whose LAST subscriber left (lease grace expired).
+
+        Trusted internal path: a lease only exists for a run that was already
+        authenticated AND authorised (the SSE route takes it after
+        ``authorize_stream``), so no principal is re-derived from here. Failures
+        are swallowed deliberately — there is no client left to report to, and
+        the run simply stays active (fail-open on availability, never on
+        safety) — while the durable terminal event stays single-shot.
+        """
+        try:
+            session_id = self._session_of(run_id)
+        except AppError:
+            return  # already gone (session deleted/expired): nothing to cancel
+        async with self._session_guard(session_id):
+            record = self.runs.get(run_id)
+            if record is None:
+                return
+            try:
+                await self._cancel_record(record)
+            except AppError:
+                return
 
     # -- streaming ---------------------------------------------------------------
 
@@ -559,6 +592,17 @@ async def get_service(request: Request) -> RunAdmissionService:
 ServiceDep = Depends(get_service)
 
 
+def get_leases(request: Request) -> RunLeaseRegistry:
+    """The lifespan-scoped SSE lease registry (one per application run)."""
+    leases = getattr(request.app.state, "stream_leases", None)
+    if leases is None:  # pragma: no cover - the server always runs the lifespan
+        raise AppError(ErrorCode.UNAVAILABLE_MAINTENANCE)
+    return leases
+
+
+LeasesDep = Depends(get_leases)
+
+
 def _snapshot_response(snap: RunStatusSnapshot) -> RunStatusResponse:
     return RunStatusResponse(
         run_id=snap.run_id,
@@ -588,6 +632,35 @@ async def _stream_with_errors(
         yield stream_error_frame(
             ErrorCode.INTERNAL_UNKNOWN, request_id=request_id, trace_id=trace_id
         )
+
+
+async def _stream_with_lease(
+    source: AsyncIterator[str], *, leases: RunLeaseRegistry, run_id: str
+) -> AsyncIterator[str]:
+    """Hold one connection lease for the lifetime of a single SSE response.
+
+    The lease is taken when streaming actually starts (the generator body runs
+    on first iteration, i.e. only for an already authorised request) and always
+    released in ``finally``.
+
+    Only a CONFIRMED disconnect arms the reconnect grace: the ASGI server closes
+    or cancels this body generator exactly when the client goes away
+    (``GeneratorExit`` / ``CancelledError``). A stream that ends on the SERVER
+    side — a terminal frame, or a structured ``stream.error`` frame after a
+    storage fault — completes normally and therefore releases the lease with
+    ``client_gone=False``, so an outage can never be mistaken for the user
+    leaving and silently cancel the run.
+    """
+    leases.open(run_id)
+    client_gone = False
+    try:
+        async for chunk in source:
+            yield chunk
+    except (GeneratorExit, asyncio.CancelledError):
+        client_gone = True
+        raise
+    finally:
+        leases.close(run_id, client_gone=client_gone)
 
 
 @router.post(
@@ -744,6 +817,7 @@ async def stream_run_events(
         description="断线续传游标：客户端最后收到的 SSE `id`；非法值忽略并回落 after_seq",
     ),
     service: RunAdmissionService = ServiceDep,
+    leases: RunLeaseRegistry = LeasesDep,
 ) -> SSEStreamingResponse:
     """Public SSE route: one atomic read stream per authenticated run.
 
@@ -761,7 +835,11 @@ async def stream_run_events(
         heartbeat_s=SSE_HEARTBEAT_S,
     )
     return SSEStreamingResponse(
-        _stream_with_errors(engine, request_id=request_id, trace_id=trace_id),
+        _stream_with_lease(
+            _stream_with_errors(engine, request_id=request_id, trace_id=trace_id),
+            leases=leases,
+            run_id=run_id,
+        ),
         headers=dict(SSE_RESPONSE_HEADERS),
     )
 

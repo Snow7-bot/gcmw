@@ -12,7 +12,9 @@
   friends) and the run service lives in the **lifespan scope**: one service per
   application run, i.e. exactly one event loop owns its asyncio primitives;
 - startup FAILS CLOSED in staging/production while the run repository or the
-  session/idempotency admission store is in-memory (see :mod:`app.runtime`).
+  session/idempotency admission store is in-memory (see :mod:`app.runtime`);
+- SSE connection leases (subscriber counting + reconnect grace) are created in
+  the same lifespan scope and torn down with the application.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from app.agents.registry import RegistryError
 from app.api.v1.agent_api import AppError, RunAdmissionService
 from app.api.v1.agent_api import router as agent_router
 from app.api.v1.errors import request_ids
+from app.api.v1.stream_leases import DEFAULT_RECONNECT_GRACE_S, RunLeaseRegistry
 from app.config import Settings
 from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 from app.providers.model_gateway import ModelGatewayError
@@ -80,6 +83,7 @@ def _normalize_stream_media_types(responses: dict) -> None:
 def create_app(
     settings: Settings | None = None,
     repository_factory: Callable[[Settings], object] | None = None,
+    reconnect_grace_s: float = DEFAULT_RECONNECT_GRACE_S,
 ) -> FastAPI:
     """Compose the application.
 
@@ -102,18 +106,29 @@ def create_app(
                 f"refusing to start in environment {settings.environment!r}: "
                 + "; ".join(report.problems)
             )
+        # SSE connection leases live beside the service: the last subscriber of
+        # a run leaving starts the reconnect grace, and only then is the run
+        # cancelled (see ``RunLeaseRegistry``)
+        leases = RunLeaseRegistry(
+            on_expire=service.cancel_for_disconnect,
+            grace_s=reconnect_grace_s,
+        )
         app.state.agent_service = service
         app.state.readiness = report
+        app.state.stream_leases = leases
         try:
             yield
         finally:
+            await leases.shutdown()
             app.state.agent_service = None
             app.state.readiness = None
+            app.state.stream_leases = None
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
     app.state.settings = settings
     app.state.agent_service = None
     app.state.readiness = None
+    app.state.stream_leases = None
 
     @app.middleware("http")
     async def ids_middleware(request: Request, call_next):

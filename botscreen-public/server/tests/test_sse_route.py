@@ -116,6 +116,7 @@ async def _open_stream(
         after_seq=after_seq,
         last_event_id=None,
         service=harness.service,
+        leases=harness.app.state.stream_leases,
     )
 
 
@@ -287,6 +288,7 @@ class TestOpenStreams:
             response = await _open_stream(harness, run["run_id"], _request())
             chunks = await _read(response, chunks=1)
             await _disconnect(response)
+            await harness.app.state.stream_leases.shutdown()  # no timer outlives
             return chunks
 
         frames = protocol_frames("".join(asyncio.run(main())))
@@ -307,6 +309,7 @@ class TestOpenStreams:
             )
             chunks = await _read(response, chunks=1)
             await _disconnect(response)
+            await harness.app.state.stream_leases.shutdown()
             return chunks
 
         frames = parse_frames("".join(asyncio.run(main())))
@@ -323,6 +326,7 @@ class TestOpenStreams:
             "after_seq",
             "last_event_id",
             "service",
+            "leases",
         }
         assert agent_api.SSE_HEARTBEAT_S == 15.0
 
@@ -340,6 +344,7 @@ class TestOpenStreams:
             )
             chunks = await _read(response, chunks=1, timeout_s=1.0)
             await _disconnect(response)
+            await harness.app.state.stream_leases.shutdown()
             return chunks
 
         frames = parse_frames("".join(asyncio.run(main())))
@@ -347,9 +352,9 @@ class TestOpenStreams:
 
 
 class TestDisconnectBoundary:
-    """B2-C owns leases/cancellation: a dropped stream must change nothing."""
+    """A disconnect releases the lease and DEFERS the cancel by the grace."""
 
-    def test_disconnect_does_not_cancel_or_lease_the_run(self, harness):
+    def test_disconnect_writes_nothing_before_the_grace_expires(self, harness):
         async def main():
             run = await _seed_run(harness, key="dc")
             touched: list[str] = []
@@ -367,28 +372,37 @@ class TestDisconnectBoundary:
 
             repository.commit_transition = spy_commit
             repository.delete = spy_delete
+            leases = harness.app.state.stream_leases
             try:
                 response = await _open_stream(harness, run["run_id"], _request())
                 await _read(response, chunks=1)
+                assert leases.subscribers(run["run_id"]) == 1  # lease held
                 await _disconnect(response)
+                assert leases.subscribers(run["run_id"]) == 0
+                assert leases.pending_expiries() == 1  # grace is now pending
+                for _ in range(50):  # the grace has NOT expired yet (2s default)
+                    await asyncio.sleep(0)
+                identity = RunIdentity(
+                    run_id=run["run_id"],
+                    tenant_id=PRINCIPAL.tenant_id,
+                    device_id=PRINCIPAL.device_id,
+                    session_id=run["session_id"],
+                )
+                state = await repository.state(identity)
+                await leases.shutdown()
             finally:
                 repository.commit_transition = original_commit
                 repository.delete = original_delete
-
-            identity = RunIdentity(
-                run_id=run["run_id"],
-                tenant_id=PRINCIPAL.tenant_id,
-                device_id=PRINCIPAL.device_id,
-                session_id=run["session_id"],
-            )
-            return touched, await repository.state(identity)
+            return touched, state
 
         touched, durable_state = asyncio.run(main())
-        assert touched == []  # no cancel, no write, no lease bookkeeping
+        assert touched == []  # the cancel is deferred, not immediate
         assert durable_state is RunState.ACCEPTED
 
-    def test_stream_does_not_track_subscribers(self, harness):
-        """No subscriber/lease state exists yet — that is B2-C's slice."""
+    def test_leases_are_counted_per_stream_not_per_service(self, harness):
+        """Connection state lives in the lease registry, not in the service."""
+        registry = harness.app.state.stream_leases
+        assert registry.tracked() == 0
         for attr in ("subscribers", "leases", "connections", "subscriber_count"):
             assert not hasattr(harness.service, attr)
             assert not hasattr(harness.repository, attr)
