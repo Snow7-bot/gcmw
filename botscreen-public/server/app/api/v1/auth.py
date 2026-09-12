@@ -125,16 +125,24 @@ def _credential_field(entry: dict, index: int) -> str:
         raise ValueError(
             f"device credential #{index}: token has surrounding whitespace"
         )
-    if not MIN_CREDENTIAL_LENGTH <= len(token) <= MAX_CREDENTIAL_LENGTH:
-        raise ValueError(
-            f"device credential #{index}: token must be "
-            f"{MIN_CREDENTIAL_LENGTH}-{MAX_CREDENTIAL_LENGTH} characters"
-        )
+    # Length rules apply to the BODY (base64 padding stripped): validating the
+    # raw value first would let ``"a" + "=" * 15`` satisfy a 16-character
+    # minimum while carrying a single character of entropy.
     body = token.rstrip(_CREDENTIAL_PADDING)
     if not body or not set(body) <= _CREDENTIAL_BASE_ALPHABET:
         raise ValueError(
             f"device credential #{index}: token contains characters that cannot "
             "appear in an Authorization header"
+        )
+    if len(body) < MIN_CREDENTIAL_LENGTH:
+        raise ValueError(
+            f"device credential #{index}: token must carry at least "
+            f"{MIN_CREDENTIAL_LENGTH} characters excluding base64 padding"
+        )
+    if len(token) > MAX_CREDENTIAL_LENGTH:
+        raise ValueError(
+            f"device credential #{index}: token must be at most "
+            f"{MAX_CREDENTIAL_LENGTH} characters including padding"
         )
     return token
 

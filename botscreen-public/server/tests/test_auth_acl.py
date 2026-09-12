@@ -256,6 +256,44 @@ class TestIdentityBoundsAtLoadTime:
         with pytest.raises(ValueError):
             CredentialStore.from_json(json.dumps([self._entry(token=token)]))
 
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "a" + "=" * 15,  # 1 body character padded up to 16 total
+            "a" * 15 + "=",  # 15 body characters
+            "a" * 15 + "=" * 5,
+        ],
+        ids=["1-body-15-padding", "15-body", "15-body-5-padding"],
+    )
+    def test_padding_cannot_be_used_to_reach_the_minimum(self, token):
+        """Review P1: the 16-character floor applies to the BODY."""
+        with pytest.raises(ValueError) as excinfo:
+            CredentialStore.from_json(json.dumps([self._entry(token=token)]))
+        assert "excluding base64 padding" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "token",
+        ["a" * 16, "a" * 16 + "=", "a" * 16 + "==", "a" * 16 + "=" * 8],
+        ids=["16-body", "16-body-1-pad", "16-body-2-pad", "16-body-8-pad"],
+    )
+    def test_sixteen_body_characters_with_padding_are_accepted(self, token):
+        store = CredentialStore.from_json(json.dumps([self._entry(token=token)]))
+        assert len(store) == 1
+        assert store.resolve(token) is not None
+
+    def test_total_length_cap_still_applies_including_padding(self):
+        with pytest.raises(ValueError) as excinfo:
+            CredentialStore.from_json(
+                json.dumps([self._entry(token="a" * MAX_CREDENTIAL_LENGTH + "=")])
+            )
+        assert "including padding" in str(excinfo.value)
+
+    def test_pure_padding_is_still_rejected(self):
+        with pytest.raises(ValueError):
+            CredentialStore.from_json(
+                json.dumps([self._entry(token="=" * (MIN_CREDENTIAL_LENGTH + 4))])
+            )
+
     def test_a_padded_credential_authenticates_end_to_end(self):
         padded = "ZGV2LXRva2VuLXRlc3Q" + "=="  # ≥ MIN_CREDENTIAL_LENGTH
         entries = [{"tenant_id": "t1", "device_id": "d1", "token": padded}]
