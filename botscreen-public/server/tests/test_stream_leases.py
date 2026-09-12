@@ -38,6 +38,18 @@ class ManualSleep:
         self.gates.append(gate)
         await gate.wait()
 
+    async def fire_all(self) -> None:
+        """Release every registered gate (after letting started tasks settle)."""
+        for _ in range(1000):
+            if self.gates:
+                break
+            await asyncio.sleep(0)
+        gates, self.gates = self.gates, []
+        for gate in gates:
+            gate.set()
+        for _ in range(200):  # let the released expiry tasks run to completion
+            await asyncio.sleep(0)
+
     async def wait_pending(self, count: int = 1) -> None:
         """Wait until ``count`` grace timers have reached the injected sleep."""
         for _ in range(1000):
@@ -203,6 +215,61 @@ class TestLeaseRegistry:
         expired, pending, tracked, timers = asyncio.run(main())
         assert expired == []  # no cancel, ever
         assert (pending, tracked, timers) == (0, 0, 0)
+
+    def test_rapid_disconnect_reconnect_disconnect_cancels_exactly_once(self):
+        """Review P1: the revoked timer must not clear the NEW timer.
+
+        Sequence: disconnect (timer T1, already sleeping) -> reconnect (T1
+        revoked) -> disconnect again (timer T2), all before T1 gets to run its
+        cancellation cleanup. The old cleanup used to clear ``entry.timer`` and
+        drop the entry, losing T2 entirely: no cancel would ever be applied.
+        """
+
+        async def main():
+            sleep = ManualSleep()
+            expired: list[str] = []
+            registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
+
+            registry.open("r1")
+            registry.close("r1", client_gone=True)  # first disconnect: T1 armed
+            await sleep.wait_pending(1)  # T1 is really sleeping in its grace
+
+            registry.open("r1")  # reconnect revokes T1 …
+            registry.close("r1", client_gone=True)  # … and the link drops again
+
+            for _ in range(50):  # T1's cancellation cleanup runs right here
+                await asyncio.sleep(0)
+            after_cleanup = (registry.tracked(), registry.pending_expiries())
+
+            await sleep.fire_all()  # T2's grace expires
+            return after_cleanup, expired, registry.tracked()
+
+        after_cleanup, expired, tracked = asyncio.run(main())
+        assert after_cleanup == (1, 1)  # the OLD task did not clear the new timer
+        assert expired == ["r1"]  # the second grace cancelled exactly once
+        assert tracked == 0
+
+    def test_repeated_rapid_cycles_still_cancel_exactly_once_each_time(self):
+        async def main():
+            sleep = ManualSleep()
+            expired: list[str] = []
+            registry = RunLeaseRegistry(_recorder(expired), sleep=sleep)
+
+            for i in range(5):
+                run_id = f"run-{i}"
+                registry.open(run_id)
+                registry.close(run_id, client_gone=True)
+                await sleep.wait_pending(1)  # grace timer is sleeping
+                registry.open(run_id)  # reconnect revokes it
+                registry.close(run_id, client_gone=True)  # drops again
+                for _ in range(50):
+                    await asyncio.sleep(0)  # old cleanup runs
+                await sleep.fire_all()
+            return expired, registry.tracked(), registry.pending_expiries()
+
+        expired, tracked, pending = asyncio.run(main())
+        assert expired == [f"run-{i}" for i in range(5)]  # one cancel per run
+        assert (tracked, pending) == (0, 0)
 
     def test_shutdown_ends_an_in_flight_callback_before_returning(self):
         """After shutdown() returns, no disconnect cancel may still run."""

@@ -128,7 +128,25 @@ class RunLeaseRegistry:
             return
         del self._entries[run_id]
 
+    def _clear_timer(self, run_id: str, task: asyncio.Task | None) -> None:
+        """Clear the entry's timer ONLY when THIS task still is that timer.
+
+        A rapid "disconnect -> reconnect -> disconnect" cycle can leave the
+        revoked first timer running its cancellation cleanup while a NEW timer
+        already owns the entry. The old task must never clear or drop the new
+        one: doing so loses the second grace window and leaks the run (no
+        cancel is ever applied).
+        """
+        entry = self._entries.get(run_id)
+        if task is None or entry is None or entry.timer is not task:
+            return  # a newer generation owns the entry: leave it alone
+        entry.timer = None
+        self._drop_if_idle(run_id)
+
     async def _expire(self, run_id: str) -> None:
+        # identity of THIS expiry task: the entry may be re-armed by a later
+        # disconnect before this task gets to clean up
+        task = asyncio.current_task()
         entry = self._entries.get(run_id)
         if entry is None:
             return
@@ -136,23 +154,19 @@ class RunLeaseRegistry:
             await self._sleep(self._grace_s)
         except asyncio.CancelledError:
             # revoked by a reconnect inside the window, or cancelled at shutdown
-            entry.timer = None
-            self._drop_if_idle(run_id)
+            self._clear_timer(run_id, task)
             return
         entry = self._entries.get(run_id)
         if entry is None or entry.subscribers > 0:
             # defensive: a reconnect would have cancelled this task instead
-            if entry is not None:
-                entry.timer = None
-            self._drop_if_idle(run_id)
+            self._clear_timer(run_id, task)
             return
         entry.expiring = True
         try:
             await self._on_expire(run_id)
         finally:
             entry.expiring = False
-            entry.timer = None
-            self._drop_if_idle(run_id)
+            self._clear_timer(run_id, task)
 
     async def shutdown(self) -> None:
         """End every pending AND in-flight expiry, then forget the leases.

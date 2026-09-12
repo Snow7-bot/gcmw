@@ -161,6 +161,33 @@ class TestRealDisconnect:
             ) as res:
                 assert "".join(res.iter_text()).count("event: run.completed") == 1
 
+    def test_rapid_drop_reconnect_drop_cancels_exactly_once(self, server):
+        """End-to-end version of the revocation race (review P1).
+
+        Drop the link, reconnect INSIDE the grace, then drop again: the second
+        grace must survive the revoked first timer's cleanup and cancel the run
+        exactly once.
+        """
+        with httpx.Client(timeout=10) as client:
+            run = _new_run(client, server.base, "real-rapid")
+            _connect_and_drop(server.base, run["run_id"])  # first link drops
+            with httpx.stream(
+                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=30
+            ) as res:
+                assert res.status_code == 200  # reconnect, inside the grace
+                time.sleep(RECONNECT_GRACE_S / 2)
+                assert _state(client, server.base, run["run_id"]) == "ACCEPTED"
+            # the second drop arms a fresh grace -> exactly one cancel
+            assert _wait_state(client, server.base, run["run_id"], "CANCELLED") == (
+                "CANCELLED"
+            )
+            with httpx.stream(
+                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=30
+            ) as res:
+                body = "".join(res.iter_text())
+            assert body.count("event: run.completed") == 1
+            assert server.leases.tracked() == 0
+
     def test_server_side_fault_never_cancels_the_run(self, server):
         """A storage fault ends the stream with stream.error — the run lives on.
 
