@@ -270,6 +270,11 @@ class RunAdmissionService:
     ) -> SessionResponse:
         """Create a session record.
 
+        Ordering matters: the RESPONSE is built first, so the session contract
+        is validated BEFORE anything is stored. An identity the API cannot
+        serialize (it is rejected at credential load time, and this is the
+        backstop) therefore leaves no half-created session behind.
+
         Deliberately synchronous: it is a single dict insertion of a fresh uuid
         with no check-then-act window, so no admission lock (and no await) is
         needed; the run lifecycle — which does span awaits — is locked.
@@ -283,8 +288,7 @@ class RunAdmissionService:
             created_at=self.now(),
             ttl_s=ttl_s,
         )
-        self.sessions[record.session_id] = record
-        return SessionResponse(
+        response = SessionResponse(  # validates against the session contract
             session_id=record.session_id,
             tenant_id=record.tenant_id,
             device_id=record.device_id,
@@ -292,6 +296,8 @@ class RunAdmissionService:
             created_at=record.created_at,
             ttl_s=record.ttl_s,
         )
+        self.sessions[record.session_id] = record
+        return response
 
     async def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
         async with self._session_guard(session_id):

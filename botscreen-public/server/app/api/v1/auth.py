@@ -27,12 +27,26 @@ from dataclasses import dataclass
 from fastapi import Depends, Request
 
 from app.contracts.errors import ErrorCode
+from app.contracts.identity import (
+    MAX_DEVICE_ID_LENGTH,
+    MAX_TENANT_ID_LENGTH,
+    MIN_IDENTITY_LENGTH,
+)
 
 from .errors import AppError
 
 #: minimum credential length accepted at load time (a one-character token is a
 #: configuration bug, not a credential)
 MIN_CREDENTIAL_LENGTH = 16
+
+#: upper bound for a credential value: an absurdly long token is a config bug
+MAX_CREDENTIAL_LENGTH = 512
+
+#: RFC 6750 ``b64token`` characters — a credential outside this set could not be
+#: presented in an ``Authorization`` header anyway
+_CREDENTIAL_ALPHABET = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~+/"
+)
 
 BEARER_SCHEME = "bearer"
 
@@ -57,6 +71,67 @@ class DeviceCredential:
 def digest_credential(credential: str) -> bytes:
     """SHA-256 digest of a presented credential (never stored in the clear)."""
     return hashlib.sha256(credential.encode("utf-8")).digest()
+
+
+def _identity_field(
+    entry: object, index: int, field_name: str, *, max_length: int
+) -> str:
+    """Strictly validated identity field (no coercion, no trimming).
+
+    The bounds are the ones the API contract enforces (see
+    :mod:`app.contracts.identity`), so an identity that could not be serialized
+    into a session/event response can never be loaded as a credential: the
+    application refuses to start instead of failing a request later.
+    """
+    if not isinstance(entry, dict) or field_name not in entry:
+        raise ValueError(f"device credential #{index} needs {field_name}")
+    value = entry[field_name]
+    if not isinstance(value, str):
+        raise TypeError(
+            f"device credential #{index}: {field_name} must be a string, "
+            f"got {type(value).__name__}"
+        )
+    if value != value.strip():
+        raise ValueError(
+            f"device credential #{index}: {field_name} has surrounding whitespace"
+        )
+    if len(value) < MIN_IDENTITY_LENGTH or len(value) > max_length:
+        raise ValueError(
+            f"device credential #{index}: {field_name} must be "
+            f"{MIN_IDENTITY_LENGTH}-{max_length} characters for this API"
+        )
+    return value
+
+
+def _credential_field(entry: dict, index: int) -> str:
+    """Strictly validated credential value.
+
+    The value itself is NEVER echoed in an error message: a rejected
+    configuration must not print the secret it rejected.
+    """
+    if "token" not in entry:
+        raise ValueError(f"device credential #{index} needs token")
+    token = entry["token"]
+    if not isinstance(token, str):
+        raise TypeError(
+            f"device credential #{index}: token must be a string, "
+            f"got {type(token).__name__}"
+        )
+    if token != token.strip():
+        raise ValueError(
+            f"device credential #{index}: token has surrounding whitespace"
+        )
+    if not MIN_CREDENTIAL_LENGTH <= len(token) <= MAX_CREDENTIAL_LENGTH:
+        raise ValueError(
+            f"device credential #{index}: token must be "
+            f"{MIN_CREDENTIAL_LENGTH}-{MAX_CREDENTIAL_LENGTH} characters"
+        )
+    if not set(token) <= _CREDENTIAL_ALPHABET:
+        raise ValueError(
+            f"device credential #{index}: token contains characters that cannot "
+            "appear in an Authorization header"
+        )
+    return token
 
 
 class CredentialStore:
@@ -93,21 +168,13 @@ class CredentialStore:
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 raise TypeError(f"device credential #{index} must be an object")
-            try:
-                tenant_id = str(entry["tenant_id"]).strip()
-                device_id = str(entry["device_id"]).strip()
-                token = str(entry["token"])
-            except KeyError as exc:
-                raise ValueError(
-                    f"device credential #{index} needs tenant_id/device_id/token"
-                ) from exc
-            if not tenant_id or not device_id:
-                raise ValueError(f"device credential #{index} has an empty identity")
-            if len(token) < MIN_CREDENTIAL_LENGTH:
-                raise ValueError(
-                    f"device credential #{index} is shorter than "
-                    f"{MIN_CREDENTIAL_LENGTH} characters"
-                )
+            tenant_id = _identity_field(
+                entry, index, "tenant_id", max_length=MAX_TENANT_ID_LENGTH
+            )
+            device_id = _identity_field(
+                entry, index, "device_id", max_length=MAX_DEVICE_ID_LENGTH
+            )
+            token = _credential_field(entry, index)
             digest = digest_credential(token)
             owner = (tenant_id, device_id)
             if digest in seen and seen[digest] != owner:

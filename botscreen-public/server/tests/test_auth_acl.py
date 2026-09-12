@@ -15,16 +15,21 @@ from __future__ import annotations
 import json
 
 import pytest
-from api_harness import running_app
+from api_harness import PRINCIPAL, running_app
 
+from app.api.v1.agent_api import RunAdmissionService
 from app.api.v1.auth import (
+    MAX_CREDENTIAL_LENGTH,
     MIN_CREDENTIAL_LENGTH,
     CredentialStore,
     DeviceCredential,
+    DevicePrincipal,
     digest_credential,
     presented_credential,
 )
+from app.contracts.api import Channel, CreateSessionRequest
 from app.contracts.errors import ErrorEnvelope
+from app.contracts.identity import MAX_DEVICE_ID_LENGTH, MAX_TENANT_ID_LENGTH
 from app.storage.run_repository import MemoryRunRepository
 
 
@@ -168,6 +173,128 @@ class TestStoreHygiene:
         assert presented_credential(request("Bearer   ")) is None
         assert presented_credential(request(f"Bearer {OWN}")) == OWN
         assert presented_credential(request(f"bearer {OWN}")) == OWN
+
+
+class TestIdentityBoundsAtLoadTime:
+    """Review P1: a credential must be rejectable AT STARTUP, not at request time.
+
+    The API contract bounds ``tenant_id`` to 64 and ``device_id`` to 128
+    characters; an identity outside those bounds used to authenticate happily
+    and then break session creation with a 500 (leaving a session behind).
+    """
+
+    @staticmethod
+    def _entry(**overrides) -> dict:
+        entry = {"tenant_id": "t1", "device_id": "d1", "token": OWN}
+        entry.update(overrides)
+        return entry
+
+    def test_contract_bounds_match_the_shared_constants(self):
+        assert (MAX_TENANT_ID_LENGTH, MAX_DEVICE_ID_LENGTH) == (64, 128)
+
+    def test_over_long_tenant_is_rejected_at_load(self):
+        entry = self._entry(tenant_id="t" * (MAX_TENANT_ID_LENGTH + 1))
+        with pytest.raises(ValueError) as excinfo:
+            CredentialStore.from_json(json.dumps([entry]))
+        assert "tenant_id" in str(excinfo.value)
+        assert OWN not in str(excinfo.value)  # never echo the credential
+
+    def test_over_long_device_is_rejected_at_load(self):
+        entry = self._entry(device_id="d" * (MAX_DEVICE_ID_LENGTH + 1))
+        with pytest.raises(ValueError) as excinfo:
+            CredentialStore.from_json(json.dumps([entry]))
+        assert "device_id" in str(excinfo.value)
+
+    def test_boundary_lengths_are_accepted(self):
+        store = CredentialStore.from_json(
+            json.dumps(
+                [
+                    self._entry(
+                        tenant_id="t" * MAX_TENANT_ID_LENGTH,
+                        device_id="d" * MAX_DEVICE_ID_LENGTH,
+                    )
+                ]
+            )
+        )
+        assert len(store) == 1
+
+    @pytest.mark.parametrize("field", ["tenant_id", "device_id", "token"])
+    @pytest.mark.parametrize("value", [42, 3.5, None, True, ["t1"], {"a": 1}])
+    def test_non_string_fields_are_rejected_not_coerced(self, field, value):
+        with pytest.raises((TypeError, ValueError)):
+            CredentialStore.from_json(json.dumps([self._entry(**{field: value})]))
+
+    @pytest.mark.parametrize("field", ["tenant_id", "device_id", "token"])
+    def test_surrounding_whitespace_is_rejected(self, field):
+        with pytest.raises(ValueError):
+            CredentialStore.from_json(json.dumps([self._entry(**{field: f" {OWN} "})]))
+
+    @pytest.mark.parametrize(
+        "token",
+        ["with space" + "0" * 10, "line\nbreak" + "0" * 10, 'quote"' + "0" * 10],
+    )
+    def test_tokens_outside_the_header_alphabet_are_rejected(self, token):
+        with pytest.raises(ValueError):
+            CredentialStore.from_json(json.dumps([self._entry(token=token)]))
+
+    def test_over_long_token_is_rejected(self):
+        with pytest.raises(ValueError):
+            CredentialStore.from_json(
+                json.dumps([self._entry(token="a" * (MAX_CREDENTIAL_LENGTH + 1))])
+            )
+
+    def test_an_invalid_credential_aborts_application_startup(self):
+        """End-to-end: the application refuses to serve, it does not 500 later."""
+        bad = [
+            {
+                "tenant_id": "t" * (MAX_TENANT_ID_LENGTH + 1),
+                "device_id": "d1",
+                "token": OWN,
+            }
+        ]
+        with (  # startup must fail before the app can serve anything
+            pytest.raises((TypeError, ValueError)),
+            running_app(overrides=False, credentials=bad),
+        ):
+            pass  # pragma: no cover - unreachable when startup fails
+
+
+class TestSessionWriteOrdering:
+    """Review P1: validate the response BEFORE storing the session."""
+
+    def test_invalid_identity_leaves_no_session_behind(self):
+        service = RunAdmissionService(repository=MemoryRunRepository())
+        bad_principal = DevicePrincipal(
+            tenant_id="t" * (MAX_TENANT_ID_LENGTH + 1), device_id="d1"
+        )
+        request = CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+        with pytest.raises(Exception):  # noqa: B017 - contract violation expected
+            service.create_session(bad_principal, request)
+        assert service.sessions == {}  # zero residue
+        assert service.runs == {} and service.idempotency == {}
+
+        # the service is still perfectly usable afterwards
+        good = service.create_session(PRINCIPAL, request)
+        assert good.session_id in service.sessions
+
+    def test_invalid_device_leaves_no_session_behind(self):
+        service = RunAdmissionService(repository=MemoryRunRepository())
+        bad_principal = DevicePrincipal(
+            tenant_id="t1", device_id="d" * (MAX_DEVICE_ID_LENGTH + 1)
+        )
+        with pytest.raises(Exception):  # noqa: B017 - contract violation expected
+            service.create_session(
+                bad_principal,
+                CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN"),
+            )
+        assert service.sessions == {}
+
+    def test_valid_identity_still_creates_a_session(self):
+        service = RunAdmissionService(repository=MemoryRunRepository())
+        session = service.create_session(
+            PRINCIPAL, CreateSessionRequest(channel=Channel.TEXT, locale="zh-CN")
+        )
+        assert service.sessions[session.session_id].tenant_id == "t1"
 
 
 class TestAuthenticationMatrix:
