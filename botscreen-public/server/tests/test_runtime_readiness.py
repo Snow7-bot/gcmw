@@ -66,6 +66,40 @@ class TestReadinessReport:
         joined = " ".join(report.problems)
         assert "run repository is in-memory" in joined
         assert "admission store is in-memory" in joined
+        # real authentication is a readiness requirement too (#66)
+        assert "no device credentials configured" in joined
+        assert report.device_credentials == "missing"
+
+    @pytest.mark.parametrize("environment", ["staging", "production"])
+    def test_persistent_environments_need_credentials_even_with_storage(
+        self, environment
+    ):
+        """Credentials alone are checked independently of the storage story."""
+
+        class _PersistentRepository:
+            """Stand-in for a wired persistent repository (not memory)."""
+
+        report = readiness_report(_settings(environment), _PersistentRepository(), None)
+        assert report.ready is False
+        assert any(
+            "no device credentials configured" in problem for problem in report.problems
+        )
+
+    @pytest.mark.parametrize("environment", ["staging", "production"])
+    def test_configured_credentials_clear_only_that_problem(self, environment):
+        class _PersistentRepository:
+            """Stand-in for a wired persistent repository (not memory)."""
+
+        class _Store:
+            configured = True
+
+        report = readiness_report(
+            _settings(environment), _PersistentRepository(), _Store()
+        )
+        assert report.device_credentials == "configured"
+        assert not any(
+            "no device credentials configured" in problem for problem in report.problems
+        )
 
     def test_report_never_exposes_counts_or_secrets(self):
         body = readiness_report(
@@ -76,6 +110,7 @@ class TestReadinessReport:
             "environment",
             "run_repository",
             "admission_store",
+            "device_credentials",
         }
 
 

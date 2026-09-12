@@ -42,7 +42,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, Query, Request, status
 from fastapi.responses import JSONResponse
 
-from app.api.v1.auth import DevicePrincipal, PrincipalDep
+from app.api.v1.auth import DevicePrincipal, PrincipalDep, require_owner
 from app.api.v1.errors import AppError, error_responses, request_ids
 from app.api.v1.sse_stream import (
     DEFAULT_HEARTBEAT_MS,
@@ -270,6 +270,11 @@ class RunAdmissionService:
     ) -> SessionResponse:
         """Create a session record.
 
+        Ordering matters: the RESPONSE is built first, so the session contract
+        is validated BEFORE anything is stored. An identity the API cannot
+        serialize (it is rejected at credential load time, and this is the
+        backstop) therefore leaves no half-created session behind.
+
         Deliberately synchronous: it is a single dict insertion of a fresh uuid
         with no check-then-act window, so no admission lock (and no await) is
         needed; the run lifecycle — which does span awaits — is locked.
@@ -283,8 +288,7 @@ class RunAdmissionService:
             created_at=self.now(),
             ttl_s=ttl_s,
         )
-        self.sessions[record.session_id] = record
-        return SessionResponse(
+        response = SessionResponse(  # validates against the session contract
             session_id=record.session_id,
             tenant_id=record.tenant_id,
             device_id=record.device_id,
@@ -292,6 +296,8 @@ class RunAdmissionService:
             created_at=record.created_at,
             ttl_s=record.ttl_s,
         )
+        self.sessions[record.session_id] = record
+        return response
 
     async def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
         async with self._session_guard(session_id):
@@ -301,8 +307,7 @@ class RunAdmissionService:
             if self._session_expired(session):
                 self._purge_session(session_id)
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
-            if not self._owns(session, principal):
-                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+            self._require_session_owner(session, principal)
             await self._delete_runs_of(session_id)
             self._purge_session(session_id)
 
@@ -326,10 +331,12 @@ class RunAdmissionService:
             self._forget_run(record.run_id)
 
     @staticmethod
-    def _owns(session: SessionRecord, principal: DevicePrincipal) -> bool:
-        return (
-            session.tenant_id == principal.tenant_id
-            and session.device_id == principal.device_id
+    def _require_session_owner(
+        session: SessionRecord, principal: DevicePrincipal
+    ) -> None:
+        """Session ACL: raises unless the principal owns this session."""
+        require_owner(
+            principal, tenant_id=session.tenant_id, device_id=session.device_id
         )
 
     def _forget_run(self, run_id: str) -> None:
@@ -402,11 +409,9 @@ class RunAdmissionService:
         if record is None:  # expired while we looked
             raise AppError(ErrorCode.NOT_FOUND_RUN)
         snapshot = record.snapshot
-        if (
-            snapshot.tenant_id != principal.tenant_id
-            or snapshot.device_id != principal.device_id
-        ):
-            raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+        require_owner(
+            principal, tenant_id=snapshot.tenant_id, device_id=snapshot.device_id
+        )
         return record
 
     async def create_run(
@@ -421,8 +426,7 @@ class RunAdmissionService:
             session = self.sessions.get(req.session_id)
             if session is None:
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
-            if not self._owns(session, principal):
-                raise AppError(ErrorCode.AUTHZ_FORBIDDEN)
+            self._require_session_owner(session, principal)
 
             payload_hash = self.payload_hash(session, req)
             key = (session.session_id, req.idempotency_key)

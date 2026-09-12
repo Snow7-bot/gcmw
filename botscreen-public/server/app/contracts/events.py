@@ -26,6 +26,11 @@ from pydantic import (
     model_validator,
 )
 
+from .identity import (
+    MAX_DEVICE_ID_LENGTH,
+    MAX_TENANT_ID_LENGTH,
+    MIN_IDENTITY_LENGTH,
+)
 from .run import RunState
 
 # Protocol version. Adding event types is additive; breaking changes (new
@@ -148,8 +153,12 @@ class SSEEvent(BaseModel):
 
     protocol_version: str = SSE_PROTOCOL_VERSION
     seq: int = Field(..., ge=1)
-    tenant_id: str = Field(..., min_length=1, max_length=64)
-    device_id: str = Field(..., min_length=1, max_length=128)
+    tenant_id: str = Field(
+        ..., min_length=MIN_IDENTITY_LENGTH, max_length=MAX_TENANT_ID_LENGTH
+    )
+    device_id: str = Field(
+        ..., min_length=MIN_IDENTITY_LENGTH, max_length=MAX_DEVICE_ID_LENGTH
+    )
     session_id: str = Field(..., min_length=1, max_length=128)
     run_id: str = Field(..., min_length=1, max_length=128)
     layer: EventLayer

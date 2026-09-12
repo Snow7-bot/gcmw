@@ -22,6 +22,8 @@ from app.storage.run_repository import MemoryRunRepository
 #: environments where the single-process in-memory arrangement is legitimate
 DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "test"})
 
+#: where the credential store comes from (see app.api.v1.auth)
+
 #: environments that require persistence on BOTH sides before serving
 PERSISTENT_ENVIRONMENTS = frozenset({"staging", "production"})
 
@@ -52,6 +54,7 @@ class ReadinessReport:
     environment: str
     run_repository: str
     admission_store: str
+    device_credentials: str
     ready: bool
     problems: tuple[str, ...]
 
@@ -62,18 +65,23 @@ class ReadinessReport:
                 "environment": self.environment,
                 "run_repository": self.run_repository,
                 "admission_store": self.admission_store,
+                "device_credentials": self.device_credentials,
             },
             "problems": list(self.problems),
         }
 
 
-def readiness_report(settings: Settings, run_repository: object) -> ReadinessReport:
+def readiness_report(
+    settings: Settings, run_repository: object, credentials: object | None = None
+) -> ReadinessReport:
     """Decide readiness from the environment and the ACTUAL backends in use."""
     backend = (
         RUN_REPOSITORY_MEMORY
         if isinstance(run_repository, MemoryRunRepository)
         else "persistent"
     )
+    configured = bool(getattr(credentials, "configured", False))
+    credentials_state = "configured" if configured else "missing"
     problems: list[str] = []
     if settings.environment in PERSISTENT_ENVIRONMENTS:
         if backend == RUN_REPOSITORY_MEMORY:
@@ -86,10 +94,16 @@ def readiness_report(settings: Settings, run_repository: object) -> ReadinessRep
                 "session/idempotency admission store is in-memory (unsafe for "
                 "multi-worker admission); a persistent AdmissionStore is required"
             )
+        if not configured:
+            problems.append(
+                f"no device credentials configured ({settings.auth_credentials_env} "
+                "is empty); real authentication is required"
+            )
     return ReadinessReport(
         environment=settings.environment,
         run_repository=backend,
         admission_store=ADMISSION_STORE_MEMORY,
+        device_credentials=credentials_state,
         ready=not problems,
         problems=tuple(problems),
     )

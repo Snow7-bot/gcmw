@@ -8,6 +8,8 @@ leak session/idempotency state into another.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -66,21 +68,41 @@ def running_app(
     environment: str = "test",
     *,
     overrides: bool = True,
+    credentials: list[dict] | None = None,
 ) -> Iterator[Harness]:
+    """Run the application under test.
+
+    ``overrides=False`` exercises the REAL auth boundary; ``credentials`` seeds
+    the credential store the way an operator would (through the environment
+    variable named by ``Settings.auth_credentials_env``), so the authentication
+    tests never bypass the production path.
+    """
     repository = repository if repository is not None else MemoryRunRepository()
-    app = create_app(
-        settings=Settings(environment=environment),
-        repository_factory=lambda _settings: repository,
-    )
-    if overrides:
-        app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
-    clock = FakeClock()
-    with TestClient(app, raise_server_exceptions=False) as client:
-        # install the clock once the lifespan has built the service
-        if app.state.agent_service is not None:
-            app.state.agent_service._clock = clock
-        yield Harness(client=client, app=app, clock=clock, repository=repository)
-    app.dependency_overrides.clear()
+    settings = Settings(environment=environment)
+    env_name = settings.auth_credentials_env
+    previous = os.environ.get(env_name)
+    if credentials is not None:
+        os.environ[env_name] = json.dumps(credentials)
+    try:
+        app = create_app(
+            settings=settings,
+            repository_factory=lambda _settings: repository,
+        )
+        if overrides:
+            app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+        clock = FakeClock()
+        with TestClient(app, raise_server_exceptions=False) as client:
+            # install the clock once the lifespan has built the service
+            if app.state.agent_service is not None:
+                app.state.agent_service._clock = clock
+            yield Harness(client=client, app=app, clock=clock, repository=repository)
+        app.dependency_overrides.clear()
+    finally:
+        if credentials is not None:
+            if previous is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = previous
 
 
 def new_session(harness: Harness, channel: str = "text") -> dict:

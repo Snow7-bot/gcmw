@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from .common import Channel
+from .identity import (
+    MAX_DEVICE_ID_LENGTH,
+    MAX_TENANT_ID_LENGTH,
+    MIN_IDENTITY_LENGTH,
+)
 from .run import RunState
 
 
@@ -31,8 +36,12 @@ class SessionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str = Field(..., min_length=1, max_length=128)
-    tenant_id: str = Field(..., min_length=1, max_length=64)
-    device_id: str = Field(..., min_length=1, max_length=128)
+    tenant_id: str = Field(
+        ..., min_length=MIN_IDENTITY_LENGTH, max_length=MAX_TENANT_ID_LENGTH
+    )
+    device_id: str = Field(
+        ..., min_length=MIN_IDENTITY_LENGTH, max_length=MAX_DEVICE_ID_LENGTH
+    )
     channel: Channel
     created_at: AwareDatetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

@@ -112,6 +112,22 @@ class TestDocumentedContract:
         ]
         assert {"403", "404", "409", "503"} <= set(cancel)
 
+    def test_bearer_security_scheme_is_published(self, schema):
+        scheme = schema["components"]["securitySchemes"]["BearerAuth"]
+        assert scheme["type"] == "http" and scheme["scheme"] == "bearer"
+
+    def test_protected_routes_require_the_scheme(self, schema):
+        for path, path_item in schema["paths"].items():
+            for method, operation in path_item.items():
+                if path in {"/api/v1/health/live", "/api/v1/health/ready"}:
+                    assert "security" not in operation, (method, path)
+                    continue
+                assert operation["security"] == [{"BearerAuth": []}], (method, path)
+
+    def test_health_probes_stay_public(self, schema):
+        for path in ("/api/v1/health/live", "/api/v1/health/ready"):
+            assert "security" not in schema["paths"][path]["get"]
+
     def test_readiness_documents_503(self, schema):
         responses = _operation(schema, "/api/v1/health/ready")["responses"]
         assert set(responses) == {"200", "503"}

@@ -111,6 +111,11 @@ class Settings(BaseModel):
     debug: bool = False
     active_provider: Literal["mock", "cloud", "local"] = "mock"
 
+    # NAME of the environment variable holding the device credentials
+    # ([{"tenant_id":…,"device_id":…,"token":…}, …]). Secrets are never stored
+    # in Settings — only their env var references.
+    auth_credentials_env: str = "GCMW_DEVICE_CREDENTIALS"
+
     redis_url: str = "redis://127.0.0.1:6379/0"
     database_url: str = "postgresql://gcmw:gcmw@127.0.0.1:5432/gcmw"
     vector_database_url: str | None = None
@@ -224,6 +229,9 @@ class Settings(BaseModel):
             environment=os.getenv("GCMW_ENV", "development"),
             debug=_bool("GCMW_DEBUG"),
             active_provider=os.getenv("GCMW_ACTIVE_PROVIDER", "mock"),
+            auth_credentials_env=os.getenv(
+                "GCMW_AUTH_CREDENTIALS_ENV", "GCMW_DEVICE_CREDENTIALS"
+            ),
             redis_url=os.getenv("GCMW_REDIS_URL", "redis://127.0.0.1:6379/0"),
             database_url=os.getenv(
                 "GCMW_DATABASE_URL", "postgresql://gcmw:gcmw@127.0.0.1:5432/gcmw"
